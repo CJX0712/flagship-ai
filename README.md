@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v9.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v10.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口注意力 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
 
 </div>
 
@@ -83,6 +83,16 @@
 | **`swa` 预设** | Mistral 配方 | `applyPreset(cfg,'swa')` 一行得到 `RMSNorm+SwiGLU+RoPE+GQA(nKvHead=2)+window=64` |
 
 > SWA 梯度检验（RoPE+SwiGLU+RMSNorm+GQA+window=4 全组合）中心差分 err/tol = **5.2e-4**；窗口局部性：距末位超出 `(window-1)·层数` 感受野的扰动对末位 logits **零影响**（逐位 0），窗内扰动必须可见；KV 缓存增量 vs 全序列重算 maxΔ=**0**。详见 `scripts/probe-swa.js`（8 项全绿）。
+
+### v10.0 新增（层交错稀疏注意力，Gemma 2/3 局部/全局模式）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **逐层窗口** | Gemma 2/3 | `window` 支持三种写法：标量（所有层同窗）、数组（逐层窗口，长度须=nLayer）、哨兵 `{alt:N}`（偶数层全因果、奇数层窗口 N 的 1:1 交错）；统一归一化为 `model.windows` 逐层数组 |
+| **局部/全局混合深度** | Gemma 2/3 | 滑动窗口层管局部依赖 O(T·w)，全局层保长程信息；静态掩码逐层应用，反向传播经缓存 `Ps` 自动继承（零新增代码） |
+| **`gemma` 预设** | Gemma 配方 | `applyPreset(cfg,'gemma')` 一行得到 `RMSNorm+SwiGLU+RoPE+GQA(nKvHead:2)+局部/全局层交错(window:64)` |
+
+> 层交错梯度检验（windows=[4,0,8] 混合）err/tol = **5.2e-4**；逐层窗口独立生效（[4,0]/[0,4]/[4,4]/[0,0] 四配置 logits 两两互异）；数组全 0 ≡ 不传 window（零回归逐位一致）；KV 缓存逐步一致 maxΔ=**0**；存档（数组/哨兵）与 INT8 量化后 windows 无损。详见 `scripts/probe-gemma.js`（12 项全绿）。
 
 
 
@@ -195,6 +205,12 @@ const swa = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: 64, nLayer: 2,
 const swaOut = F.generate(swa, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 // window=0（默认）= 全因果；RoPE 下 KV 缓存增量与全序列重算逐位一致
 
+// ── v10.0：层交错稀疏注意力（Gemma 2/3：偶数层全局、奇数层滑动窗口）──
+const gemma = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: 64, nLayer: 4,
+  nHead: 4, nKvHead: 2, dModel: 64, norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope',
+  window: { alt: 32 } });                                // 也可 applyPreset(cfg,'gemma')
+// 逐层显式写法：window: [0, 32, 0, 32]（长度须 = nLayer）；model.windows 为归一化逐层数组
+
 // ── v3.0：BPE 分词器（字符级基元，中文语料更省 token）──
 const bpe = new F.BPETokenizer(CORPUS, 320, { byteLevel: false }); // 词表 317 · 往返无损
 console.log('bpe tokens:', bpe.encode('旗舰 AI 锻造世界顶级模型').length);
@@ -228,8 +244,8 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 |---|---|---|
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
-| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + SWA 开关 `window`（滑动窗口大小，默认 0=全因果） |
-| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
+| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） |
+| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64}}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
 | `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
@@ -254,6 +270,7 @@ flagship-ai/
 ├── scripts/probe-moe.js      # v7 验证：MoE 梯度检验 / 负载均衡 / 存档往返
 ├── scripts/probe-moe-quant.js # v8 验证：MoE × INT8 组合保真 / 压缩 / 不坍缩
 ├── scripts/probe-swa.js      # v9 验证：SWA 梯度检验 / 窗口局部性 / KV 一致性 / 零回归
+├── scripts/probe-gemma.js    # v10 验证：层交错梯度检验 / 逐层生效 / alt 展开 / 存档量化往返
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导

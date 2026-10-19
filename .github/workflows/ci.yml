@@ -45,6 +45,9 @@ jobs:
       - name: Sliding-Window Attention (SWA) probe
         run: node scripts/probe-swa.js
 
+      - name: Interleaved sparse attention (Gemma-style) probe
+        run: node scripts/probe-gemma.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

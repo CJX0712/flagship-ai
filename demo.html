@@ -137,8 +137,16 @@
           <input id="topK" type="number" min="1" step="1" placeholder="留空=自动">
         </div>
         <div>
-          <label for="window">滑动窗口 window（0=全因果；&gt;0 启用 SWA 稀疏注意力）</label>
-          <input id="window" type="number" min="0" step="1" value="0" placeholder="0=全因果">
+          <label for="windowMode">稀疏注意力模式</label>
+          <select id="windowMode">
+            <option value="causal" selected>全因果（window=0）</option>
+            <option value="uniform">统一滑动窗口</option>
+            <option value="alt">Gemma 交错（偶数层全局/奇数层窗口）</option>
+          </select>
+        </div>
+        <div>
+          <label for="window">窗口大小 N（统一/交错模式生效）</label>
+          <input id="window" type="number" min="1" step="1" value="32" placeholder="32">
         </div>
       </div>
       <div class="row">
@@ -158,6 +166,7 @@
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
             <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
             <option value="swa">SWA（LLaMA+GQA+滑动窗口注意力）</option>
+            <option value="gemma">Gemma（LLaMA+GQA+局部/全局层交错）</option>
           </select>
         </div>
         <div>
@@ -923,7 +932,8 @@
      *   topK:    top-k 门控（每个 token 仅激活 topK 个专家，默认 1）
      *   auxWeight: 负载均衡辅助损失权重（Switch/GDP-MoE，默认 0.01；非 MoE 为 0）
      *   稀疏注意力开关（Mistral/Gemma 谱系）：
-     *   window: 滑动窗口大小（查询 i 仅 attend 键 [i-window+1, i]，0 = 全因果，默认）
+     *   window: 滑动窗口。标量=所有层同窗口；数组=逐层窗口（长度须=nLayer，Gemma 2/3 局部/全局交错）；
+     *           哨兵 {alt:N}=偶数层全因果(0)、奇数层窗口 N 的 1:1 交错。0 = 全因果，默认
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -953,8 +963,28 @@
       this.useMoE = this.nExp > 1;
       this.auxWeight = cfg.auxWeight != null ? cfg.auxWeight : (this.useMoE ? 0.01 : 0);
       // 滑动窗口注意力（SWA，Mistral/Gemma）：window>0 时查询 i 只 attend 键 [i-window+1, i]；
-      // window=0（默认）即标准全因果，逐位兼容旧模型。
-      this.window = cfg.window > 0 ? Math.floor(cfg.window) : 0;
+      // window=0（默认）即标准全因果，逐位兼容旧模型。三种写法归一化为逐层数组 this.windows：
+      //   标量 s      -> 所有层同窗口 [s,s,...]
+      //   数组 [a,b]  -> 逐层窗口（长度须 = nLayer，Gemma 2/3 局部/全局层交错）
+      //   哨兵 {alt:N} -> 偶数层全因果(0)、奇数层窗口 N（Gemma 2 的 1:1 交错模式）
+      const wRaw = cfg.window;
+      let wArr;
+      if (Array.isArray(wRaw)) {
+        if (wRaw.length !== L) {
+          throw new Error(`window 数组长度(${wRaw.length}) 需等于 nLayer(${L})`);
+        }
+        wArr = wRaw.map((v) => (v > 0 ? Math.floor(v) : 0));
+      } else if (wRaw && typeof wRaw === 'object' && wRaw.alt > 0) {
+        const w = Math.floor(wRaw.alt);
+        wArr = [];
+        for (let l = 0; l < L; l++) wArr.push(l % 2 === 1 ? w : 0); // 偶数层全局，奇数层局部
+      } else {
+        const w = wRaw > 0 ? Math.floor(wRaw) : 0;
+        wArr = new Array(L).fill(w);
+      }
+      this.windows = wArr;   // 逐层窗口（权威字段，0 = 该层全因果/全局）
+      this.window = Array.isArray(wRaw) ? wArr.slice()
+        : (wRaw && typeof wRaw === 'object' ? { alt: Math.floor(wRaw.alt) } : wArr[0]); // 兼容读取：原样反映配置
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -1027,7 +1057,7 @@
       m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
-      m.window = this.window;
+      m.window = this.window; m.windows = this.windows.slice();
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -1093,7 +1123,7 @@
           const ko = D + kvh * dh;                 // K 段偏移
           const vo = D + KV * dh + kvh * dh;        // V 段偏移
           const S = new Float64Array(T * T);
-          const win = this.window; // 0 = 全因果（GPT-2 原行为）
+          const win = this.windows[l]; // 0 = 该层全因果（GPT-2 原行为）
           for (let i = 0; i < T; i++) {
             const qi = i * qkvDim + h * dh;
             // 因果掩码（j <= i）叠加滑动窗口左边界（j >= i-window+1，Mistral/Gemma）
@@ -1453,7 +1483,7 @@
       for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
 
       // 4) 因果 + 滑动窗口注意力：仅对窗口内的缓存位置 attend（窗外槽位不影响输出）
-      const win = model.window > 0 ? Math.min(model.window, nValid) : nValid;
+      const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
       const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
       const ctx = new Float64Array(D);
       for (let h = 0; h < H; h++) {
@@ -1702,6 +1732,8 @@
     mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
     // 滑动窗口注意力（SWA）：LLaMA 配方 + GQA + window=64（Mistral/Gemma 稀疏注意力）。
     swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
+    // Gemma 2/3 风格：LLaMA 配方 + GQA + 局部/全局层交错（偶数层全因果，奇数层滑动窗口 64）。
+    gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 } },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {
@@ -2174,7 +2206,7 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa') cfg = F.applyPreset(cfg, arch);
+      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa' || arch === 'gemma') cfg = F.applyPreset(cfg, arch);
       if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
       // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
       const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
@@ -2190,12 +2222,16 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
       } else if (topKRaw !== '' && cfg.nExp) {
         cfg.topK = Math.min(+topKRaw, cfg.nExp);
       }
-      // SWA 覆盖：window=0=全因果（默认）；>0 启用滑动窗口（swa 预设为 64）
-      const winRaw = $('window').value.trim();
-      if (winRaw !== '') {
-        const w = +winRaw;
-        if (!(w >= 0)) { log('window 需 ≥ 0', 'err'); return false; }
-        cfg.window = w;
+      // 稀疏注意力覆盖：全因果 / 统一窗口 / Gemma 交错三种模式；
+      // 选 swa/gemma 预设且保持「全因果」时不覆盖（跟随预设）
+      const wMode = $('windowMode').value;
+      if (wMode === 'uniform' || wMode === 'alt') {
+        const winRaw = $('window').value.trim();
+        const wN = winRaw === '' ? 32 : +winRaw;
+        if (!(wN >= 1)) { log('window 需 ≥ 1', 'err'); return false; }
+        cfg.window = wMode === 'alt' ? { alt: wN } : wN;
+      } else if (arch !== 'swa' && arch !== 'gemma') {
+        cfg.window = 0;
       }
       state.arch = arch;
       state.tokMode = tokMode;
@@ -2210,10 +2246,13 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     state.stale = false;
     const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
     const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
-    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const winLabel = state.model.windows.some(w => w > 0)
+      ? (state.model.windows.every(w => w === state.model.windows[0]) ? `SWA(window=${state.model.windows[0]})` : `层交错SWA[${state.model.windows}]`)
+      : '全因果';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -2438,8 +2477,14 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
+    });
+    // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式
+    $('arch').addEventListener('change', () => {
+      const a = $('arch').value;
+      if (a === 'gemma') $('windowMode').value = 'alt';
+      else if (a === 'swa') $('windowMode').value = 'uniform';
     });
     window.addEventListener('resize', drawChart);
     log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');

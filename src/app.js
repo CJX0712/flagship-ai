@@ -65,7 +65,7 @@
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa') cfg = F.applyPreset(cfg, arch);
+      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa' || arch === 'gemma') cfg = F.applyPreset(cfg, arch);
       if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
       // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
       const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
@@ -81,12 +81,16 @@
       } else if (topKRaw !== '' && cfg.nExp) {
         cfg.topK = Math.min(+topKRaw, cfg.nExp);
       }
-      // SWA 覆盖：window=0=全因果（默认）；>0 启用滑动窗口（swa 预设为 64）
-      const winRaw = $('window').value.trim();
-      if (winRaw !== '') {
-        const w = +winRaw;
-        if (!(w >= 0)) { log('window 需 ≥ 0', 'err'); return false; }
-        cfg.window = w;
+      // 稀疏注意力覆盖：全因果 / 统一窗口 / Gemma 交错三种模式；
+      // 选 swa/gemma 预设且保持「全因果」时不覆盖（跟随预设）
+      const wMode = $('windowMode').value;
+      if (wMode === 'uniform' || wMode === 'alt') {
+        const winRaw = $('window').value.trim();
+        const wN = winRaw === '' ? 32 : +winRaw;
+        if (!(wN >= 1)) { log('window 需 ≥ 1', 'err'); return false; }
+        cfg.window = wMode === 'alt' ? { alt: wN } : wN;
+      } else if (arch !== 'swa' && arch !== 'gemma') {
+        cfg.window = 0;
       }
       state.arch = arch;
       state.tokMode = tokMode;
@@ -101,10 +105,13 @@
     state.stale = false;
     const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
     const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
-    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const winLabel = state.model.windows.some(w => w > 0)
+      ? (state.model.windows.every(w => w === state.model.windows[0]) ? `SWA(window=${state.model.windows[0]})` : `层交错SWA[${state.model.windows}]`)
+      : '全因果';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -329,8 +336,14 @@
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
+    });
+    // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式
+    $('arch').addEventListener('change', () => {
+      const a = $('arch').value;
+      if (a === 'gemma') $('windowMode').value = 'alt';
+      else if (a === 'swa') $('windowMode').value = 'uniform';
     });
     window.addEventListener('resize', drawChart);
     log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');

@@ -230,6 +230,19 @@ MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2
 - **量化与持久化**：`quantize()` 复制 `window` 字段；`cfg.window` 随 `saveModel` 存档，`loadModel` 重建后语义不变。
 - **验证**：`scripts/probe-swa.js` —— 梯度检验（RoPE+SwiGLU+RMSNorm+GQA+window 全组合 err/tol=5.2e-4）、窗口局部性（深度锥语义）、KV 缓存逐步一致（maxΔ=0）、window=0 零回归、window≥T 等价全因果、过拟合训练、缓存/重算贪心解码一致、持久化+INT8 往返，8 项全绿。
 
+### 2.15 层交错稀疏注意力（v10.0，Gemma 2/3 局部/全局模式）
+
+v9 的 `window` 升级为**逐层**配置，构造时统一归一化为长度 `nLayer` 的数组 `model.windows`：
+
+- **三种写法**：
+  - 标量 `window: 64` → 所有层同窗 `[64,64,...]`（v9 行为，零回归）
+  - 数组 `window: [0,64,0,64]` → 逐层显式窗口（长度须 = nLayer，否则抛错）
+  - 哨兵 `window: {alt: 64}` → 偶数层全因果(0)、奇数层窗口 64（Gemma 2 的 1:1 局部/全局交错；随 nLayer 自动展开）
+- **前向**：每层注意力取 `this.windows[l]` 作为该层窗口；`0` = 全局层（全因果），`>0` = 局部层（滑动窗口）。层间深度混合：局部层 O(T·w) 管局部依赖，全局层保长程信息。
+- **反向**：仍是静态掩码——每层的 `Ps` 缓存自带该层窗口，梯度自动继承，零新增代码。
+- **不变量**：混合窗口 `[4,0,8]` 梯度检验 err/tol=5.2e-4；逐层窗口独立生效（`[4,0]`/`[0,4]`/`[4,4]`/`[0,0]` 四配置 logits 两两互异）；数组全 0 ≡ 不传 window（逐位一致）；单层数组 ≡ 标量；KV 缓存逐步一致 maxΔ=0；存档（数组/哨兵均 JSON 可序列化）与 INT8 量化后 `windows` 无损。
+- **验证**：`scripts/probe-gemma.js` —— 12 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -428,6 +441,7 @@ logits = LN_f(x)·Wteᵀ
 | `generate` | GPT-2 采样逻辑 | temperature / top-k / top-p、贪心 |
 | MoE 稀疏 FFN + top-k 路由 | Mixtral / DeepSeek / Switch Transformer | 每层 N 专家 + 1 路由、top-k 门控、`N·Σ f_e·P_e` 负载均衡辅助损失（冻结 f_e） |
 | 滑动窗口注意力 | Mistral 7B / Gemma | 查询 i 仅 attend `[i-window+1, i]`，窗外掩码 -1e9（softmax 后精确 0）；固定掩码 → 反向经缓存 Ps 自动继承 |
+| 局部/全局层交错 | Gemma 2/3 | `window` 逐层配置（标量/数组/`{alt:N}` 哨兵），偶数层全局 + 奇数层滑动窗口的 1:1 交错；归一化为 `model.windows` |
 | 单文件风格 | picoGPT | 零依赖、可通读、公式即代码 |
 | 验证方法论 | 各 forge 系列硬不变量 | 行和=1、正交/因果掩码、数值梯度检验、过拟合收敛 |
 

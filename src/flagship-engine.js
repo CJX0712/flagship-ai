@@ -661,7 +661,8 @@
      *   topK:    top-k 门控（每个 token 仅激活 topK 个专家，默认 1）
      *   auxWeight: 负载均衡辅助损失权重（Switch/GDP-MoE，默认 0.01；非 MoE 为 0）
      *   稀疏注意力开关（Mistral/Gemma 谱系）：
-     *   window: 滑动窗口大小（查询 i 仅 attend 键 [i-window+1, i]，0 = 全因果，默认）
+     *   window: 滑动窗口。标量=所有层同窗口；数组=逐层窗口（长度须=nLayer，Gemma 2/3 局部/全局交错）；
+     *           哨兵 {alt:N}=偶数层全因果(0)、奇数层窗口 N 的 1:1 交错。0 = 全因果，默认
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -691,8 +692,28 @@
       this.useMoE = this.nExp > 1;
       this.auxWeight = cfg.auxWeight != null ? cfg.auxWeight : (this.useMoE ? 0.01 : 0);
       // 滑动窗口注意力（SWA，Mistral/Gemma）：window>0 时查询 i 只 attend 键 [i-window+1, i]；
-      // window=0（默认）即标准全因果，逐位兼容旧模型。
-      this.window = cfg.window > 0 ? Math.floor(cfg.window) : 0;
+      // window=0（默认）即标准全因果，逐位兼容旧模型。三种写法归一化为逐层数组 this.windows：
+      //   标量 s      -> 所有层同窗口 [s,s,...]
+      //   数组 [a,b]  -> 逐层窗口（长度须 = nLayer，Gemma 2/3 局部/全局层交错）
+      //   哨兵 {alt:N} -> 偶数层全因果(0)、奇数层窗口 N（Gemma 2 的 1:1 交错模式）
+      const wRaw = cfg.window;
+      let wArr;
+      if (Array.isArray(wRaw)) {
+        if (wRaw.length !== L) {
+          throw new Error(`window 数组长度(${wRaw.length}) 需等于 nLayer(${L})`);
+        }
+        wArr = wRaw.map((v) => (v > 0 ? Math.floor(v) : 0));
+      } else if (wRaw && typeof wRaw === 'object' && wRaw.alt > 0) {
+        const w = Math.floor(wRaw.alt);
+        wArr = [];
+        for (let l = 0; l < L; l++) wArr.push(l % 2 === 1 ? w : 0); // 偶数层全局，奇数层局部
+      } else {
+        const w = wRaw > 0 ? Math.floor(wRaw) : 0;
+        wArr = new Array(L).fill(w);
+      }
+      this.windows = wArr;   // 逐层窗口（权威字段，0 = 该层全因果/全局）
+      this.window = Array.isArray(wRaw) ? wArr.slice()
+        : (wRaw && typeof wRaw === 'object' ? { alt: Math.floor(wRaw.alt) } : wArr[0]); // 兼容读取：原样反映配置
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -765,7 +786,7 @@
       m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
-      m.window = this.window;
+      m.window = this.window; m.windows = this.windows.slice();
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -831,7 +852,7 @@
           const ko = D + kvh * dh;                 // K 段偏移
           const vo = D + KV * dh + kvh * dh;        // V 段偏移
           const S = new Float64Array(T * T);
-          const win = this.window; // 0 = 全因果（GPT-2 原行为）
+          const win = this.windows[l]; // 0 = 该层全因果（GPT-2 原行为）
           for (let i = 0; i < T; i++) {
             const qi = i * qkvDim + h * dh;
             // 因果掩码（j <= i）叠加滑动窗口左边界（j >= i-window+1，Mistral/Gemma）
@@ -1191,7 +1212,7 @@
       for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
 
       // 4) 因果 + 滑动窗口注意力：仅对窗口内的缓存位置 attend（窗外槽位不影响输出）
-      const win = model.window > 0 ? Math.min(model.window, nValid) : nValid;
+      const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
       const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
       const ctx = new Float64Array(D);
       for (let h = 0; h < H; h++) {
@@ -1440,6 +1461,8 @@
     mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
     // 滑动窗口注意力（SWA）：LLaMA 配方 + GQA + window=64（Mistral/Gemma 稀疏注意力）。
     swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
+    // Gemma 2/3 风格：LLaMA 配方 + GQA + 局部/全局层交错（偶数层全因果，奇数层滑动窗口 64）。
+    gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 } },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {

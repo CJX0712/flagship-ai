@@ -137,8 +137,16 @@
           <input id="topK" type="number" min="1" step="1" placeholder="留空=自动">
         </div>
         <div>
-          <label for="window">滑动窗口 window（0=全因果；&gt;0 启用 SWA 稀疏注意力）</label>
-          <input id="window" type="number" min="0" step="1" value="0" placeholder="0=全因果">
+          <label for="windowMode">稀疏注意力模式</label>
+          <select id="windowMode">
+            <option value="causal" selected>全因果（window=0）</option>
+            <option value="uniform">统一滑动窗口</option>
+            <option value="alt">Gemma 交错（偶数层全局/奇数层窗口）</option>
+          </select>
+        </div>
+        <div>
+          <label for="window">窗口大小 N（统一/交错模式生效）</label>
+          <input id="window" type="number" min="1" step="1" value="32" placeholder="32">
         </div>
       </div>
       <div class="row">
@@ -158,6 +166,7 @@
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
             <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
             <option value="swa">SWA（LLaMA+GQA+滑动窗口注意力）</option>
+            <option value="gemma">Gemma（LLaMA+GQA+局部/全局层交错）</option>
           </select>
         </div>
         <div>
