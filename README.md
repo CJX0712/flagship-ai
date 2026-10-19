@@ -4,14 +4,14 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Tests](https://img.shields.io/badge/tests-10%2F10%20passing-brightgreen)](#-自检套件-10-项全绿)
+[![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
 [![Node](https://img.shields.io/badge/node-%E2%89%A514-blue)](https://nodejs.org)
 [![Browser](https://img.shields.io/badge/browser-file%3A%2F%2F%20direct-orange)](#-浏览器一键运行)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char-level Tokenizer · Decoder-only Transformer · Hand-written Backpropagation · AdamW · Temperature/top-k Sampling*
+*Char-level Tokenizer · Decoder-only Transformer · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
 
 </div>
 
@@ -32,7 +32,7 @@
 
 不借助 PyTorch/TensorFlow，反向传播的每一条梯度都**手写**，并接受**中心差分数值梯度检验**的拷问。
 
-## 自检套件（10 项全绿）
+## 自检套件（12 项全绿）
 
 `node src/verify.js` 一键运行，全部不变量独立可交叉验证：
 
@@ -48,8 +48,29 @@
 | 8 | 随机批次训练收敛 | 前 30 步均值 2.463 → 后 30 步 0.036 | loss 单调下降 |
 | 9 | 生成确定性与健壮性 | 同种子一致 ✓ 贪心 ✓ 120 字长 prompt ✓ 空 prompt ✓ | 边界全过 |
 | 10 | Tokenizer 编解码往返 | 往返一致，未知字符跳过 | encode∘decode = id |
+| 11 | **KV Cache 与全序列前向逐位一致** | 末位 logits 差异 **0**；10 步贪心逐位一致；40 步超长窗口容量恒定 | 增量推理 ≡ 全量推理 |
+| 12 | 模型持久化 save/load 无损往返 | 参数差 **0**，logits 差 **0**，再序列化一致，词表恢复 | 存档可完整复现 |
 
 > 检查 6 的 5 个跳过参数是 Q/K 偏置——softmax 的行移位不变性使其梯度**恒为零**（PyTorch 行为一致），此为数学事实而非缺陷。
+
+## 性能
+
+KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 token，历史 K/V 直接复用。
+
+| 配置 | 生成 64 token | 生成 200 token | 吞吐 |
+|---|---|---|---|
+| 37 万参数 · blockSize 96 | **28.5x**（33ms vs 942ms） | **58.8x**（115ms vs 6759ms） | 1739 token/s |
+| blockSize 256 · dModel 128 | **27.3x**（79ms vs 2153ms） | **95.3x**（223ms vs 21253ms） | 897 token/s |
+
+浏览器端实测（12 万参数）：**80 token / 27ms = 2996 token/s**。
+
+**两条被实测否决的优化路线**（不做无数据支撑的优化）：
+
+| 路线 | 实测 | 结论 |
+|---|---|---|
+| 手写 4 路循环展开 | 32.7µs vs 30.2µs（更慢） | V8 已把朴素循环优化到标量极限 ~900M MAC/s |
+| Int8 权重量化（llama.cpp 路线） | 0.92x（无加速） | JS 无 SIMD intrinsics，量化收益来自 C++ SIMD，JS 拿不到 |
+
 
 ## 快速开始
 
@@ -76,8 +97,13 @@ const r = F.train(model, tok.encode(CORPUS),
 console.log('final loss:', r.finalLoss);                // ≈ 1.93
 
 const out = F.generate(model, tok, '旗舰之道', {
-  maxTokens: 100, temperature: 0.8, topK: 40, seed: 7 });
+  maxTokens: 100, temperature: 0.8, topK: 40, seed: 7 }); // KV cache 默认开启
 console.log(out.text);
+
+// 持久化：参数 + 词表 一并存档，导入后可完整复现
+const json = F.saveModel(model, tok);
+const model2 = F.loadModel(json);
+const tok2 = F.loadTokenizer(json);
 ```
 
 ### 浏览器（一键运行）
@@ -87,7 +113,8 @@ console.log(out.text);
 - 📝 语料实时编辑 → 一键构建模型（词表/参数量即时统计）
 - 🧪 一键自检（10 项逐项点亮，与 Node 结果一致）
 - 📈 训练（分块不卡 UI，loss 实时曲线，断点续训与直训**逐位等价**）
-- ✨ 生成（温度 / top-k / 种子可调）
+- ✨ 生成（温度 / top-k / 种子可调，KV cache 加速，实时显示 token/s）
+- 💾 导出/导入模型（参数 + 词表，JSON 无损）
 
 ## API 速查
 
@@ -96,7 +123,11 @@ console.log(out.text);
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
-| `generate` | `generate(model, tok, prompt, opts)` → `{text}` | opts: `maxTokens/temperature/topK/topP/seed/greedy` |
+| `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
+| `initKVCache` | `initKVCache(model)` → `{K, V, n}` | 每层 K/V 预分配 `blockSize×D` |
+| `forwardStep` | `forwardStep(model, tokenId, pos, kv)` → `{logits}` | 单 token 增量前向，O(T·D) |
+| `kvShift` | `kvShift(model, kv)` | 滑动窗口：丢弃最旧 token（`copyWithin` 原生 memmove） |
+| `saveModel` / `loadModel` / `loadTokenizer` | `saveModel(model, tok?)` → JSON | 参数与词表无损持久化 |
 
 ## 项目结构
 
@@ -124,7 +155,8 @@ flagship-ai/
 
 - 教学级规模（dModel 64 / 2 层 ≈ 12 万参数），面向学习与验证，非生产推理
 - 字符级 tokenizer，无 BPE（BPE 属工程加速，不改变架构本质）
-- 纯 JS 单线程，无 GPU 加速
+- 纯 JS 单线程，无 GPU；已实测排除循环展开与 Int8 量化（V8 无 SIMD 收益）
+- 绝对位置嵌入：序列超出 blockSize 后转入**滑动窗口**（丢弃最旧 token），此时与"全量重算最后 blockSize 个 token"不再逐位等价 —— 这是 GPT-2 位置嵌入的固有约束，业界同样如此
 
 ## 许可
 

@@ -184,14 +184,19 @@
           <input id="genSeed" type="number" value="1234" min="0" step="1">
         </div>
       </div>
-      <div class="btns"><button id="genBtn" disabled>生成文本</button></div>
+      <div class="btns">
+        <button id="genBtn" disabled>生成文本</button>
+        <button id="exportBtn" disabled>导出模型</button>
+        <button id="importBtn">导入模型</button>
+        <input id="importFile" type="file" accept=".json" hidden>
+      </div>
       <div id="output" style="margin-top:12px">（训练完成后在此生成）</div>
     </div>
 
     <div class="card">
-      <h2>一键自检 <span class="tag">10 项不变量</span></h2>
+      <h2>一键自检 <span class="tag">12 项不变量</span></h2>
       <div class="btns"><button id="checkBtn">运行自检</button></div>
-      <div class="hint">与 Node 端同一套检验：不变量 / 因果掩码 / 中心差分梯度检验 / 过拟合 / 训练收敛 / 生成确定性与健壮性。</div>
+      <div class="hint">与 Node 端同一套检验：不变量 / 因果掩码 / 中心差分梯度检验 / 过拟合 / 训练收敛 / 生成确定性 / KV cache 逐位一致 / 模型持久化无损往返。</div>
       <table style="margin-top:10px">
         <thead><tr><th>#</th><th>检查项</th><th>结果</th><th>详情</th></tr></thead>
         <tbody id="checkBody"></tbody>

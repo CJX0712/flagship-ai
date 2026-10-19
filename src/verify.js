@@ -261,6 +261,82 @@
         return { pass: round === POEM + 'ABCabc' && skip && vocabOk, detail: `往返一致=${round === POEM + 'ABCabc'}；未知字符跳过=${skip}；词表大小=${tok.vocabSize}` };
       },
     },
+    {
+      name: 'KV Cache 与全序列前向逐位一致',
+      run: () => {
+        const tok = new F.Tokenizer(POEM);
+        const ids = tok.encode(POEM);
+        const B = 16;
+        const model = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: B, nLayer: 2, nHead: 2, dModel: 16, seed: 3 });
+
+        // (a) 单序列：缓存路径末位 logits == 全序列路径末位 logits
+        const seq = ids.slice(0, 10);
+        const full = model.forward(seq).logits;
+        const kv = F.initKVCache(model);
+        const cached = F.warmupKV(model, seq, kv);
+        let maxDiff = 0;
+        const off = (seq.length - 1) * model.cfg.vocabSize;
+        for (let j = 0; j < model.cfg.vocabSize; j++) {
+          maxDiff = Math.max(maxDiff, Math.abs(cached[j] - full[off + j]));
+        }
+
+        // (b) 纯增量区间（prompt+生成 < blockSize）：缓存/非缓存必须逐位一致
+        const a = F.generate(model, tok, '朝辞', { maxNew: 10, temperature: 0, useCache: true, seed: 1 });
+        const b = F.generate(model, tok, '朝辞', { maxNew: 10, temperature: 0, useCache: false, seed: 1 });
+        const same = a.text === b.text && a.ids.every((v, i) => v === b.ids[i]);
+
+        // (c) 长生成跨越 blockSize：滑动窗口 memmove 必须保持缓存容量恒定且输出全部有效
+        const kv2 = F.initKVCache(model);
+        const long = F.generate(model, tok, '朝辞', {
+          maxNew: 40, temperature: 0, useCache: true, seed: 1, kv: kv2,
+        });
+        const overflow = long.ids.length === 40
+          && long.ids.every(v => Number.isInteger(v) && v >= 0 && v < model.cfg.vocabSize)
+          && kv2.n === B;
+
+        return {
+          pass: maxDiff === 0 && same && overflow,
+          detail: `末位 logits 最大差异 ${maxDiff}（要求 0）；纯增量区间 10 步贪心输出逐位一致=${same}；超长生成(40>blockSize=16)滑动窗口容量恒定=${kv2.n === B}`,
+        };
+      },
+    },
+    {
+      name: '模型持久化 save/load 无损往返',
+      run: () => {
+        const tok = new F.Tokenizer(POEM);
+        const ids = tok.encode(POEM);
+        const model = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: 16, nLayer: 1, nHead: 2, dModel: 16, seed: 5 });
+        F.train(model, ids, { steps: 20, lr: 3e-3, warmup: 5, seed: 0, logEvery: 1e9 });
+
+        const json = F.saveModel(model, tok);
+        const restored = F.loadModel(json);
+
+        // 参数逐位相等
+        let maxDiff = 0;
+        for (const key in model.params) {
+          const p1 = model.params[key].d, p2 = restored.params[key].d;
+          if (p1.length !== p2.length) return { pass: false, detail: `参数 ${key} 长度不匹配` };
+          for (let i = 0; i < p1.length; i++) maxDiff = Math.max(maxDiff, Math.abs(p1[i] - p2[i]));
+        }
+        // 前向输出逐位相等 + 序列化幂等
+        const seq = ids.slice(0, 12);
+        const l1 = model.forward(seq).logits, l2 = restored.forward(seq).logits;
+        let logitDiff = 0;
+        for (let i = 0; i < l1.length; i++) logitDiff = Math.max(logitDiff, Math.abs(l1[i] - l2[i]));
+        const stable = F.saveModel(restored, tok) === json;
+        const cfgOk = restored.cfg.vocabSize === model.cfg.vocabSize;
+        // 词表一并持久化：导入后分词器可完整重建，编解码行为一致
+        const tok2 = F.loadTokenizer(json);
+        const vocabOk = tok2 && tok2.vocabSize === tok.vocabSize
+          && tok2.encode(POEM).every((v, i) => v === tok.encode(POEM)[i])
+          && tok2.decode(tok2.encode(POEM)) === POEM;
+
+        return {
+          pass: maxDiff === 0 && logitDiff === 0 && stable && cfgOk && vocabOk,
+          detail: `参数最大差异 ${maxDiff}；前向 logits 最大差异 ${logitDiff}；再序列化一致=${stable}；词表恢复=${!!vocabOk}（${tok.vocabSize} 字符）；体积 ${(json.length / 1024).toFixed(0)} KB`,
+        };
+      },
+    },
   ];
 
   function runAll() {

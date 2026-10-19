@@ -112,6 +112,7 @@
     $('stopBtn').disabled = true;
     $('buildBtn').disabled = false;
     $('genBtn').disabled = false;
+    $('exportBtn').disabled = false;
     log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${state.history[state.history.length - 1].toFixed(4)}，全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`, state.stopFlag ? 'warn' : 'ok');
   }
 
@@ -172,8 +173,54 @@
       topK: +$('topK').value,
       seed: +$('genSeed').value || 1234,
     });
+    const ms = performance.now() - t0;
     $('output').textContent = r.text;
-    log(`生成 ${r.text.length} 字，耗时 ${(performance.now() - t0).toFixed(0)}ms（温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
+    const tps = ms > 0 ? (r.ids.length / ms * 1000).toFixed(0) : '—';
+    log(`生成 ${r.ids.length} token，耗时 ${ms.toFixed(0)}ms（${tps} token/s · KV cache · 温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
+  }
+
+  /* ---------- 模型持久化 ---------- */
+  function doExport() {
+    if (!state.model) return;
+    const json = F.saveModel(state.model, state.tok);
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'flagship-model.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    log(`模型导出完成：${(json.length / 1024 / 1024).toFixed(2)} MB（含 ${state.tok.vocabSize} 字符词表）`);
+  }
+
+  function handleImport(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const json = String(reader.result);
+        const model = F.loadModel(json);
+        const tok = F.loadTokenizer(json);
+        if (!tok) throw new Error('存档缺少词表');
+        state.model = model;
+        state.tok = tok;
+        state.trained = true;
+        state.stepsDone = 0;
+        state.totalSteps = 0;
+        state.history = [];
+        state.stale = false;
+        $('modelInfo').textContent =
+          `词表 ${tok.vocabSize} · 参数 ${model.paramCount().toLocaleString()}（导入）`;
+        $('genBtn').disabled = false;
+        $('exportBtn').disabled = false;
+        drawChart();
+        log(`模型导入成功：${model.paramCount().toLocaleString()} 参数，可直接生成`);
+      } catch (err) {
+        log('导入失败：' + err.message, 'err');
+      }
+      ev.target.value = '';
+    };
+    reader.readAsText(file);
   }
 
   /* ---------- 一键自检（逐项执行） ---------- */
@@ -224,6 +271,9 @@
     $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
     $('genBtn').addEventListener('click', doGenerate);
     $('checkBtn').addEventListener('click', runSelfCheck);
+    $('exportBtn').addEventListener('click', doExport);
+    $('importBtn').addEventListener('click', () => $('importFile').click());
+    $('importFile').addEventListener('change', handleImport);
     $('corpus').addEventListener('input', () => {
       state.stale = true;
       $('genBtn').disabled = true;
