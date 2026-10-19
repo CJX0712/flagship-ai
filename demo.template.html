@@ -124,6 +124,10 @@
           <label for="seed">随机种子 seed</label>
           <input id="seed" type="number" value="42" min="0" step="1">
         </div>
+        <div>
+          <label for="nKvHead">KV 头数 nKvHead（留空=MHA；&lt; nHead 启用 GQA）</label>
+          <input id="nKvHead" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -139,6 +143,7 @@
           <select id="arch">
             <option value="gpt2" selected>GPT-2（LN+GELU+位置嵌入）</option>
             <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
+            <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
           </select>
         </div>
         <div>

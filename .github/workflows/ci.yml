@@ -29,3 +29,6 @@ jobs:
 
       - name: Architecture comparison probe
         run: node scripts/probe-v3.js
+
+      - name: GQA (Grouped-Query Attention) probe
+        run: node scripts/probe-v4-gqa.js

@@ -124,6 +124,10 @@
           <label for="seed">随机种子 seed</label>
           <input id="seed" type="number" value="42" min="0" step="1">
         </div>
+        <div>
+          <label for="nKvHead">KV 头数 nKvHead（留空=MHA；&lt; nHead 启用 GQA）</label>
+          <input id="nKvHead" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -139,6 +143,7 @@
           <select id="arch">
             <option value="gpt2" selected>GPT-2（LN+GELU+位置嵌入）</option>
             <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
+            <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
           </select>
         </div>
         <div>
@@ -484,25 +489,31 @@
    * 且使滑动窗口 KV cache 在任意绝对位置下都与全序列重算逐位一致。
    * sign=+1 前向（逆时针）；sign=-1 反向（正交矩阵的逆 = 其转置）。 */
   const ROPE_BASE = 10000;
-  function ropeApply(X, T, D, H, dh, posOff, sign) {
+  function ropeApply(X, T, D, H, dh, posOff, sign, Hk, stride) {
+    Hk = Hk || H;                 // K 段头数（GQA 下 < H）；默认 = H（MHA）
+    stride = stride || 3 * D;     // qkv 行宽（GQA 下 = D + 2·KV·dh）
     const half = dh >> 1;
     if (half <= 0) return;
-    const bases = [0, D]; // Q 段与 K 段在 3D 行内的偏移
     for (let i = 0; i < T; i++) {
       const pos = i + posOff;
-      const row = i * 3 * D;
+      const row = i * stride;
       for (let p = 0; p < half; p++) {
         const th = pos * Math.pow(ROPE_BASE, -2 * p / dh);
         const cs = Math.cos(th), sn = Math.sin(th) * sign;
-        for (let b = 0; b < 2; b++) {
-          const o = row + bases[b] + (p << 1);
-          // 每个 head 的该维度对
-          for (let h = 0; h < H; h++) {
-            const q = o + h * dh;
-            const x0 = X[q], x1 = X[q + 1];
-            X[q] = x0 * cs - x1 * sn;
-            X[q + 1] = x0 * sn + x1 * cs;
-          }
+        // Q 段：base 0，H 个头
+        for (let h = 0; h < H; h++) {
+          const q = row + h * dh + (p << 1);
+          const x0 = X[q], x1 = X[q + 1];
+          X[q] = x0 * cs - x1 * sn;
+          X[q + 1] = x0 * sn + x1 * cs;
+        }
+        // K 段：base D，Hk 个头
+        const base = row + D;
+        for (let h = 0; h < Hk; h++) {
+          const q = base + h * dh + (p << 1);
+          const x0 = X[q], x1 = X[q + 1];
+          X[q] = x0 * cs - x1 * sn;
+          X[q + 1] = x0 * sn + x1 * cs;
         }
       }
     }
@@ -751,6 +762,14 @@
       if (this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
         throw new Error(`RoPE 要求每个 head 维度 dh=${D / H} 为偶数`);
       }
+      // GQA（分组查询注意力）：KV 头数可小于 Q 头数（LLaMA-2/3 标准）。
+      // 默认 nKvHead = nHead 即 MHA，完全向后兼容。
+      const KV = cfg.nKvHead != null ? cfg.nKvHead : H;
+      if (KV < 1 || KV > H || H % KV !== 0) {
+        throw new Error(`nKvHead(${KV}) 需满足 1 <= nKvHead <= nHead(${H}) 且 nHead 可被整除`);
+      }
+      const dh = D / H;
+      this.KV = KV; this.dh = dh; this.g = H / KV; this.qkvDim = D + 2 * KV * dh;
       this.useRope = this.cfg.pos === 'rope';
       this.useRms = this.cfg.norm === 'rmsnorm';
       this.useSwi = this.cfg.ffn === 'swiglu';
@@ -775,7 +794,7 @@
       const FH = this.fh;
       for (let l = 0; l < L; l++) {
         const k = `l${l}.`;
-        add(k + 'wqkv', D, 3 * D); zeros(k + 'bqkv', 3 * D);
+        add(k + 'wqkv', D, this.qkvDim); zeros(k + 'bqkv', this.qkvDim);
         add(k + 'wproj', D, D, rscale); zeros(k + 'bproj', D);
         // SwiGLU 的 w1 一次产出 gate 与 up 两半（D → 2·FH），少一次矩阵乘
         add(k + 'w1', D, this.useSwi ? 2 * FH : FH);
@@ -804,7 +823,7 @@
     /** 前向传播，返回 { logits(T×V), cache }，cache 供反向传播使用 */
     forward(tokens) {
       const { vocabSize: V, blockSize: B, nLayer: L, nHead: H, dModel: D } = this.cfg;
-      const dh = D / H;
+      const dh = this.dh, KV = this.KV, g = this.g, qkvDim = this.qkvDim;
       const P = this.params;
       const T = Math.min(tokens.length, B);
       const toks = tokens.length > B ? tokens.slice(tokens.length - B) : tokens;
@@ -828,22 +847,25 @@
         // 2) pre-LN #1 -> 因果多头自注意力
         const ln1 = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), T, D);
         const A = ln1.Y;
-        const qkv = matmul(A, P[k + 'wqkv'].d, T, D, 3 * D);
+        const qkv = matmul(A, P[k + 'wqkv'].d, T, D, qkvDim);
         for (let i = 0; i < T; i++) {
-          const o = i * 3 * D;
-          for (let j = 0; j < 3 * D; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
+          const o = i * qkvDim;
+          for (let j = 0; j < qkvDim; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
         }
         // RoPE：就地旋转 Q/K 段（V 段不旋转）
-        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1);
+        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim);
         const ctx = new Float64Array(T * D);
         const Ps = [];
         const scale = 1 / Math.sqrt(dh);
         for (let h = 0; h < H; h++) {
+          const kvh = (h / g) | 0;                 // 该 Q 头对应的 KV 头
+          const ko = D + kvh * dh;                 // K 段偏移
+          const vo = D + KV * dh + kvh * dh;        // V 段偏移
           const S = new Float64Array(T * T);
           for (let i = 0; i < T; i++) {
-            const qi = i * 3 * D + h * dh;
+            const qi = i * qkvDim + h * dh;
             for (let j = 0; j <= i; j++) { // 因果掩码：只 attend 到 j <= i
-              const kj = j * 3 * D + D + h * dh;
+              const kj = j * qkvDim + ko;
               let s = 0;
               for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
               S[i * T + j] = s * scale;
@@ -855,7 +877,7 @@
           for (let i = 0; i < T; i++) {
             for (let p = 0; p < dh; p++) {
               let s = 0;
-              for (let j = 0; j <= i; j++) s += Pm[i * T + j] * qkv[j * 3 * D + 2 * D + h * dh + p];
+              for (let j = 0; j <= i; j++) s += Pm[i * T + j] * qkv[j * qkvDim + vo + p];
               ctx[i * D + h * dh + p] = s;
             }
           }
@@ -940,15 +962,19 @@
         rowSumInto(G[k + 'bproj'], dattn, T, D);
         const dctx = matmulAtB(dattn, P[k + 'wproj'].d, T, D, D);
 
-        const dqkv = new Float64Array(T * 3 * D);
+        const qkvDim = this.qkvDim, KV = this.KV, g = this.g;
+        const dqkv = new Float64Array(T * qkvDim);
         for (let h = 0; h < H; h++) {
+          const kvh = (h / g) | 0;
+          const ko = D + kvh * dh;
+          const vo = D + KV * dh + kvh * dh;
           const Pm = c.Ps[h];
           const dP = new Float64Array(T * T);
           const dVh = new Float64Array(T * dh);
           for (let i = 0; i < T; i++) {
             for (let j = 0; j < T; j++) {
               let s = 0;
-              for (let p = 0; p < dh; p++) s += dctx[i * D + h * dh + p] * c.qkv[j * 3 * D + 2 * D + h * dh + p];
+              for (let p = 0; p < dh; p++) s += dctx[i * D + h * dh + p] * c.qkv[j * qkvDim + vo + p];
               dP[i * T + j] = s;
             }
           }
@@ -967,9 +993,9 @@
             for (let p = 0; p < dh; p++) {
               let sq = 0;
               for (let j = 0; j <= i; j++) {
-                sq += dS[i * T + j] * c.qkv[j * 3 * D + D + h * dh + p];
+                sq += dS[i * T + j] * c.qkv[j * qkvDim + ko + p];
               }
-              dqkv[i * 3 * D + h * dh + p] = sq * scale;
+              dqkv[i * qkvDim + h * dh + p] = sq * scale;
             }
           }
           // dK[i] = Σ_{a≥i} dS[a][i] · Q[a]（列方向：所有 a≥i 的行都向 K[i] 传梯度）
@@ -977,20 +1003,20 @@
             for (let p = 0; p < dh; p++) {
               let sk = 0;
               for (let a = i; a < T; a++) {
-                sk += dS[a * T + i] * c.qkv[a * 3 * D + h * dh + p];
+                sk += dS[a * T + i] * c.qkv[a * qkvDim + h * dh + p];
               }
-              dqkv[i * 3 * D + D + h * dh + p] = sk * scale;
+              dqkv[i * qkvDim + ko + p] += sk * scale; // 共享 KV 头：多个 Q 头累加
             }
           }
           for (let i = 0; i < T; i++) {
-            for (let p = 0; p < dh; p++) dqkv[i * 3 * D + 2 * D + h * dh + p] = dVh[i * dh + p];
+            for (let p = 0; p < dh; p++) dqkv[i * qkvDim + vo + p] += dVh[i * dh + p];
           }
         }
         // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转
-        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1);
-        addInto(G[k + 'wqkv'], matmulTA(c.A, dqkv, T, D, 3 * D));
-        rowSumInto(G[k + 'bqkv'], dqkv, T, 3 * D);
-        const dA = matmulAtB(dqkv, P[k + 'wqkv'].d, T, 3 * D, D);
+        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1, KV, qkvDim);
+        addInto(G[k + 'wqkv'], matmulTA(c.A, dqkv, T, D, qkvDim));
+        rowSumInto(G[k + 'bqkv'], dqkv, T, qkvDim);
+        const dA = matmulAtB(dqkv, P[k + 'wqkv'].d, T, qkvDim, D);
         const ln1b = NB(dA, c.ln1.xhat, c.ln1.rstd, P[k + 'ln1.g'].d, T, D);
         addInto(G[k + 'ln1.g'], ln1b.dg);
         if (G[k + 'ln1.b']) addInto(G[k + 'ln1.b'], ln1b.db);
@@ -1121,11 +1147,12 @@
 
   /** 初始化 KV 缓存：每层 K/V 各预分配 blockSize×D */
   function initKVCache(model) {
-    const { nLayer: L, blockSize: B, dModel: D } = model.cfg;
+    const { nLayer: L, blockSize: B } = model.cfg;
+    const kvDim = model.KV * model.dh; // GQA 下 K/V 每位置维度 = KV 头数 · headDim
     const K = [], V = [];
     for (let l = 0; l < L; l++) {
-      K.push(new Float64Array(B * D));
-      V.push(new Float64Array(B * D));
+      K.push(new Float64Array(B * kvDim));
+      V.push(new Float64Array(B * kvDim));
     }
     return { K, V, n: 0 };
   }
@@ -1139,7 +1166,8 @@
    */
   function forwardStep(model, tokenId, pos, kv) {
     const { dModel: D, nHead: H, nLayer: L, vocabSize: V0, blockSize: B } = model.cfg;
-    const dh = D / H, scale = 1 / Math.sqrt(dh);
+    const dh = model.dh, scale = 1 / Math.sqrt(dh);
+    const KV = model.KV, qkvDim = model.qkvDim, kvDim = KV * dh;
     const P = model.params;
     const NF = model.useRms ? rmsnormFwd : layernormFwd;
     const nb = (key) => (P[key] ? P[key].d : null);
@@ -1160,27 +1188,28 @@
       const k = `l${l}.`;
       // 2) pre-norm #1 -> QKV
       const A = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), 1, D).Y;
-      const qkv = matmul(A, P[k + 'wqkv'].d, 1, D, 3 * D);
-      for (let j = 0; j < 3 * D; j++) qkv[j] += P[k + 'bqkv'].d[j];
-      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1);
+      const qkv = matmul(A, P[k + 'wqkv'].d, 1, D, qkvDim);
+      for (let j = 0; j < qkvDim; j++) qkv[j] += P[k + 'bqkv'].d[j];
+      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim);
 
-      // 3) 写入缓存（K 取 QKV 中段，V 取尾段）
-      const Ko = kv.K[l], Vo = kv.V[l], o = slot * D;
-      for (let j = 0; j < D; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[2 * D + j]; }
+      // 3) 写入缓存（K 取 QKV 中段，V 取尾段；GQA 下 K/V 各 kvDim 维）
+      const Ko = kv.K[l], Vo = kv.V[l], o = slot * kvDim;
+      for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
 
       // 4) 因果注意力：仅对已缓存的 nValid 个位置 attend
       const ctx = new Float64Array(D);
       for (let h = 0; h < H; h++) {
+        const kvh = (h / model.g) | 0;
         const S = new Float64Array(nValid);
         for (let j = 0; j < nValid; j++) {
           let s = 0;
-          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * Ko[j * D + h * dh + p];
+          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * Ko[j * kvDim + kvh * dh + p];
           S[j] = s * scale;
         }
         const Pm = softmaxRows(S, 1, nValid);
         for (let p = 0; p < dh; p++) {
           let s = 0;
-          for (let j = 0; j < nValid; j++) s += Pm[j] * Vo[j * D + h * dh + p];
+          for (let j = 0; j < nValid; j++) s += Pm[j] * Vo[j * kvDim + kvh * dh + p];
           ctx[h * dh + p] = s;
         }
       }
@@ -1211,11 +1240,12 @@
   /** 滑动窗口：丢弃最旧的 1 个 token（copyWithin 原生 memmove，O(B·D) 无重算）。
    * K/V 向量在写入时已携带当时的绝对位置信息，搬移不改变其数值。 */
   function kvShift(model, kv) {
-    const { nLayer: L, dModel: D } = model.cfg;
+    const { nLayer: L } = model.cfg;
+    const kvDim = model.KV * model.dh;
     const n = kv.n;
     for (let l = 0; l < L; l++) {
-      kv.K[l].copyWithin(0, D, n * D);
-      kv.V[l].copyWithin(0, D, n * D);
+      kv.K[l].copyWithin(0, kvDim, n * kvDim);
+      kv.V[l].copyWithin(0, kvDim, n * kvDim);
     }
     kv.n = n - 1;
   }
@@ -1373,7 +1403,8 @@
   /* 架构预设：一行切换到现代 LLM 的标准配方 */
   const ARCH_PRESETS = {
     gpt2: { norm: 'ln', ffn: 'gelu', pos: 'learned' },                 // GPT-2 / 本项目默认
-    llama: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope' },            // LLaMA / Mistral
+    llama: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope' },            // LLaMA / Mistral（MHA）
+    'llama-gqa': { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2 }, // LLaMA + GQA 演示
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {
@@ -1820,6 +1851,15 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
       log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
       return false;
     }
+    const nKvHeadRaw = $('nKvHead').value.trim();
+    let nKvHead = -1;
+    if (nKvHeadRaw !== '') {
+      nKvHead = +nKvHeadRaw;
+      if (!(nKvHead >= 1 && nKvHead <= nHead && nHead % nKvHead === 0)) {
+        log(`nKvHead(${nKvHead}) 需满足 1 <= nKvHead <= nHead(${nHead}) 且 nHead 可被整除`, 'err');
+        return false;
+      }
+    }
     const tokMode = $('tokenizer').value;
     const arch = $('arch').value;
     try {
@@ -1837,7 +1877,8 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama') cfg = F.applyPreset(cfg, 'llama');
+      if (arch === 'llama' || arch === 'llama-gqa') cfg = F.applyPreset(cfg, arch);
+      if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
       state.arch = arch;
       state.tokMode = tokMode;
       state.model = new F.GPTModel(cfg);
@@ -1850,10 +1891,11 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     state.stepsDone = 0;
     state.stale = false;
     const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
-    log(`模型已构建：[${arch} / ${tokLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -2076,7 +2118,7 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     window.addEventListener('resize', drawChart);

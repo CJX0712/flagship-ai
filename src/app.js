@@ -39,6 +39,15 @@
       log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
       return false;
     }
+    const nKvHeadRaw = $('nKvHead').value.trim();
+    let nKvHead = -1;
+    if (nKvHeadRaw !== '') {
+      nKvHead = +nKvHeadRaw;
+      if (!(nKvHead >= 1 && nKvHead <= nHead && nHead % nKvHead === 0)) {
+        log(`nKvHead(${nKvHead}) 需满足 1 <= nKvHead <= nHead(${nHead}) 且 nHead 可被整除`, 'err');
+        return false;
+      }
+    }
     const tokMode = $('tokenizer').value;
     const arch = $('arch').value;
     try {
@@ -56,7 +65,8 @@
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama') cfg = F.applyPreset(cfg, 'llama');
+      if (arch === 'llama' || arch === 'llama-gqa') cfg = F.applyPreset(cfg, arch);
+      if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
       state.arch = arch;
       state.tokMode = tokMode;
       state.model = new F.GPTModel(cfg);
@@ -69,10 +79,11 @@
     state.stepsDone = 0;
     state.stale = false;
     const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
-    log(`模型已构建：[${arch} / ${tokLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -295,7 +306,7 @@
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     window.addEventListener('resize', drawChart);

@@ -164,6 +164,21 @@ SiLU(z) = z · σ(z) = z / (1 + e^{-z})
 
 ---
 
+### 2.10 GQA 分组查询注意力（v4.0）
+
+MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2/3 标准），每组服务 `g = H/KV` 个 Q 头，显著降低 KV cache 显存与推理成本，是现代开源 LLM 的事实标配。
+
+- **参数形状**：`wqkv` 输出列数从 `3·D` 变为 `D + 2·KV·dh`（Q 占 D，K/V 各占 `KV·dh`；`dh = D/H`）。`nKvHead` 缺省 = `nHead`（即 MHA，完全向后兼容）。
+- **头映射**：Q 头 `h` 对应的 KV 头为 `kvh = ⌊h/g⌋`，须满足 `H % KV === 0`。
+- **前向**：`K_j = qkv[j·stride + D + kvh·dh]`、`V_j = qkv[j·stride + D + KV·dh + kvh·dh]`（stride = qkvDim）。
+- **反向要点（唯一易错点）**：多个 Q 头共享同一 KV 头，故 `dK/dV` 必须**累加**（`+=`）而非覆盖。该 bug 在 v4 开发中被梯度检验抓出（MHA 下 `KV=H` 每个头唯一，`+=` 退化为 `=`，故此前零回归）。
+- **KV cache**：缓存的 K/V 维度同步变为 `KV·dh`（不再是 D），`initKVCache`/`kvShift` 已按 `model.KV·model.dh` 分配。
+- **预设**：`llama-gqa = {rmsnorm, swiglu, rope, nKvHead:2}`；亦可显式传 `nKvHead` 任意合法值。
+- **收益（实测，dModel=16/H=4）**：wqkv 参数 MHA=768 → GQA(nKvHead=2)=512；总参 7648 → 7104。
+- **验证**：`scripts/probe-v4-gqa.js` —— GQA 中心差分梯度检验（err/tol=4.95e-4）、KV cache 逐步逐位一致、持久化无损往返、参数节省、过拟合可训练性，全绿。
+
+---
+
 ## 3. 反向传播（全部手写）
 
 ### 3.1 损失与起点
