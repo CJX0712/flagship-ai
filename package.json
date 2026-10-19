@@ -1,7 +1,7 @@
 {
   "name": "flagship-ai",
-  "version": "4.0.0",
-  "description": "零依赖纯 JavaScript 手写 GPT 引擎：字符级分词 + Decoder-only Transformer + 手写反向传播 + AdamW + 温度/top-k 采样。Node 与浏览器双端运行，10 项自检全绿。",
+  "version": "5.0.0",
+  "description": "零依赖纯 JavaScript 手写 GPT 引擎：多架构(GPT-2/LLaMA/LLaMA-GQA) + BPE 分词 + INT8 权重量化 + 手写反向传播 + AdamW + KV Cache。Node 与浏览器双端运行，12 项自检全绿。",
   "main": "src/flagship-engine.js",
   "scripts": {
     "test": "node src/verify.js",

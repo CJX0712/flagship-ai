@@ -209,6 +209,10 @@
           <label for="genSeed">种子</label>
           <input id="genSeed" type="number" value="1234" min="0" step="1">
         </div>
+        <div style="grid-column:1/-1;display:flex;align-items:center;gap:8px">
+          <label for="quant" style="margin:0">量化推理（INT8 权重量化，内存/体积 ≈ 1/7）</label>
+          <input id="quant" type="checkbox" style="width:auto">
+        </div>
       </div>
       <div class="btns">
         <button id="genBtn" disabled>生成文本</button>

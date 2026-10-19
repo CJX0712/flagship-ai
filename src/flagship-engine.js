@@ -92,6 +92,45 @@
     return C;
   }
 
+  // ── INT8 权重量化（weight-only PTQ，LLM.int8 / AWQ 谱系）──────────────
+  // 对称逐张量量化：q = round(w / scale), clamp[-127,127], scale = max|w|/127。
+  // 推理时 w = q·scale 在矩阵乘内联解量化，权重常驻 Int8 → 内存/体积 ≈ 1/4。
+  function matmulQ(A, q, scale, r, k, c) {
+    const C = new Float64Array(r * c);
+    for (let i = 0; i < r; i++) {
+      const ai = i * k, ci = i * c;
+      for (let j = 0; j < c; j++) {
+        let s = 0;
+        for (let p = 0; p < k; p++) s += A[ai + p] * q[p * c + j];
+        C[ci + j] = s * scale;
+      }
+    }
+    return C;
+  }
+  // A(r×k) @ (scale·q)(m×k)^T -> C(r×m)，q 按 [m][k] 行主序展开
+  function matmulAtBQ(A, q, scale, r, k, m) {
+    const C = new Float64Array(r * m);
+    for (let i = 0; i < r; i++) {
+      const ai = i * k, ci = i * m;
+      for (let j = 0; j < m; j++) {
+        let s = 0;
+        const qj = j * k;
+        for (let p = 0; p < k; p++) s += A[ai + p] * q[qj + p];
+        C[ci + j] = s * scale;
+      }
+    }
+    return C;
+  }
+  // 权重分发：param 含 .q 即走解量化路径，否则走原始 Float64 路径（零回归）
+  function mm(A, W, r, k, c) {
+    return W.q ? matmulQ(A, W.q, W.scale, r, k, c) : matmul(A, W.d, r, k, c);
+  }
+  function mmAtB(A, W, r, k, m) {
+    return W.q ? matmulAtBQ(A, W.q, W.scale, r, k, m) : matmulAtB(A, W.d, r, k, m);
+  }
+  const QUANT_LINEAR_RE = /^(l\d+\.(wqkv|wproj|w1|w2)|tokEmb|posEmb)$/;
+  function isQuantLinear(key) { return QUANT_LINEAR_RE.test(key); }
+
   function addInto(dst, src) {
     for (let i = 0; i < dst.length; i++) dst[i] += src[i];
   }
@@ -530,6 +569,7 @@
       this.useRms = this.cfg.norm === 'rmsnorm';
       this.useSwi = this.cfg.ffn === 'swiglu';
       this.fh = this.cfg.ffnHidden || 4 * D;
+      this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
       const add = (name, r, c, scale) => {
@@ -572,8 +612,41 @@
 
     paramCount() {
       let n = 0;
-      for (const key in this.params) n += this.params[key].d.length;
+      for (const key in this.params) {
+        const p = this.params[key];
+        n += p.q ? p.q.length : p.d.length;
+      }
       return n;
+    }
+
+    /** 导出 INT8 权重量化推理副本（weight-only PTQ）。
+     * 线性权重（wqkv/wproj/w1/w2/tokEmb/posEmb）转为 {q, scale} 常驻 Int8，
+     * 偏置与归一化参数保持 Float64。原模型（训练态）不受影响。 */
+    quantize() {
+      const m = Object.create(GPTModel.prototype);
+      m.cfg = this.cfg;
+      m.useRms = this.useRms; m.useSwi = this.useSwi; m.useRope = this.useRope;
+      m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
+      m.qkvDim = this.qkvDim; m.quantized = true;
+      m.params = {};
+      for (const key in this.params) {
+        const p = this.params[key];
+        if (p && p.d && isQuantLinear(key)) {
+          const d = p.d;
+          let maxAbs = 0;
+          for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > maxAbs) maxAbs = a; }
+          const scale = maxAbs / 127 || 1;
+          const q = new Int8Array(d.length);
+          for (let i = 0; i < d.length; i++) {
+            let v = Math.round(d[i] / scale);
+            q[i] = v > 127 ? 127 : v < -127 ? -127 : v;
+          }
+          m.params[key] = { q, scale };
+        } else {
+          m.params[key] = { d: p.d ? p.d.slice() : p.d };
+        }
+      }
+      return m;
     }
 
     /** 前向传播，返回 { logits(T×V), cache }，cache 供反向传播使用 */
@@ -589,11 +662,13 @@
 
       // 1) token 嵌入 + 位置嵌入（RoPE 模式下无位置嵌入）
       let X = new Float64Array(T * D);
-      const tokEmb = P.tokEmb.d, posEmb = P.posEmb ? P.posEmb.d : null;
+      const te = P.tokEmb, pe = P.posEmb;
+      const teQ = te.q, peQ = pe ? pe.q : null;
       for (let i = 0; i < T; i++) {
         const t = toks[i], o = i * D;
         for (let j = 0; j < D; j++) {
-          X[o + j] = posEmb ? tokEmb[t * D + j] + posEmb[o + j] : tokEmb[t * D + j];
+          const tv = teQ ? te.q[t * D + j] * te.scale : te.d[t * D + j];
+          X[o + j] = peQ ? tv + pe.q[o + j] * pe.scale : (pe ? tv + pe.d[o + j] : tv);
         }
       }
 
@@ -603,7 +678,7 @@
         // 2) pre-LN #1 -> 因果多头自注意力
         const ln1 = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), T, D);
         const A = ln1.Y;
-        const qkv = matmul(A, P[k + 'wqkv'].d, T, D, qkvDim);
+        const qkv = mm(A, P[k + 'wqkv'], T, D, qkvDim);
         for (let i = 0; i < T; i++) {
           const o = i * qkvDim;
           for (let j = 0; j < qkvDim; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
@@ -638,7 +713,7 @@
             }
           }
         }
-        let attn = matmul(ctx, P[k + 'wproj'].d, T, D, D);
+        let attn = mm(ctx, P[k + 'wproj'], T, D, D);
         for (let i = 0; i < T; i++) {
           const o = i * D;
           for (let j = 0; j < D; j++) attn[o + j] += P[k + 'bproj'].d[j];
@@ -650,14 +725,14 @@
         const ln2 = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), T, D);
         const M = ln2.Y;
         const FH = this.fh;
-        const pre1 = matmul(M, P[k + 'w1'].d, T, D, this.useSwi ? 2 * FH : FH);
+        const pre1 = mm(M, P[k + 'w1'], T, D, this.useSwi ? 2 * FH : FH);
         const W1 = this.useSwi ? 2 * FH : FH;
         for (let i = 0; i < T; i++) {
           const o = i * W1;
           for (let j = 0; j < W1; j++) pre1[o + j] += P[k + 'b1'].d[j];
         }
         const h1 = this.useSwi ? swigluFwd(pre1, T, FH) : geluFwd(pre1);
-        const ff = matmul(h1, P[k + 'w2'].d, T, FH, D);
+        const ff = mm(h1, P[k + 'w2'], T, FH, D);
         for (let i = 0; i < T; i++) {
           const o = i * D;
           for (let j = 0; j < D; j++) ff[o + j] += P[k + 'b2'].d[j];
@@ -672,7 +747,7 @@
       // 4) 最终归一化 + 权重共享输出头
       const lnf = NF(X, P['lnf.g'].d, nb('lnf.b'), T, D);
       const Hf = lnf.Y;
-      const logits = matmulAtB(Hf, P.tokEmb.d, T, D, V);
+      const logits = mmAtB(Hf, P.tokEmb, T, D, V);
       return { logits, cache: { T, dh, H, D, L, layers, lnf, Hf, toks } };
     }
 
@@ -931,20 +1006,22 @@
     const slot = kv.n;        // 写入槽位
     const nValid = slot + 1;  // 参与注意力的有效位置数（含当前 token）
 
-    // 1) token 嵌入 + 位置嵌入（单行）
+    // 1) token 嵌入 + 位置嵌入（单行，量化权重走解量化查表）
     let X = new Float64Array(D);
     const posIdx = Math.min(pos, B - 1);
+    const te = P.tokEmb, pe = P.posEmb;
     for (let j = 0; j < D; j++) {
-      X[j] = P.posEmb
-        ? P.tokEmb.d[tokenId * D + j] + P.posEmb.d[posIdx * D + j]
-        : P.tokEmb.d[tokenId * D + j];
+      const tv = te.q ? te.q[tokenId * D + j] * te.scale : te.d[tokenId * D + j];
+      X[j] = pe
+        ? (pe.q ? pe.q[posIdx * D + j] * pe.scale : pe.d[posIdx * D + j]) + tv
+        : tv;
     }
 
     for (let l = 0; l < L; l++) {
       const k = `l${l}.`;
       // 2) pre-norm #1 -> QKV
       const A = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), 1, D).Y;
-      const qkv = matmul(A, P[k + 'wqkv'].d, 1, D, qkvDim);
+      const qkv = mm(A, P[k + 'wqkv'], 1, D, qkvDim);
       for (let j = 0; j < qkvDim; j++) qkv[j] += P[k + 'bqkv'].d[j];
       if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim);
 
@@ -969,7 +1046,7 @@
           ctx[h * dh + p] = s;
         }
       }
-      let attn = matmul(ctx, P[k + 'wproj'].d, 1, D, D);
+      let attn = mm(ctx, P[k + 'wproj'], 1, D, D);
       for (let j = 0; j < D; j++) attn[j] += P[k + 'bproj'].d[j];
       const xMid = new Float64Array(D);
       for (let j = 0; j < D; j++) xMid[j] = X[j] + attn[j];
@@ -977,10 +1054,10 @@
       // 5) pre-norm #2 -> FFN
       const M = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), 1, D).Y;
       const W1 = model.useSwi ? 2 * FH : FH;
-      const pre1 = matmul(M, P[k + 'w1'].d, 1, D, W1);
+      const pre1 = mm(M, P[k + 'w1'], 1, D, W1);
       for (let j = 0; j < W1; j++) pre1[j] += P[k + 'b1'].d[j];
       const h1 = model.useSwi ? swigluFwd(pre1, 1, FH) : geluFwd(pre1);
-      const ff = matmul(h1, P[k + 'w2'].d, 1, FH, D);
+      const ff = mm(h1, P[k + 'w2'], 1, FH, D);
       for (let j = 0; j < D; j++) ff[j] += P[k + 'b2'].d[j];
       const xOut = new Float64Array(D);
       for (let j = 0; j < D; j++) xOut[j] = xMid[j] + ff[j];
@@ -990,7 +1067,7 @@
     // 6) 最终归一化 + 权重共享输出头
     const Hf = NF(X, P['lnf.g'].d, nb('lnf.b'), 1, D).Y;
     kv.n = slot + 1;
-    return { logits: matmulAtB(Hf, P.tokEmb.d, 1, D, V0) };
+    return { logits: mmAtB(Hf, P.tokEmb, 1, D, V0) };
   }
 
   /** 滑动窗口：丢弃最旧的 1 个 token（copyWithin 原生 memmove，O(B·D) 无重算）。
@@ -1019,13 +1096,19 @@
   /* ==========================================================================
    * 六、模型持久化（无损 JSON）
    * ======================================================================== */
-  /** 序列化模型。一并存词表（字符数组），保证导入后可完整重建分词器 */
+  /** 序列化模型。一并存词表（字符数组），保证导入后可完整重建分词器。
+   * 量化权重存为 {q:[...], s:scale}（Int8），未量化存为普通浮点数组。 */
   function saveModel(model, tok) {
     const params = {};
-    for (const key in model.params) params[key] = Array.from(model.params[key].d);
+    let quantized = false;
+    for (const key in model.params) {
+      const p = model.params[key];
+      if (p.q) { params[key] = { q: Array.from(p.q), s: p.scale }; quantized = true; }
+      else params[key] = Array.from(p.d);
+    }
     return JSON.stringify({
       format: 'flagship-ai', version: 2,
-      cfg: model.cfg, params,
+      cfg: model.cfg, params, quantized,
       vocab: tok ? tok.chars : null,
       tokKind: tok ? (tok.kind || 'char') : null,
       merges: tok && tok.kind === 'bpe' ? tok.merges : null,
@@ -1061,11 +1144,18 @@
     if (!obj || obj.format !== 'flagship-ai') throw new Error('无法识别的模型格式');
     const m = new GPTModel(obj.cfg);
     for (const key in obj.params) {
-      const dst = m.params[key];
-      if (!dst) throw new Error(`模型缺少参数 ${key}`);
-      if (obj.params[key].length !== dst.d.length) throw new Error(`参数 ${key} 长度不匹配`);
-      dst.d.set(obj.params[key]);
+      const src = obj.params[key];
+      if (Array.isArray(src)) {
+        const dst = m.params[key];
+        if (!dst) throw new Error(`模型缺少参数 ${key}`);
+        if (src.length !== dst.d.length) throw new Error(`参数 ${key} 长度不匹配`);
+        dst.d.set(src);
+      } else {
+        // 量化权重：{q, s}
+        m.params[key] = { q: Int8Array.from(src.q), scale: src.s };
+      }
     }
+    if (obj.quantized) m.quantized = true;
     return m;
   }
 

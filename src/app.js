@@ -189,8 +189,10 @@
   /* ---------- 生成 ---------- */
   function doGenerate() {
     if (!state.model) { log('请先构建并训练模型', 'warn'); return; }
+    const useQuant = $('quant') && $('quant').checked;
+    const model = useQuant ? state.model.quantize() : state.model;
     const t0 = performance.now();
-    const r = F.generate(state.model, state.tok, $('prompt').value, {
+    const r = F.generate(model, state.tok, $('prompt').value, {
       maxNew: +$('maxNew').value,
       temperature: +$('temperature').value,
       topK: +$('topK').value,
@@ -199,7 +201,7 @@
     const ms = performance.now() - t0;
     $('output').textContent = r.text;
     const tps = ms > 0 ? (r.ids.length / ms * 1000).toFixed(0) : '—';
-    log(`生成 ${r.ids.length} token，耗时 ${ms.toFixed(0)}ms（${tps} token/s · KV cache · 温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
+    log(`生成 ${r.ids.length} token，耗时 ${ms.toFixed(0)}ms（${tps} token/s · KV cache${useQuant ? ' · INT8 量化' : ''} · 温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
   }
 
   /* ---------- 模型持久化 ---------- */

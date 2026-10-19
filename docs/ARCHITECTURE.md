@@ -177,6 +177,19 @@ MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2
 - **收益（实测，dModel=16/H=4）**：wqkv 参数 MHA=768 → GQA(nKvHead=2)=512；总参 7648 → 7104。
 - **验证**：`scripts/probe-v4-gqa.js` —— GQA 中心差分梯度检验（err/tol=4.95e-4）、KV cache 逐步逐位一致、持久化无损往返、参数节省、过拟合可训练性，全绿。
 
+### 2.11 INT8 权重量化推理（v5.0，weight-only PTQ）
+
+对称逐张量量化（LLM.int8 / AWQ 谱系），仅压缩**权重**，激活仍走 Float64：
+
+- **编码**：`scale = max|w| / 127`，`q = clamp(round(w/scale), -127, 127)`（Int8）。每个线性权重（wqkv/wproj/w1/w2/tokEmb/posEmb）独立一个 scale。
+- **推理**：权重常驻 `Int8Array`，矩阵乘内联解量化 `w = q·scale`，即 `C = (A @ q)·scale`。偏置与归一化参数保持 Float64（占比极小）。
+- **内存/体积**：线性权重由 Float64(8B) → Int8(1B) **恰好 8x**；整体（含偏置/归一化）实测 **6.89x**；模型存档（JSON）F32 888.7KB → INT8 157.9KB = **5.63x**。
+- **精度**：纯舍入误差，对解码无损——logits `max|Δ| < 0.03`，生成文本与 F32 一致、有限无 NaN。
+- **零回归保证**：`mm` / `mmAtB` 在权重带 `.q` 时走 `matmulQ` / `matmulAtBQ` 解量化路径，否则走原始 Float64 路径；F32 训练模型因无 `.q` 完全不受影响。`quantize()` 为**只读导出**，不改动原模型。
+- **持久化兼容**：`saveModel` 对量化权重自动存 `{q, s}`；`loadModel` 还原为 `{q, scale}` 常驻 Int8，载入即量化推理。
+- **诚实说明**：纯 JS 无 SIMD，解量化 matmul 的**计算速度持平**（不加速）；量化收益全部在内存与序列化体积——直接服务于"浏览器一键运行"的小体积部署。
+- **验证**：`scripts/probe-v5-quant.js` —— 数值保真 / KV-cache 末位逐位一致 / 存档往返 / 体积压缩 / in-RAM 8x，11 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -340,7 +353,8 @@ logits = LN_f(x)·Wteᵀ
 | 路线 | 实测结果 | 否决原因 |
 |---|---|---|
 | 手写 4 路循环展开 | 32.70µs vs 朴素 30.20µs（**更慢**） | V8 已把 `i-p-j` 朴素循环优化到标量极限 ~900–1040M MAC/s，手工展开干扰了它的优化 |
-| Int8 权重量化（llama.cpp 路线） | 0.92x（**无加速**） | JS 无法访问 SIMD intrinsics；Int8Array 加载还要符号扩展。量化的收益在 JS 里拿不到，反而丢精度 |
+| Int8 **计算**量化（llama.cpp 路线） | 0.92x（**无加速**） | JS 无法访问 SIMD intrinsics；Int8Array 加载还要符号扩展。量化**计算**的收益在 JS 里拿不到 |
+| INT8 **权重**量化（v5.0，仅压缩） | 存档 ≈ 5.6x、内存 ≈ 6.9x（**保真**） | weight-only PTQ：权重常驻 Int8 在 matmul 内联解量化，计算速度持平，但体积/内存大幅下降，对解码无损 |
 
 **JS 中 Float64 matmul 的真实天花板约 1 G MAC/s**（单核标量）。要突破只能靠 Wasm SIMD，那就不再是"零依赖单文件"了——本项目选择守住这个边界。
 

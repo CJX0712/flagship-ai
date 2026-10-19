@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v4.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v5.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA 架构可切换 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA 架构可切换 · INT8 权重量化推理 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
 
 </div>
 
@@ -33,6 +33,18 @@
 | **架构预设** | `applyPreset(cfg,'llama')` | 一行切到 `RMSNorm + SwiGLU + RoPE`，每个模块均经中心差分梯度检验 |
 | **BPE 分词器** | GPT-2 / tiktoken | 字节级（覆盖任意 UTF-8）与字符级（中文语料更省 token）双基元，往返无损 |
 | **RoPE 长度外推** | LLaMA | 相对位置不变性，注意力分数只依赖相对距离，支持超长生成 + 滑动窗口精确一致 |
+
+### v4.0 新增（GQA 分组查询注意力，LLaMA-2/3 标准）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **GQA** | LLaMA-2/3 | `nKvHead` 开关（`<nHead` 启用），Q 头→KV 头分组映射 `⌊h/(nHead/nKvHead)⌋`，KV cache 同步压缩 |
+
+### v5.0 新增（INT8 权重量化推理，weight-only PTQ）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **INT8 权重量化** | LLM.int8 / AWQ 谱系 | `model.quantize()` 将线性权重转 {Int8, scale} 常驻内存；推理时在矩阵乘内联解量化，权重体积 ≈ 1/8，模型存档 ≈ 1/7（实测 5.6x），对解码无损（logits maxΔ<0.03）。原训练模型不受影响 |
 
 
 
@@ -84,7 +96,8 @@ KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 toke
 | 路线 | 实测 | 结论 |
 |---|---|---|
 | 手写 4 路循环展开 | 32.7µs vs 30.2µs（更慢） | V8 已把朴素循环优化到标量极限 ~900M MAC/s |
-| Int8 权重量化（llama.cpp 路线） | 0.92x（无加速） | JS 无 SIMD intrinsics，量化收益来自 C++ SIMD，JS 拿不到 |
+| Int8 计算量化（llama.cpp 路线） | 0.92x（无加速） | JS 无 SIMD intrinsics，量化计算收益来自 C++ SIMD，JS 拿不到 |
+| **INT8 权重量化（v5.0，仅权重压缩）** | **存档 ≈ 5.6x、内存 ≈ 6.9x** | weight-only PTQ：权重常驻 Int8 在矩阵乘内联解量化，**计算速度持平但体积/内存大降**，对解码无损（logits maxΔ<0.03） |
 
 
 ## 快速开始
@@ -135,6 +148,13 @@ console.log('bpe tokens:', bpe.encode('旗舰 AI 锻造世界顶级模型').leng
 const json = F.saveModel(model, tok);
 const model2 = F.loadModel(json);
 const tok2 = F.loadTokenizer(json);
+
+// ── v5.0：INT8 权重量化推理（weight-only PTQ，内存/存档 ≈ 1/7，对解码无损）──
+const mInt8 = model.quantize();                 // 只读导出，原 model 不受影响
+const json8 = F.saveModel(mInt8, tok);           // 存档自动以 {q, scale} 编码
+const m8 = F.loadModel(json8);                   // 载入即 INT8 常驻
+console.log('量化存档体积比:', (json.length / json8.length).toFixed(2) + 'x'); // ≈ 5.6x
+const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 ```
 
 ### 浏览器（一键运行）
@@ -155,6 +175,7 @@ const tok2 = F.loadTokenizer(json);
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
 | `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） |
 | `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}` |
+| `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻，推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
 | `initKVCache` | `initKVCache(model)` → `{K, V, n}` | 每层 K/V 预分配 `blockSize×D` |
@@ -173,6 +194,8 @@ flagship-ai/
 │   └── app.js               # demo 应用逻辑（字符级 / BPE / 架构选择）
 ├── scripts/build-demo.js    # 把引擎+套件+应用内联进 demo.html
 ├── scripts/probe-v3.js      # v3 对照实验：BPE / 多架构梯度检验 / RoPE 不变性
+├── scripts/probe-v4-gqa.js  # v4 验证：GQA 梯度检验 / KV 一致性 / 持久化 / 参数节省
+├── scripts/probe-v5-quant.js # v5 验证：INT8 量化保真 / 存档体积 / in-RAM 压缩
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导
 └── package.json
@@ -188,7 +211,8 @@ flagship-ai/
 ## 已知限制
 
 - 教学级规模（dModel 64 / 2 层 ≈ 12 万参数），面向学习与验证，非生产推理
-- 纯 JS 单线程，无 GPU；已实测排除循环展开与 Int8 量化（V8 无 SIMD 收益）
+- 纯 JS 单线程，无 GPU；已实测排除循环展开与 Int8 **计算**量化（V8 无 SIMD 收益），但 v5.0 的 INT8 **权重**量化（仅压缩）仍带来 ≈ 7x 体积/内存下降
+- 量化后计算速度持平（无 SIMD 加速），收益在内存与序列化体积，对解码质量无损
 - `pos:'learned'`（GPT-2 绝对位置嵌入）下，序列超出 blockSize 后转入**滑动窗口**（丢弃最旧 token），与"全量重算最后 blockSize 个 token"不再逐位等价 —— 这是 GPT-2 位置嵌入的固有约束
 - `pos:'rope'`（RoPE）天然支持长度外推，滑动窗口下与全量推理**逐位一致**（注意力分数只依赖相对距离），更适合超长生成
 - 字节级 BPE 在中文小语料下压缩率反而不如字符级（每汉字 3 字节需先"合并回来"）；中文场景建议 `byteLevel:false`

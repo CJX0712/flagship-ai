@@ -32,3 +32,6 @@ jobs:
 
       - name: GQA (Grouped-Query Attention) probe
         run: node scripts/probe-v4-gqa.js
+
+      - name: INT8 weight-only quantization probe
+        run: node scripts/probe-v5-quant.js
