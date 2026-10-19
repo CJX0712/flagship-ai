@@ -1,10 +1,12 @@
 {
   "name": "flagship-ai",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "description": "零依赖纯 JavaScript 手写 GPT 引擎：多架构(GPT-2/LLaMA/LLaMA-GQA) + BPE 分词 + INT8 权重量化 + 手写反向传播 + AdamW + KV Cache。Node 与浏览器双端运行，12 项自检全绿。",
   "main": "src/flagship-engine.js",
   "scripts": {
     "test": "node src/verify.js",
+    "bench": "node scripts/bench.js",
+    "bench:full": "node scripts/bench.js --full",
     "build": "node scripts/build-demo.js",
     "demo": "node scripts/build-demo.js && echo '打开 demo.html 即可（file:// 协议直接运行）'"
   },

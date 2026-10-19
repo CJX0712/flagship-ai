@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v5.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v6.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -45,6 +45,13 @@
 | 能力 | 复用来源 | 说明 |
 |---|---|---|
 | **INT8 权重量化** | LLM.int8 / AWQ 谱系 | `model.quantize()` 将线性权重转 {Int8, scale} 常驻内存；推理时在矩阵乘内联解量化，权重体积 ≈ 1/8，模型存档 ≈ 1/7（实测 5.6x），对解码无损（logits maxΔ<0.03）。原训练模型不受影响 |
+
+### v6.0 新增（工程化基准收口）
+
+| 能力 | 说明 |
+|---|---|
+| **统一基准报告 `bench.js`** | `npm run bench` 一键聚合多架构梯度检验 / RoPE 不变性 / GQA / BPE / INT8 量化 / KV cache 加速比，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)；`npm run bench:full` 追加参数对齐架构对照（llama 准确率 47.6% > gpt2 34.9%） |
+| **CI 门禁闭环** | GitHub Actions（Node 20/22）依次跑 verify(12/12) → probe-v3/v4/v5 → bench，把"可复现可验证"固化成工程纪律 |
 
 
 
@@ -99,6 +106,9 @@ KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 toke
 | Int8 计算量化（llama.cpp 路线） | 0.92x（无加速） | JS 无 SIMD intrinsics，量化计算收益来自 C++ SIMD，JS 拿不到 |
 | **INT8 权重量化（v5.0，仅权重压缩）** | **存档 ≈ 5.6x、内存 ≈ 6.9x** | weight-only PTQ：权重常驻 Int8 在矩阵乘内联解量化，**计算速度持平但体积/内存大降**，对解码无损（logits maxΔ<0.03） |
 
+### 一键基准报告
+
+`npm run bench` 聚合所有核心度量，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)（多架构梯度检验、RoPE 不变性、GQA、BPE、INT8 量化、KV cache 加速比）；`npm run bench:full` 追加**参数对齐架构对照**（同语料/同种子/同步数下 gpt2 vs llama 的 loss 与准确率）。CI 默认跑快速版。
 
 ## 快速开始
 
@@ -196,8 +206,10 @@ flagship-ai/
 ├── scripts/probe-v3.js      # v3 对照实验：BPE / 多架构梯度检验 / RoPE 不变性
 ├── scripts/probe-v4-gqa.js  # v4 验证：GQA 梯度检验 / KV 一致性 / 持久化 / 参数节省
 ├── scripts/probe-v5-quant.js # v5 验证：INT8 量化保真 / 存档体积 / in-RAM 压缩
+├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导
+├── docs/BENCHMARK.md        # 自动生成的基准报告（bench.js 产出）
 └── package.json
 ```
 
