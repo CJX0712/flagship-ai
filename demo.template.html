@@ -128,6 +128,14 @@
           <label for="nKvHead">KV 头数 nKvHead（留空=MHA；&lt; nHead 启用 GQA）</label>
           <input id="nKvHead" type="number" min="1" step="1" placeholder="留空=自动">
         </div>
+        <div>
+          <label for="nExp">专家数 nExp（留空=稠密；&gt;1 启用 MoE 混合专家）</label>
+          <input id="nExp" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
+        <div>
+          <label for="topK">激活专家 topK（留空=跟随 nExp/预设）</label>
+          <input id="topK" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -144,6 +152,7 @@
             <option value="gpt2" selected>GPT-2（LN+GELU+位置嵌入）</option>
             <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
+            <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
           </select>
         </div>
         <div>

@@ -128,6 +128,14 @@
           <label for="nKvHead">KV 头数 nKvHead（留空=MHA；&lt; nHead 启用 GQA）</label>
           <input id="nKvHead" type="number" min="1" step="1" placeholder="留空=自动">
         </div>
+        <div>
+          <label for="nExp">专家数 nExp（留空=稠密；&gt;1 启用 MoE 混合专家）</label>
+          <input id="nExp" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
+        <div>
+          <label for="topK">激活专家 topK（留空=跟随 nExp/预设）</label>
+          <input id="topK" type="number" min="1" step="1" placeholder="留空=自动">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -144,6 +152,7 @@
             <option value="gpt2" selected>GPT-2（LN+GELU+位置嵌入）</option>
             <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
+            <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
           </select>
         </div>
         <div>
@@ -376,7 +385,7 @@
   function mmAtB(A, W, r, k, m) {
     return W.q ? matmulAtBQ(A, W.q, W.scale, r, k, m) : matmulAtB(A, W.d, r, k, m);
   }
-  const QUANT_LINEAR_RE = /^(l\d+\.(wqkv|wproj|w1|w2)|tokEmb|posEmb)$/;
+  const QUANT_LINEAR_RE = /^(l\d+\.(wqkv|wproj|w1|w2|wg)|l\d+\.e\d+\.(w1|w2)|tokEmb|posEmb)$/;
   function isQuantLinear(key) { return QUANT_LINEAR_RE.test(key); }
 
   function addInto(dst, src) {
@@ -587,6 +596,115 @@
     return dS;
   }
 
+  /* ---- Top-k 行选择（MoE 路由用） ---- */
+  // 每行取概率最大的 k 个下标（升序稳定排序后取尾部），返回 idx/val 行主序数组
+  function topkRows(P, r, c, k) {
+    const idx = new Int32Array(r * k);
+    const val = new Float64Array(r * k);
+    for (let i = 0; i < r; i++) {
+      const o = i * c;
+      const order = [];
+      for (let j = 0; j < c; j++) order.push(j);
+      order.sort((a, b) => P[o + a] - P[o + b]); // 升序；并列保持插入序（稳定）
+      for (let t = 0; t < k; t++) {
+        const e = order[c - 1 - t];
+        idx[i * k + t] = e;
+        val[i * k + t] = P[o + e];
+      }
+    }
+    return { idx, val };
+  }
+
+  /* ---- MoE 前馈：路由网络 + top-k 专家散射 + 负载均衡辅助损失 ----
+   * 前向：logits = M·wg + bg → softmax → top-k 选专家 → 各专家 FFN 加权求和。
+   * 反向所需的中间量（各专家子集的 M/pre/h1/out、路由概率、计数）一并缓存。 */
+  function moeForward(model, P, k, M, T, D, FH) {
+    const E = model.nExp, K = model.topK;
+    const W1 = model.useSwi ? 2 * FH : FH;
+    const rlogits = mm(M, P[k + 'wg'], T, D, E);
+    for (let i = 0; i < T; i++) { const o = i * E; for (let j = 0; j < E; j++) rlogits[o + j] += P[k + 'bg'].d[j]; }
+    const probs = softmaxRows(rlogits, T, E);
+    const tk = topkRows(probs, T, E, K);
+    const f = new Int32Array(E);
+    const exp = [];
+    for (let e = 0; e < E; e++) exp.push({ rows: [], g: [], pre: null, h1: null, out: null, Msub: null });
+    for (let i = 0; i < T; i++) {
+      for (let j = 0; j < K; j++) { const e = tk.idx[i * K + j]; exp[e].rows.push(i); exp[e].g.push(tk.val[i * K + j]); f[e]++; }
+    }
+    const ff = new Float64Array(T * D);
+    for (let e = 0; e < E; e++) {
+      const ex = exp[e];
+      const cnt = ex.rows.length;
+      if (cnt === 0) continue;
+      const Msub = new Float64Array(cnt * D);
+      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D; for (let j = 0; j < D; j++) Msub[o2 + j] = M[oi + j]; }
+      const ek = `${k}e${e}.`;
+      const pre = mm(Msub, P[ek + 'w1'], cnt, D, W1);
+      for (let r2 = 0; r2 < cnt; r2++) { const o = r2 * W1; for (let j = 0; j < W1; j++) pre[o + j] += P[ek + 'b1'].d[j]; }
+      const h1 = model.useSwi ? swigluFwd(pre, cnt, FH) : geluFwd(pre);
+      const out = mm(h1, P[ek + 'w2'], cnt, FH, D);
+      for (let r2 = 0; r2 < cnt; r2++) { const o = r2 * D; for (let j = 0; j < D; j++) out[o + j] += P[ek + 'b2'].d[j]; }
+      ex.pre = pre; ex.h1 = h1; ex.out = out; ex.Msub = Msub;
+      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D, g = ex.g[r2]; for (let j = 0; j < D; j++) ff[oi + j] += g * out[o2 + j]; }
+    }
+    // 辅助负载均衡损失（Switch/GDP-MoE）：E·Σ_e f_e·P_e，冻结 f_e（离散选择不回传）
+    let aux = 0;
+    for (let e = 0; e < E; e++) {
+      let sp = 0;
+      for (let i = 0; i < T; i++) sp += probs[i * E + e];
+      aux += E * (f[e] / T) * (sp / T);
+    }
+    return { ff, moe: { rlogits, probs, idx: tk.idx, gate: tk.val, exp, f, E, K, T, M, k, aux } };
+  }
+
+  /* ---- MoE 反向：专家路径（标准 FFN 反向，按 top-k 子集累加）+ 路由路径 ----
+   * 路由路径：dgate=dot(dff, out) 注入 dprobs（仅选中位置）；再加辅助损失梯度
+   * ∂/∂probs[i,e]=auxWeight·E·count_e/T²（冻结 f_e），经 softmaxBwd 回传至 wg/bg。 */
+  function moeBackward(model, P, G, moe, dff, T, D) {
+    const E = moe.E, K = moe.K, FH = model.fh, W1 = model.useSwi ? 2 * FH : FH;
+    const dM = new Float64Array(T * D);
+    const k = moe.k;
+    // 1) 专家路径
+    for (let e = 0; e < E; e++) {
+      const ex = moe.exp[e];
+      const cnt = ex.rows.length;
+      if (cnt === 0) continue;
+      const ek = `${k}e${e}.`;
+      const dout = new Float64Array(cnt * D);
+      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D, g = ex.g[r2]; for (let j = 0; j < D; j++) dout[o2 + j] = dff[oi + j] * g; }
+      addInto(G[ek + 'w2'], matmulTA(ex.h1, dout, cnt, FH, D));
+      rowSumInto(G[ek + 'b2'], dout, cnt, D);
+      const dh1 = matmulAtB(dout, P[ek + 'w2'].d, cnt, D, FH);
+      const dpre = model.useSwi ? swigluBwd(dh1, ex.pre, cnt, FH) : geluBwd(dh1, ex.pre);
+      addInto(G[ek + 'w1'], matmulTA(ex.Msub, dpre, cnt, D, W1));
+      rowSumInto(G[ek + 'b1'], dpre, cnt, W1);
+      const dMsub = matmulAtB(dpre, P[ek + 'w1'].d, cnt, W1, D);
+      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D; for (let j = 0; j < D; j++) dM[oi + j] += dMsub[o2 + j]; }
+    }
+    // 2) 路由路径
+    const dprobs = new Float64Array(T * E);
+    for (let e = 0; e < E; e++) {
+      const ex = moe.exp[e];
+      for (let r2 = 0; r2 < ex.rows.length; r2++) {
+        const ti = ex.rows[r2];
+        let s = 0; for (let j = 0; j < D; j++) s += dff[ti * D + j] * ex.out[r2 * D + j];
+        dprobs[ti * E + e] = s;
+      }
+    }
+    // 辅助损失梯度（冻结 f_e）：∂/∂probs[i,e] = auxWeight·E·count_e/T²
+    const aw = model.auxWeight;
+    for (let e = 0; e < E; e++) {
+      const term = aw * E * moe.f[e] / (T * T);
+      for (let i = 0; i < T; i++) dprobs[i * E + e] += term;
+    }
+    const dRlogits = softmaxBwd(dprobs, moe.probs, T, E);
+    addInto(G[k + 'wg'], matmulTA(moe.M, dRlogits, T, D, E));
+    rowSumInto(G[k + 'bg'], dRlogits, T, E);
+    const dMr = matmulAtB(dRlogits, P[k + 'wg'].d, T, E, D);
+    for (let i = 0; i < T * D; i++) dM[i] += dMr[i];
+    return dM;
+  }
+
   /* ---- 交叉熵（logits 前 n 行对 targets；totalRows 补零至完整行数供反向使用） ---- */
   function crossEntropy(logits, targets, n, V, totalRows) {
     const rows = totalRows || n;
@@ -795,6 +913,10 @@
      *   ffn:  'gelu'（GPT-2）        | 'swiglu'（SiLU 门控，LLaMA/Mistral）
      *   pos:  'learned'（可学习位置嵌入，GPT-2）| 'rope'（旋转位置编码，LLaMA/Mistral）
      *   ffnHidden: FFN 隐藏层宽度，默认 4·dModel（LLaMA 惯例为 ⌊2/3·4D⌋，可显式传入）
+     *   MoE 开关（默认稠密，nExp=1；nExp>1 即混合专家，现代顶级 LLM 核心稀疏架构）：
+     *   nExp:    专家数量（每层 N 个独立 FFN + 1 个路由网络）
+     *   topK:    top-k 门控（每个 token 仅激活 topK 个专家，默认 1）
+     *   auxWeight: 负载均衡辅助损失权重（Switch/GDP-MoE，默认 0.01；非 MoE 为 0）
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -817,6 +939,12 @@
       this.useRms = this.cfg.norm === 'rmsnorm';
       this.useSwi = this.cfg.ffn === 'swiglu';
       this.fh = this.cfg.ffnHidden || 4 * D;
+      // MoE（混合专家）：nExp>1 时每层 FFN 替换为 N 个专家 + top-k 路由网络；
+      // 现代顶级 LLM（Mixtral/GPT-4/DeepSeek）的核心稀疏架构。nExp=1 即稠密（零回归）。
+      this.nExp = cfg.nExp || 1;
+      this.topK = Math.min(cfg.topK || 1, this.nExp);
+      this.useMoE = this.nExp > 1;
+      this.auxWeight = cfg.auxWeight != null ? cfg.auxWeight : (this.useMoE ? 0.01 : 0);
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -840,10 +968,22 @@
         const k = `l${l}.`;
         add(k + 'wqkv', D, this.qkvDim); zeros(k + 'bqkv', this.qkvDim);
         add(k + 'wproj', D, D, rscale); zeros(k + 'bproj', D);
-        // SwiGLU 的 w1 一次产出 gate 与 up 两半（D → 2·FH），少一次矩阵乘
-        add(k + 'w1', D, this.useSwi ? 2 * FH : FH);
-        zeros(k + 'b1', this.useSwi ? 2 * FH : FH);
-        add(k + 'w2', FH, D, rscale); zeros(k + 'b2', D);
+        if (this.useMoE) {
+          // 路由网络：x → 各专家门控 logits（softmax over experts）
+          add(k + 'wg', D, this.nExp); zeros(k + 'bg', this.nExp);
+          // N 个专家 FFN（各自独立的 SwiGLU/GELU 两层），复用稠密 FFN 的同一宽度约定
+          for (let e = 0; e < this.nExp; e++) {
+            const ek = `${k}e${e}.`;
+            add(ek + 'w1', D, this.useSwi ? 2 * FH : FH);
+            zeros(ek + 'b1', this.useSwi ? 2 * FH : FH);
+            add(ek + 'w2', FH, D, rscale); zeros(ek + 'b2', D);
+          }
+        } else {
+          // SwiGLU 的 w1 一次产出 gate 与 up 两半（D → 2·FH），少一次矩阵乘
+          add(k + 'w1', D, this.useSwi ? 2 * FH : FH);
+          zeros(k + 'b1', this.useSwi ? 2 * FH : FH);
+          add(k + 'w2', FH, D, rscale); zeros(k + 'b2', D);
+        }
         ones(k + 'ln1.g', D); if (!this.useRms) zeros(k + 'ln1.b', D);
         ones(k + 'ln2.g', D); if (!this.useRms) zeros(k + 'ln2.b', D);
       }
@@ -969,26 +1109,32 @@
         const xMid = new Float64Array(T * D);
         for (let i = 0; i < T * D; i++) xMid[i] = X[i] + attn[i]; // 残差连接
 
-        // 3) pre-LN #2 -> 前馈网络（GELU）
+        // 3) pre-LN #2 -> 前馈网络（MoE 稀疏 / 稠密 GELU/SwiGLU 双路径）
         const ln2 = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), T, D);
         const M = ln2.Y;
         const FH = this.fh;
-        const pre1 = mm(M, P[k + 'w1'], T, D, this.useSwi ? 2 * FH : FH);
-        const W1 = this.useSwi ? 2 * FH : FH;
-        for (let i = 0; i < T; i++) {
-          const o = i * W1;
-          for (let j = 0; j < W1; j++) pre1[o + j] += P[k + 'b1'].d[j];
-        }
-        const h1 = this.useSwi ? swigluFwd(pre1, T, FH) : geluFwd(pre1);
-        const ff = mm(h1, P[k + 'w2'], T, FH, D);
-        for (let i = 0; i < T; i++) {
-          const o = i * D;
-          for (let j = 0; j < D; j++) ff[o + j] += P[k + 'b2'].d[j];
+        let ff, pre1 = null, h1 = null, moe = null;
+        if (this.useMoE) {
+          const r = moeForward(this, P, k, M, T, D, FH);
+          ff = r.ff; moe = r.moe;
+        } else {
+          const W1 = this.useSwi ? 2 * FH : FH;
+          pre1 = mm(M, P[k + 'w1'], T, D, W1);
+          for (let i = 0; i < T; i++) {
+            const o = i * W1;
+            for (let j = 0; j < W1; j++) pre1[o + j] += P[k + 'b1'].d[j];
+          }
+          h1 = this.useSwi ? swigluFwd(pre1, T, FH) : geluFwd(pre1);
+          ff = mm(h1, P[k + 'w2'], T, FH, D);
+          for (let i = 0; i < T; i++) {
+            const o = i * D;
+            for (let j = 0; j < D; j++) ff[o + j] += P[k + 'b2'].d[j];
+          }
         }
         const xOut = new Float64Array(T * D);
         for (let i = 0; i < T * D; i++) xOut[i] = xMid[i] + ff[i]; // 残差连接
 
-        layers.push({ ln1, A, qkv, Ps, ctx, xMid, ln2, M, pre1, h1 });
+        layers.push({ ln1, A, qkv, Ps, ctx, xMid, ln2, M, pre1, h1, moe });
         X = xOut;
       }
 
@@ -1021,14 +1167,19 @@
         const c = cache.layers[l];
         // xOut = xMid + ff => dff = dX, dxMid = dX
         const dff = dX;
-        const FH = this.fh, W1 = this.useSwi ? 2 * FH : FH;
-        addInto(G[k + 'w2'], matmulTA(c.h1, dff, T, FH, D));
-        rowSumInto(G[k + 'b2'], dff, T, D);
-        const dh1 = matmulAtB(dff, P[k + 'w2'].d, T, D, FH);
-        const dpre1 = this.useSwi ? swigluBwd(dh1, c.pre1, T, FH) : geluBwd(dh1, c.pre1);
-        addInto(G[k + 'w1'], matmulTA(c.M, dpre1, T, D, W1));
-        rowSumInto(G[k + 'b1'], dpre1, T, W1);
-        const dM = matmulAtB(dpre1, P[k + 'w1'].d, T, W1, D);
+        let dM;
+        if (this.useMoE) {
+          dM = moeBackward(this, P, G, c.moe, dff, T, D);
+        } else {
+          const FH = this.fh, W1 = this.useSwi ? 2 * FH : FH;
+          addInto(G[k + 'w2'], matmulTA(c.h1, dff, T, FH, D));
+          rowSumInto(G[k + 'b2'], dff, T, D);
+          const dh1 = matmulAtB(dff, P[k + 'w2'].d, T, D, FH);
+          const dpre1 = this.useSwi ? swigluBwd(dh1, c.pre1, T, FH) : geluBwd(dh1, c.pre1);
+          addInto(G[k + 'w1'], matmulTA(c.M, dpre1, T, D, W1));
+          rowSumInto(G[k + 'b1'], dpre1, T, W1);
+          dM = matmulAtB(dpre1, P[k + 'w1'].d, T, W1, D);
+        }
         const ln2b = NB(dM, c.ln2.xhat, c.ln2.rstd, P[k + 'ln2.g'].d, T, D);
         addInto(G[k + 'ln2.g'], ln2b.dg);
         if (G[k + 'ln2.b']) addInto(G[k + 'ln2.b'], ln2b.db);
@@ -1188,6 +1339,13 @@
       const { logits, cache } = model.forward(batchToks);
       const { loss, dlogits } = crossEntropy(logits, targets, T - 1, V, T);
       model.backward(cache, dlogits);
+      // 负载均衡辅助损失（仅 MoE）：E·Σ_e f_e·P_e，乘以 auxWeight 并入总损失
+      let reported = loss;
+      if (model.useMoE && model.auxWeight) {
+        let aux = 0;
+        for (let l = 0; l < model.cfg.nLayer; l++) aux += cache.layers[l].moe.aux;
+        reported = loss + model.auxWeight * aux;
+      }
       // 全局梯度范数裁剪
       let gsq = 0;
       for (const key in model.grads) {
@@ -1208,8 +1366,8 @@
           p[i] -= lrNow * (mh / (Math.sqrt(vh) + eps) + o.wd * p[i]); // AdamW：解耦权重衰减
         }
       }
-      history.push(loss);
-      if (o.onStep) o.onStep(step, loss, lrNow, norm);
+      history.push(reported);
+      if (o.onStep) o.onStep(step, reported, lrNow, norm);
     }
     st.t = t;
     st.rngA = a;
@@ -1299,14 +1457,36 @@
       const xMid = new Float64Array(D);
       for (let j = 0; j < D; j++) xMid[j] = X[j] + attn[j];
 
-      // 5) pre-norm #2 -> FFN
+      // 5) pre-norm #2 -> FFN（MoE 稀疏 / 稠密 双路径，单 token 增量）
       const M = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), 1, D).Y;
-      const W1 = model.useSwi ? 2 * FH : FH;
-      const pre1 = mm(M, P[k + 'w1'], 1, D, W1);
-      for (let j = 0; j < W1; j++) pre1[j] += P[k + 'b1'].d[j];
-      const h1 = model.useSwi ? swigluFwd(pre1, 1, FH) : geluFwd(pre1);
-      const ff = mm(h1, P[k + 'w2'], 1, FH, D);
-      for (let j = 0; j < D; j++) ff[j] += P[k + 'b2'].d[j];
+      let ff;
+      if (model.useMoE) {
+        const E = model.nExp, K = model.topK, W1 = model.useSwi ? 2 * FH : FH;
+        const rlogits = mm(M, P[k + 'wg'], 1, D, E);
+        for (let j = 0; j < E; j++) rlogits[j] += P[k + 'bg'].d[j];
+        const probs = softmaxRows(rlogits, 1, E);
+        const order = [];
+        for (let j = 0; j < E; j++) order.push(j);
+        order.sort((a, b) => probs[a] - probs[b]); // 升序，取尾部 K 个
+        ff = new Float64Array(D);
+        for (let t = 0; t < K; t++) {
+          const e = order[E - 1 - t], ek = `${k}e${e}.`;
+          const pre = mm(M, P[ek + 'w1'], 1, D, W1);
+          for (let j = 0; j < W1; j++) pre[j] += P[ek + 'b1'].d[j];
+          const h1 = model.useSwi ? swigluFwd(pre, 1, FH) : geluFwd(pre);
+          const out = mm(h1, P[ek + 'w2'], 1, FH, D);
+          for (let j = 0; j < D; j++) out[j] += P[ek + 'b2'].d[j];
+          const g = probs[e];
+          for (let j = 0; j < D; j++) ff[j] += g * out[j];
+        }
+      } else {
+        const W1 = model.useSwi ? 2 * FH : FH;
+        const pre1 = mm(M, P[k + 'w1'], 1, D, W1);
+        for (let j = 0; j < W1; j++) pre1[j] += P[k + 'b1'].d[j];
+        const h1 = model.useSwi ? swigluFwd(pre1, 1, FH) : geluFwd(pre1);
+        ff = mm(h1, P[k + 'w2'], 1, FH, D);
+        for (let j = 0; j < D; j++) ff[j] += P[k + 'b2'].d[j];
+      }
       const xOut = new Float64Array(D);
       for (let j = 0; j < D; j++) xOut[j] = xMid[j] + ff[j];
       X = xOut;
@@ -1499,6 +1679,8 @@
     gpt2: { norm: 'ln', ffn: 'gelu', pos: 'learned' },                 // GPT-2 / 本项目默认
     llama: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope' },            // LLaMA / Mistral（MHA）
     'llama-gqa': { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2 }, // LLaMA + GQA 演示
+    // Mixtral 风格：LLaMA 配方 + GQA + MoE（4 专家 top-2 路由）。nExp/topK 可在 cfg 覆盖。
+    mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {
@@ -1971,8 +2153,22 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama' || arch === 'llama-gqa') cfg = F.applyPreset(cfg, arch);
+      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral') cfg = F.applyPreset(cfg, arch);
       if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
+      // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
+      const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
+      if (nExpRaw !== '') {
+        const nExp = +nExpRaw;
+        if (!(nExp >= 1)) { log('nExp 需 ≥ 1', 'err'); return false; }
+        cfg.nExp = nExp;
+        if (topKRaw !== '') {
+          const topK = +topKRaw;
+          if (!(topK >= 1 && topK <= nExp)) { log(`topK(${topK}) 需满足 1 ≤ topK ≤ nExp(${nExp})`, 'err'); return false; }
+          cfg.topK = topK;
+        } else if (!cfg.topK) cfg.topK = 1;
+      } else if (topKRaw !== '' && cfg.nExp) {
+        cfg.topK = Math.min(+topKRaw, cfg.nExp);
+      }
       state.arch = arch;
       state.tokMode = tokMode;
       state.model = new F.GPTModel(cfg);
@@ -2214,7 +2410,7 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     window.addEventListener('resize', drawChart);

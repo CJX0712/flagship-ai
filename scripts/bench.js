@@ -6,6 +6,7 @@
  *   - 多架构手写反向传播梯度检验 (err/tol ≤ 1)
  *   - RoPE 相对位置不变性
  *   - GQA 梯度检验 + 参数节省
+ *   - MoE（混合专家）梯度检验 + 稀疏参数量
  *   - BPE 分词器往返无损 + 压缩率
  *   - INT8 量化保真 / 体积压缩 / in-RAM 压缩
  *   - KV cache 增量推理加速比
@@ -106,6 +107,19 @@ allPass = gradCheck(new F.GPTModel(Object.assign({}, gbase, { pos: 'rope' })), s
   const cfg = { vocabSize: 50, blockSize: 16, nLayer: 2, nHead: 4, dModel: 16, seed: 1 };
   const m1 = new F.GPTModel(cfg), m2 = new F.GPTModel(Object.assign({}, cfg, { nKvHead: 2 }));
   rec('注意力', 'GQA 参数节省', `MHA=${m1.paramCount()} → GQA=${m2.paramCount()}`, 'GQA < MHA', m2.paramCount() < m1.paramCount());
+})();
+
+/* ---------- 3.5 MoE（混合专家）梯度检验 + 稀疏参数量 ---------- */
+(function () {
+  // 强制清晰路由间隙（bg 大间隔 + wg=0）保证 top-k 选择在扰动下稳定，从而中心差分有效
+  const moe = new F.GPTModel({ vocabSize: 40, blockSize: 12, nLayer: 1, nHead: 2, dModel: 16, norm: 'rmsnorm', ffn: 'swiglu', nExp: 4, topK: 2, seed: 7, auxWeight: 0 });
+  moe.params['l0.bg'].d.set([8, 4, 0, -4]);
+  moe.params['l0.wg'].d.fill(0);
+  moe.auxWeight = 0;
+  const seq2 = Array.from({ length: 8 }, (_, i) => (i * 3) % 40);
+  gradCheck(moe, seq2, 'MoE(路由+专家)');
+  const dense = new F.GPTModel({ vocabSize: 40, blockSize: 12, nLayer: 1, nHead: 2, dModel: 16 });
+  rec('混合专家', 'MoE 稀疏参数量', `稠密=${dense.paramCount()} → MoE(4专家/top2)=${moe.paramCount()}`, 'MoE>稠密', moe.paramCount() > dense.paramCount());
 })();
 
 /* ---------- 4. BPE 往返 + 压缩率 ---------- */

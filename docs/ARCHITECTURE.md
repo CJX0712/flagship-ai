@@ -190,6 +190,26 @@ MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2
 - **诚实说明**：纯 JS 无 SIMD，解量化 matmul 的**计算速度持平**（不加速）；量化收益全部在内存与序列化体积——直接服务于"浏览器一键运行"的小体积部署。
 - **验证**：`scripts/probe-v5-quant.js` —— 数值保真 / KV-cache 末位逐位一致 / 存档往返 / 体积压缩 / in-RAM 8x，11 项全绿。
 
+### 2.12 MoE 混合专家（v7.0，Mixtral/DeepSeek 稀疏架构）
+
+`nExp > 1` 时每层 FFN 替换为 **N 个独立专家** + **1 个 top-k 路由网络**；`nExp = 1` 即稠密（零回归）。
+
+- **前向**：给定 FFN 输入 `M`（T×D，即 ln2 输出）
+  - 路由：`logits = M·wg + bg`（T×N_exp），`probs = softmax(logits)`（over experts）
+  - top-k：每 token 取概率最大的 `topK` 个专家及其门控值 `g = probs[i, e_sel]`
+  - 专家：`ff[i] = Σ_k g_k · Expert[e_k](M[i])`，每个专家是独立的 SwiGLU/GELU 两层
+  - 辅助负载均衡损失：`aux = N_exp·Σ_e f_e·P_e`（`f_e`=路由占比，`P_e`=平均门控概率）
+- **反向**（关键点）：
+  - 专家路径 = 标准 FFN 反向，但只对**被路由到该专家**的 token 子集累加梯度（`matmulTA` 作用在子集上）
+  - 门控：`dout = dff·g`（门控是 out→ff 边的乘子）
+  - 路由路径：`∂L/∂probs[i,e] = dot(dff[i], out_i^e)`（仅选中位置）→ `softmaxBwd` → `dwg/dbg`
+  - **离散 top-k 选择不回传**（硬路由）：非选中专家的门控梯度恒为 0
+  - **辅助损失梯度**：冻结 `f_e`（离散计数不回传），`∂aux/∂probs[i,e] = auxWeight·N_exp·count_e/T²`，叠加到 dprobs 后统一 `softmaxBwd`
+- **两个不变量**：未选中专家梯度**恒为 0**（离散选择正确性）；在 top-k 选择稳定（大间隔路由）前提下，路由与专家权重中心差分梯度检验 err/tol ≈ **1e-3**（连续门控概率精确回传）
+- **负载均衡实证**：坍缩场景 aux=3.59 → 启用 aux 损失均衡 aux=1.02（下界 1，坍缩上界 N_exp）
+- **量化兼容**：路由 `wg` 与专家 `e*.w1/w2` 一并纳入 INT8 正则（权重体积同样 ≈ 1/8）
+- **验证**：`scripts/probe-moe.js` —— CE/aux 双路径梯度检验、未选中专家零梯度、训练收敛、负载均衡、生成、存档往返，7 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -386,6 +406,7 @@ logits = LN_f(x)·Wteᵀ
 | `GPTModel` 前向 | nanoGPT `model.py` | pre-LN、残差、因果掩码、权重共享、0.02 初始化与 1/√(2L) 缩放 |
 | `train` | nanoGPT `train.py` | AdamW 超参、warmup+cosine、梯度裁剪 |
 | `generate` | GPT-2 采样逻辑 | temperature / top-k / top-p、贪心 |
+| MoE 稀疏 FFN + top-k 路由 | Mixtral / DeepSeek / Switch Transformer | 每层 N 专家 + 1 路由、top-k 门控、`N·Σ f_e·P_e` 负载均衡辅助损失（冻结 f_e） |
 | 单文件风格 | picoGPT | 零依赖、可通读、公式即代码 |
 | 验证方法论 | 各 forge 系列硬不变量 | 行和=1、正交/因果掩码、数值梯度检验、过拟合收敛 |
 

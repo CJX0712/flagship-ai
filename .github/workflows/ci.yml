@@ -36,5 +36,8 @@ jobs:
       - name: INT8 weight-only quantization probe
         run: node scripts/probe-v5-quant.js
 
+      - name: MoE (Mixture of Experts) probe
+        run: node scripts/probe-moe.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
