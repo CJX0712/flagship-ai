@@ -1,0 +1,236 @@
+/* ============================================================================
+ * 演示应用逻辑（app.js）— 仅浏览器环境运行
+ * 训练分块执行（setTimeout 让出主线程），自检逐项执行，UI 不卡死。
+ * 作者：晨星  ·  License: MIT
+ * ========================================================================*/
+(function () {
+  'use strict';
+  const F = window.FlagshipAI;
+  const VF = window.FlagshipVerify;
+
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    tok: null, model: null, trainState: null,
+    history: [], stepsDone: 0, totalSteps: 0,
+    training: false, stopFlag: false, stale: true,
+  };
+
+  function now() {
+    return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }
+  function log(msg, cls) {
+    const el = $('log');
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = `[${now()}] ${msg}`;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  /* ---------- 模型构建 ---------- */
+  function buildModel() {
+    const corpus = $('corpus').value;
+    if (corpus.replace(/\s/g, '').length < 10) {
+      log('语料太短（至少 10 个非空白字符），拒绝构建', 'err');
+      return false;
+    }
+    const dModel = +$('dModel').value, nHead = +$('nHead').value;
+    if (dModel % nHead !== 0) {
+      log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
+      return false;
+    }
+    try {
+      state.tok = new F.Tokenizer(corpus);
+      state.model = new F.GPTModel({
+        vocabSize: state.tok.vocabSize,
+        blockSize: +$('blockSize').value,
+        nLayer: +$('nLayer').value,
+        nHead: nHead,
+        dModel: dModel,
+        seed: +$('seed').value || 42,
+      });
+    } catch (e) {
+      log('构建失败: ' + e.message, 'err');
+      return false;
+    }
+    state.trainState = null;
+    state.history = [];
+    state.stepsDone = 0;
+    state.stale = false;
+    log(`模型已构建：词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    $('trainBtn').disabled = false;
+    $('genBtn').disabled = true;
+    $('modelInfo').textContent = `词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    drawChart();
+    return true;
+  }
+
+  /* ---------- 训练（分块） ---------- */
+  function startTraining() {
+    if (state.training) return;
+    if (state.stale && !buildModel()) return;
+    state.totalSteps = +$('steps').value;
+    state.training = true;
+    state.stopFlag = false;
+    $('trainBtn').disabled = true;
+    $('stopBtn').disabled = false;
+    $('buildBtn').disabled = true;
+    log(`开始训练：共 ${state.totalSteps} 步，lr=${$('lr').value}，batch=${$('blockSize').value}`);
+    trainChunk();
+  }
+
+  function trainChunk() {
+    if (state.stopFlag || state.stepsDone >= state.totalSteps) { finishTraining(); return; }
+    const chunk = Math.min(8, state.totalSteps - state.stepsDone);
+    const ids = state.tok.encode($('corpus').value);
+    let lastLoss = 0;
+    const res = F.train(state.model, ids, {
+      steps: chunk,
+      lr: +$('lr').value,
+      batch: +$('blockSize').value,
+      warmup: Math.min(30, Math.floor(state.totalSteps / 5)),
+      seed: 0,
+      state: state.trainState,
+      stepOffset: state.stepsDone,
+      totalSteps: state.totalSteps,
+      onStep: (_s, loss) => { lastLoss = loss; },
+    });
+    state.trainState = res.state;
+    for (const h of res.history) state.history.push(h);
+    state.stepsDone += chunk;
+    $('progFill').style.width = (100 * state.stepsDone / state.totalSteps).toFixed(1) + '%';
+    $('progText').textContent = `${state.stepsDone}/${state.totalSteps} 步 · loss ${lastLoss.toFixed(4)}`;
+    drawChart();
+    setTimeout(trainChunk, 0);
+  }
+
+  function finishTraining() {
+    state.training = false;
+    const ids = state.tok.encode($('corpus').value);
+    const ev = state.model.evaluate(ids);
+    $('trainBtn').disabled = false;
+    $('stopBtn').disabled = true;
+    $('buildBtn').disabled = false;
+    $('genBtn').disabled = false;
+    log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${state.history[state.history.length - 1].toFixed(4)}，全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`, state.stopFlag ? 'warn' : 'ok');
+  }
+
+  /* ---------- Loss 曲线（log 纵轴） ---------- */
+  function drawChart() {
+    const cv = $('chart');
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = 180;
+    if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 44, padR = 8, padT = 10, padB = 20;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + ih * i / 4;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    }
+    const h = state.history;
+    if (!h.length) {
+      ctx.fillText('等待训练数据…', padL + 6, padT + 14);
+      return;
+    }
+    const minL = Math.max(1e-4, Math.min(...h));
+    const maxL = Math.max(...h);
+    const lo = Math.log10(minL), hi = Math.log10(maxL);
+    const span = Math.max(0.5, hi - lo);
+    const X = (i) => padL + iw * (h.length === 1 ? 1 : i / (h.length - 1));
+    const Y = (v) => padT + ih * (1 - (Math.log10(Math.max(1e-4, v)) - (hi - span)) / span);
+    for (let i = 0; i <= 4; i++) {
+      const lv = Math.pow(10, hi - span + span * i / 4);
+      ctx.fillText(lv >= 0.01 ? lv.toFixed(2) : lv.toExponential(0), 4, padT + ih * i / 4 + 3);
+    }
+    ctx.strokeStyle = '#4f46e5';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < h.length; i++) {
+      const x = X(i), y = Y(h[i]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#4f46e5';
+    ctx.font = '11px ui-monospace, monospace';
+    ctx.fillText(`loss ${h[h.length - 1].toFixed(4)}`, W - padR - 76, padT + 12);
+  }
+
+  /* ---------- 生成 ---------- */
+  function doGenerate() {
+    if (!state.model) { log('请先构建并训练模型', 'warn'); return; }
+    const t0 = performance.now();
+    const r = F.generate(state.model, state.tok, $('prompt').value, {
+      maxNew: +$('maxNew').value,
+      temperature: +$('temperature').value,
+      topK: +$('topK').value,
+      seed: +$('genSeed').value || 1234,
+    });
+    $('output').textContent = r.text;
+    log(`生成 ${r.text.length} 字，耗时 ${(performance.now() - t0).toFixed(0)}ms（温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
+  }
+
+  /* ---------- 一键自检（逐项执行） ---------- */
+  function runSelfCheck() {
+    $('checkBtn').disabled = true;
+    const tbody = $('checkBody');
+    tbody.innerHTML = '';
+    log('自检开始：共 ' + VF.CHECKS.length + ' 项，逐项运行中…');
+    let i = 0, passCount = 0;
+    const next = () => {
+      if (i >= VF.CHECKS.length) {
+        log(`自检结束：${passCount}/${VF.CHECKS.length} 通过 ${passCount === VF.CHECKS.length ? '✅ 全绿' : '❌ 存在失败'}`, passCount === VF.CHECKS.length ? 'ok' : 'err');
+        $('checkBtn').disabled = false;
+        return;
+      }
+      const c = VF.CHECKS[i];
+      let r;
+      try {
+        const out = c.run() || {};
+        r = { pass: out.pass !== false, detail: out.detail || '' };
+      } catch (e) {
+        r = { pass: false, detail: '异常: ' + e.message };
+      }
+      if (r.pass) passCount++;
+      const tr = document.createElement('tr');
+      const td1 = document.createElement('td');
+      td1.textContent = String(i + 1);
+      const td2 = document.createElement('td');
+      td2.textContent = c.name;
+      const td3 = document.createElement('td');
+      td3.textContent = r.pass ? '✅ 通过' : '❌ 失败';
+      td3.className = r.pass ? 'ok' : 'err';
+      const td4 = document.createElement('td');
+      td4.className = 'detail';
+      td4.textContent = r.detail;
+      tr.append(td1, td2, td3, td4);
+      tbody.appendChild(tr);
+      i++;
+      setTimeout(next, 20);
+    };
+    setTimeout(next, 30);
+  }
+
+  /* ---------- 事件绑定 ---------- */
+  document.addEventListener('DOMContentLoaded', () => {
+    $('buildBtn').addEventListener('click', buildModel);
+    $('trainBtn').addEventListener('click', startTraining);
+    $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
+    $('genBtn').addEventListener('click', doGenerate);
+    $('checkBtn').addEventListener('click', runSelfCheck);
+    $('corpus').addEventListener('input', () => {
+      state.stale = true;
+      $('genBtn').disabled = true;
+      $('modelInfo').textContent = '语料已修改，重新构建后生效';
+    });
+    window.addEventListener('resize', drawChart);
+    log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');
+    log('默认语料已载入，点击「构建模型」开始');
+  });
+})();

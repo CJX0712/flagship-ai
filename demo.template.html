@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>旗舰 AI · 零依赖纯 JS GPT 引擎</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --card: #ffffff; --line: #e2e8f0; --ink: #0f172a;
+    --sub: #64748b; --brand: #4f46e5; --ok: #059669; --err: #dc2626; --warn: #d97706;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 20px; }
+  header h1 { font-size: 22px; letter-spacing: .5px; }
+  header .sub { color: var(--sub); font-size: 13px; }
+  header .author { margin-left: auto; color: var(--sub); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+  }
+  .card.full { grid-column: 1 / -1; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .tag {
+    font-size: 11px; font-weight: 400; color: var(--brand);
+    border: 1px solid currentColor; border-radius: 99px; padding: 0 8px; line-height: 18px;
+  }
+  label { display: block; font-size: 12px; color: var(--sub); margin: 8px 0 4px; }
+  textarea, select, input {
+    width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+    font: 13px/1.5 ui-monospace, "PingFang SC", monospace; background: #fbfcfe; color: var(--ink);
+  }
+  textarea { resize: vertical; }
+  textarea:focus, select:focus, input:focus { outline: 2px solid #c7d2fe; border-color: var(--brand); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 110px; }
+  .btns { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  button {
+    border: none; border-radius: 8px; padding: 8px 18px; font-size: 13px; cursor: pointer;
+    background: var(--brand); color: #fff; font-weight: 500;
+  }
+  button.ghost { background: #eef2ff; color: var(--brand); }
+  button:disabled { background: #cbd5e1; color: #f8fafc; cursor: not-allowed; }
+  #chart { width: 100%; height: 180px; display: block; }
+  .prog { height: 8px; background: #eef2f7; border-radius: 99px; overflow: hidden; margin-top: 10px; }
+  .prog > div { height: 100%; width: 0; background: linear-gradient(90deg, #6366f1, #4f46e5); transition: width .2s; }
+  .prog-text { font: 12px ui-monospace, monospace; color: var(--sub); margin-top: 6px; }
+  #output {
+    background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px 14px;
+    font: 13px/1.8 ui-monospace, "PingFang SC", monospace; min-height: 88px; white-space: pre-wrap; word-break: break-all;
+  }
+  #log {
+    background: #0f172a; color: #94a3b8; border-radius: 8px; padding: 10px 12px;
+    font: 12px/1.7 ui-monospace, monospace; height: 148px; overflow-y: auto; white-space: pre-wrap;
+  }
+  #log .ok { color: #34d399; }
+  #log .err { color: #f87171; }
+  #log .warn { color: #fbbf24; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--sub); font-weight: 500; white-space: nowrap; }
+  td.detail { color: var(--sub); font: 11.5px/1.5 ui-monospace, monospace; word-break: break-all; }
+  td.ok { color: var(--ok); white-space: nowrap; }
+  td.err { color: var(--err); white-space: nowrap; }
+  .hint { font-size: 12px; color: var(--sub); margin-top: 8px; }
+  .model-info { font: 12px ui-monospace, monospace; color: var(--brand); margin-top: 8px; }
+  footer { margin-top: 20px; color: var(--sub); font-size: 12px; text-align: center; line-height: 1.8; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🚀 旗舰 AI</h1>
+    <span class="sub">零依赖纯 JavaScript 手写 GPT 引擎 · 训练 / 自检 / 生成</span>
+    <span class="author">作者：晨星 · MIT License</span>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>语料与模型 <span class="tag">字符级 tokenizer</span></h2>
+      <label for="corpus">训练语料（可自由替换，建议 300 字以上）</label>
+      <textarea id="corpus" rows="7"></textarea>
+      <div class="row">
+        <div>
+          <label for="dModel">模型维度 dModel</label>
+          <select id="dModel">
+            <option value="32">32</option>
+            <option value="64" selected>64</option>
+            <option value="128">128</option>
+          </select>
+        </div>
+        <div>
+          <label for="nHead">注意力头数 nHead</label>
+          <select id="nHead">
+            <option value="2">2</option>
+            <option value="4" selected>4</option>
+            <option value="8">8</option>
+          </select>
+        </div>
+        <div>
+          <label for="nLayer">层数 nLayer</label>
+          <select id="nLayer">
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="3">3</option>
+          </select>
+        </div>
+        <div>
+          <label for="blockSize">上下文长度 blockSize</label>
+          <select id="blockSize">
+            <option value="32">32</option>
+            <option value="64" selected>64</option>
+            <option value="128">128</option>
+          </select>
+        </div>
+        <div>
+          <label for="seed">随机种子 seed</label>
+          <input id="seed" type="number" value="42" min="0" step="1">
+        </div>
+      </div>
+      <div class="btns">
+        <button id="buildBtn" class="ghost">构建模型</button>
+      </div>
+      <div class="model-info" id="modelInfo">尚未构建</div>
+    </div>
+
+    <div class="card">
+      <h2>训练 <span class="tag">AdamW + cosine LR</span></h2>
+      <div class="row">
+        <div>
+          <label for="steps">训练步数 steps</label>
+          <select id="steps">
+            <option value="100">100</option>
+            <option value="300" selected>300</option>
+            <option value="600">600</option>
+            <option value="1000">1000</option>
+          </select>
+        </div>
+        <div>
+          <label for="lr">学习率 lr</label>
+          <select id="lr">
+            <option value="0.001">0.001</option>
+            <option value="0.003" selected>0.003</option>
+            <option value="0.01">0.01</option>
+          </select>
+        </div>
+      </div>
+      <canvas id="chart"></canvas>
+      <div class="prog"><div id="progFill"></div></div>
+      <div class="prog-text" id="progText">0/0 步</div>
+      <div class="btns">
+        <button id="trainBtn" disabled>开始训练</button>
+        <button id="stopBtn" class="ghost" disabled>停止</button>
+      </div>
+      <div class="hint">训练分块执行，页面不卡死；loss 曲线为 log 纵轴。</div>
+    </div>
+
+    <div class="card">
+      <h2>生成 <span class="tag">温度 / top-k / 贪心</span></h2>
+      <label for="prompt">提示词 prompt</label>
+      <input id="prompt" type="text" value="旗舰之道" maxlength="200">
+      <div class="row">
+        <div>
+          <label for="temperature">温度（0=贪心）</label>
+          <input id="temperature" type="number" value="0.8" min="0" max="2" step="0.1">
+        </div>
+        <div>
+          <label for="topK">top-k（0=不截断）</label>
+          <input id="topK" type="number" value="5" min="0" step="1">
+        </div>
+        <div>
+          <label for="maxNew">生成长度</label>
+          <input id="maxNew" type="number" value="80" min="1" max="500" step="1">
+        </div>
+        <div>
+          <label for="genSeed">种子</label>
+          <input id="genSeed" type="number" value="1234" min="0" step="1">
+        </div>
+      </div>
+      <div class="btns"><button id="genBtn" disabled>生成文本</button></div>
+      <div id="output" style="margin-top:12px">（训练完成后在此生成）</div>
+    </div>
+
+    <div class="card">
+      <h2>一键自检 <span class="tag">10 项不变量</span></h2>
+      <div class="btns"><button id="checkBtn">运行自检</button></div>
+      <div class="hint">与 Node 端同一套检验：不变量 / 因果掩码 / 中心差分梯度检验 / 过拟合 / 训练收敛 / 生成确定性与健壮性。</div>
+      <table style="margin-top:10px">
+        <thead><tr><th>#</th><th>检查项</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody id="checkBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card full">
+      <h2>运行日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <footer>
+    旗舰 AI · 零依赖单文件 · 架构复用 GPT-2 / nanoGPT / picoGPT 已验证设计 · 手写反向传播经中心差分梯度检验<br>
+    开源交付：可运行 · 可复现 · 可验证 ｜ 作者：晨星 ｜ MIT License
+  </footer>
+</div>
+
+<script>
+/*__FLAGSHIP_ENGINE__*/
+</script>
+<script>
+/*__FLAGSHIP_VERIFY__*/
+</script>
+<script>
+/*__FLAGSHIP_CORPUS__*/
+document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
+</script>
+<script>
+/*__FLAGSHIP_APP__*/
+</script>
+</body>
+</html>

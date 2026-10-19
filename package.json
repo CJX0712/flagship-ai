@@ -1,0 +1,28 @@
+{
+  "name": "flagship-ai",
+  "version": "1.0.0",
+  "description": "零依赖纯 JavaScript 手写 GPT 引擎：字符级分词 + Decoder-only Transformer + 手写反向传播 + AdamW + 温度/top-k 采样。Node 与浏览器双端运行，10 项自检全绿。",
+  "main": "src/flagship-engine.js",
+  "scripts": {
+    "test": "node src/verify.js",
+    "build": "node scripts/build-demo.js",
+    "demo": "node scripts/build-demo.js && echo '打开 demo.html 即可（file:// 协议直接运行）'"
+  },
+  "keywords": [
+    "gpt", "transformer", "llm", "deep-learning", "backpropagation",
+    "attention", "zero-dependency", "javascript", "from-scratch", "educational"
+  ],
+  "author": "晨星 (Chenxing)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CJX0712/flagship-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CJX0712/flagship-ai/issues"
+  },
+  "homepage": "https://github.com/CJX0712/flagship-ai#readme"
+}
