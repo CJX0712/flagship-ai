@@ -1,11 +1,11 @@
 {
   "name": "flagship-ai",
-  "version": "7.0.0",
-  "description": "零依赖纯 JavaScript 手写 GPT 引擎：多架构(GPT-2/LLaMA/LLaMA-GQA) + BPE 分词 + INT8 权重量化 + MoE 混合专家 + 手写反向传播 + AdamW + KV Cache。Node 与浏览器双端运行，全探针绿。",
+  "version": "8.0.0",
+  "description": "零依赖纯 JavaScript 手写 GPT 引擎：多架构(GPT-2/LLaMA/LLaMA-GQA) + BPE 分词 + INT8 权重量化 + MoE 混合专家 + MoE×INT8 组合 + 手写反向传播 + AdamW + KV Cache。Node 与浏览器双端运行，全探针绿。",
   "main": "src/flagship-engine.js",
   "scripts": {
     "test": "node src/verify.js",
-    "test:all": "node src/verify.js && node scripts/probe-v3.js && node scripts/probe-v4-gqa.js && node scripts/probe-v5-quant.js && node scripts/probe-moe.js",
+    "test:all": "node src/verify.js && node scripts/probe-v3.js && node scripts/probe-v4-gqa.js && node scripts/probe-v5-quant.js && node scripts/probe-moe.js && node scripts/probe-moe-quant.js",
     "bench": "node scripts/bench.js",
     "bench:full": "node scripts/bench.js --full",
     "build": "node scripts/build-demo.js",

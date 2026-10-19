@@ -210,6 +210,15 @@ MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2
 - **量化兼容**：路由 `wg` 与专家 `e*.w1/w2` 一并纳入 INT8 正则（权重体积同样 ≈ 1/8）
 - **验证**：`scripts/probe-moe.js` —— CE/aux 双路径梯度检验、未选中专家零梯度、训练收敛、负载均衡、生成、存档往返，7 项全绿。
 
+### 2.13 MoE × INT8 组合（v8.0）
+
+把 v5 的 weight-only PTQ 用到 v7 的 MoE 模型上，稀疏专家同样获得 ≈ 1/8 权重体积：
+
+- **量化范围**：`QUANT_LINEAR_RE` 覆盖稠密 `wqkv/wproj/w1/w2`、MoE **路由 `wg`** 与 **专家 `l{l}.e{e}.w1/w2`**、嵌入 `tokEmb/posEmb`；偏置 `bg/b*/ln` 保持 Float64（占比极小）。`mm/mmAtB` 按 `.q` 自动走解量化路径，专家子集 matmul 同样受益。
+- **关键修复**：`quantize()` 用 `Object.create` 复制模型，v7.0 时漏拷 MoE 字段（`useMoE/nExp/topK/auxWeight`）→ 量化副本 `useMoE` 变 falsy，前向误走稠密路径取不存在的 `w1` 报错；v8.0 补全字段后组合闭环。
+- **无损实证**：logits maxΔ<0.1；量化 KV-cache 末位与全序列前向 Δ=0；存档往返 Δ=0；in-RAM 线性权重恰好 8x、整体 6.90x；JSON 存档 5.67x；量化后路由不坍缩（最大专家占用 63%）。
+- **验证**：`scripts/probe-moe-quant.js` —— 14 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）

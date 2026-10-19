@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v7.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v8.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -64,6 +64,16 @@
 
 > MoE 梯度检验在 top-k 选择稳定（大间隔路由）前提下，路由与专家权重中心差分 err/tol = **1.1e-3**；辅助损失梯度 err/tol = **8.3e-6**；未选中专家梯度恒为 0（离散路由正确性）。详见 `scripts/probe-moe.js`（7 项全绿）。
 
+### v8.0 新增（MoE × INT8 组合：稀疏专家的权重量化）
+
+| 能力 | 说明 |
+|---|---|
+| **MoE 权重量化** | `model.quantize()` 现已把**路由 `wg` 与专家 `e*.w1/w2`** 一并转 INT8（偏置 `bg/b*/ln` 保持 Float64）；稀疏混合专家模型同样获得 ≈ 1/8 权重体积 |
+| **组合无损验证** | `scripts/probe-moe-quant.js` 14 项：logits maxΔ<0.1 / KV-cache 末位 Δ=0 / 存档往返 Δ=0 / in-RAM 线性 8x、整体 6.90x / JSON 存档 5.67x / 量化后路由不坍缩（最大专家占用 63%） |
+| **CI 基准产物** | GitHub Actions 新增 `probe-moe-quant` 步骤，并把 `docs/BENCHMARK.md` 作为 artifact 上传（每次 CI 运行可下载） |
+
+> 修复：v7.0 的 `quantize()` 用 `Object.create` 复制模型时漏拷 MoE 字段（`useMoE/nExp/topK/auxWeight`），导致量化副本误走稠密路径报错；v8.0 补全，组合才闭环。
+
 
 
 | 组件 | 复用来源 | 论文 |
@@ -119,7 +129,7 @@ KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 toke
 
 ### 一键基准报告
 
-`npm run bench` 聚合所有核心度量，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)（多架构梯度检验、RoPE 不变性、GQA、MoE、BPE、INT8 量化、KV cache 加速比）；`npm run bench:full` 追加**参数对齐架构对照**（同语料/同种子/同步数下 gpt2 vs llama 的 loss 与准确率）。CI 默认跑快速版。
+`npm run bench` 聚合所有核心度量，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)（多架构梯度检验、RoPE 不变性、GQA、MoE、BPE、INT8 量化、KV cache 加速比）；`npm run bench:full` 追加**参数对齐架构对照**（同语料/同种子/同步数下 gpt2 vs llama 的 loss 与准确率）。CI 默认跑快速版，并把报告作为 artifact 上传（每次运行可下载）。一键全探针：`npm run test:all`。
 
 ## 快速开始
 
@@ -203,7 +213,7 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
 | `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） |
 | `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
-| `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻，推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
+| `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
 | `initKVCache` | `initKVCache(model)` → `{K, V, n}` | 每层 K/V 预分配 `blockSize×D` |
@@ -225,6 +235,7 @@ flagship-ai/
 ├── scripts/probe-v4-gqa.js  # v4 验证：GQA 梯度检验 / KV 一致性 / 持久化 / 参数节省
 ├── scripts/probe-v5-quant.js # v5 验证：INT8 量化保真 / 存档体积 / in-RAM 压缩
 ├── scripts/probe-moe.js      # v7 验证：MoE 梯度检验 / 负载均衡 / 存档往返
+├── scripts/probe-moe-quant.js # v8 验证：MoE × INT8 组合保真 / 压缩 / 不坍缩
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导

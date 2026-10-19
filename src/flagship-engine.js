@@ -759,6 +759,7 @@
       m.useRms = this.useRms; m.useSwi = this.useSwi; m.useRope = this.useRope;
       m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
       m.qkvDim = this.qkvDim; m.quantized = true;
+      m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];

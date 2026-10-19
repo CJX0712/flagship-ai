@@ -39,5 +39,15 @@ jobs:
       - name: MoE (Mixture of Experts) probe
         run: node scripts/probe-moe.js
 
+      - name: MoE x INT8 combined probe
+        run: node scripts/probe-moe-quant.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
+
+      - name: Upload benchmark report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report-node-${{ matrix.node }}
+          path: docs/BENCHMARK.md
+          if-no-files-found: warn
