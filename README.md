@@ -4,6 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
+[![Version](https://img.shields.io/badge/version-v3.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
 [![Node](https://img.shields.io/badge/node-%E2%89%A514-blue)](https://nodejs.org)
@@ -11,7 +12,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char-level Tokenizer · Decoder-only Transformer · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA 架构可切换 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
 
 </div>
 
@@ -19,9 +20,20 @@
 
 ## 这是什么
 
-一个 **约 900 行、零依赖、单文件** 的 GPT 语言模型完整实现：分词 → 前向 → 手写反向传播 → AdamW → 采样生成，Node 与浏览器双端运行。
+一个 **零依赖、单文件** 的 GPT 语言模型完整实现：分词 → 前向 → 手写反向传播 → AdamW → 采样生成，Node 与浏览器双端运行。
 
 **设计信条：零重写，集大成。** 架构不发明，直接站在世界顶级成果之上——
+
+### v3.0 新增（现代 LLM 标准配方，一行切换）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **模块化架构开关** | GPT-2 / LLaMA / Mistral | `norm`（LN↔RMSNorm）、`ffn`（GELU↔SwiGLU）、`pos`（learned↔RoPE）可独立组合 |
+| **架构预设** | `applyPreset(cfg,'llama')` | 一行切到 `RMSNorm + SwiGLU + RoPE`，每个模块均经中心差分梯度检验 |
+| **BPE 分词器** | GPT-2 / tiktoken | 字节级（覆盖任意 UTF-8）与字符级（中文语料更省 token）双基元，往返无损 |
+| **RoPE 长度外推** | LLaMA | 相对位置不变性，注意力分数只依赖相对距离，支持超长生成 + 滑动窗口精确一致 |
+
+
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -52,6 +64,8 @@
 | 12 | 模型持久化 save/load 无损往返 | 参数差 **0**，logits 差 **0**，再序列化一致，词表恢复 | 存档可完整复现 |
 
 > 检查 6 的 5 个跳过参数是 Q/K 偏置——softmax 的行移位不变性使其梯度**恒为零**（PyTorch 行为一致），此为数学事实而非缺陷。
+
+**架构梯度检验扩展**：`scripts/probe-v3.js` 对 5 种架构组合（GPT-2、LLaMA、仅 RMSNorm、仅 SwiGLU、仅 RoPE）逐一做中心差分梯度检验，最大 err/tol 均 < 3e-3，`scripts/probe-v3.js` 同时验证 BPE 往返无损、RoPE 相对位置不变性（差异 1.33e-15）与 KV cache 逐位一致。
 
 ## 性能
 
@@ -88,7 +102,8 @@ node src/verify.js   # 10 项自检，约 10 秒
 const F = require('./src/flagship-engine.js');
 const { CORPUS } = require('./src/corpus.js');
 
-const tok = new F.Tokenizer(CORPUS);                    // 字符级分词（词表 291）
+// 字符级分词（经典、中文友好，词表 ≈291）
+const tok = new F.Tokenizer(CORPUS);
 const model = new F.GPTModel({ vocabSize: tok.vocabSize,
   blockSize: 64, nLayer: 2, nHead: 4, dModel: 64, seed: 42 });
 
@@ -100,7 +115,15 @@ const out = F.generate(model, tok, '旗舰之道', {
   maxTokens: 100, temperature: 0.8, topK: 40, seed: 7 }); // KV cache 默认开启
 console.log(out.text);
 
-// 持久化：参数 + 词表 一并存档，导入后可完整复现
+// ── v3.0：一行切到现代架构（RMSNorm + SwiGLU + RoPE）──
+const llama = new F.GPTModel(F.applyPreset(
+  { vocabSize: tok.vocabSize, blockSize: 64, nLayer: 2, nHead: 4, dModel: 64 }, 'llama'));
+
+// ── v3.0：BPE 分词器（字符级基元，中文语料更省 token）──
+const bpe = new F.BPETokenizer(CORPUS, 320, { byteLevel: false }); // 词表 317 · 往返无损
+console.log('bpe tokens:', bpe.encode('旗舰 AI 锻造世界顶级模型').length);
+
+// 持久化：参数 + 词表 一并存档，导入后可完整复现（BPE 亦无损）
 const json = F.saveModel(model, tok);
 const model2 = F.loadModel(json);
 const tok2 = F.loadTokenizer(json);
@@ -121,13 +144,15 @@ const tok2 = F.loadTokenizer(json);
 | 导出 | 签名 | 说明 |
 |---|---|---|
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
-| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` |
+| `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
+| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` |
+| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
 | `initKVCache` | `initKVCache(model)` → `{K, V, n}` | 每层 K/V 预分配 `blockSize×D` |
 | `forwardStep` | `forwardStep(model, tokenId, pos, kv)` → `{logits}` | 单 token 增量前向，O(T·D) |
 | `kvShift` | `kvShift(model, kv)` | 滑动窗口：丢弃最旧 token（`copyWithin` 原生 memmove） |
-| `saveModel` / `loadModel` / `loadTokenizer` | `saveModel(model, tok?)` → JSON | 参数与词表无损持久化 |
+| `saveModel` / `loadModel` / `loadTokenizer` | `saveModel(model, tok?)` → JSON | 参数与词表无损持久化（自动携带 tokenizer 类型与 BPE merges） |
 
 ## 项目结构
 
@@ -135,10 +160,11 @@ const tok2 = F.loadTokenizer(json);
 flagship-ai/
 ├── src/
 │   ├── flagship-engine.js   # 核心引擎（唯一必需文件，零依赖）
-│   ├── verify.js            # 10 项自检套件（Node + 浏览器双端）
+│   ├── verify.js            # 12 项自检套件（Node + 浏览器双端）
 │   ├── corpus.js            # 默认中文语料（可随意替换）
-│   └── app.js               # demo 应用逻辑
+│   └── app.js               # demo 应用逻辑（字符级 / BPE / 架构选择）
 ├── scripts/build-demo.js    # 把引擎+套件+应用内联进 demo.html
+├── scripts/probe-v3.js      # v3 对照实验：BPE / 多架构梯度检验 / RoPE 不变性
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导
 └── package.json
@@ -154,9 +180,10 @@ flagship-ai/
 ## 已知限制
 
 - 教学级规模（dModel 64 / 2 层 ≈ 12 万参数），面向学习与验证，非生产推理
-- 字符级 tokenizer，无 BPE（BPE 属工程加速，不改变架构本质）
 - 纯 JS 单线程，无 GPU；已实测排除循环展开与 Int8 量化（V8 无 SIMD 收益）
-- 绝对位置嵌入：序列超出 blockSize 后转入**滑动窗口**（丢弃最旧 token），此时与"全量重算最后 blockSize 个 token"不再逐位等价 —— 这是 GPT-2 位置嵌入的固有约束，业界同样如此
+- `pos:'learned'`（GPT-2 绝对位置嵌入）下，序列超出 blockSize 后转入**滑动窗口**（丢弃最旧 token），与"全量重算最后 blockSize 个 token"不再逐位等价 —— 这是 GPT-2 位置嵌入的固有约束
+- `pos:'rope'`（RoPE）天然支持长度外推，滑动窗口下与全量推理**逐位一致**（注意力分数只依赖相对距离），更适合超长生成
+- 字节级 BPE 在中文小语料下压缩率反而不如字符级（每汉字 3 字节需先"合并回来"）；中文场景建议 `byteLevel:false`
 
 ## 许可
 

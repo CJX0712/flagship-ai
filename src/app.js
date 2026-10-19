@@ -39,16 +39,27 @@
       log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
       return false;
     }
+    const tokMode = $('tokenizer').value;
+    const arch = $('arch').value;
     try {
-      state.tok = new F.Tokenizer(corpus);
-      state.model = new F.GPTModel({
+      if (tokMode === 'char') {
+        state.tok = new F.Tokenizer(corpus);
+      } else {
+        const byteLevel = tokMode === 'bpe-byte';
+        state.tok = new F.BPETokenizer(corpus, +$('vocabSize').value || 320, { byteLevel });
+      }
+      let cfg = {
         vocabSize: state.tok.vocabSize,
         blockSize: +$('blockSize').value,
         nLayer: +$('nLayer').value,
         nHead: nHead,
         dModel: dModel,
         seed: +$('seed').value || 42,
-      });
+      };
+      if (arch === 'llama') cfg = F.applyPreset(cfg, 'llama');
+      state.arch = arch;
+      state.tokMode = tokMode;
+      state.model = new F.GPTModel(cfg);
     } catch (e) {
       log('构建失败: ' + e.message, 'err');
       return false;
@@ -57,10 +68,11 @@
     state.history = [];
     state.stepsDone = 0;
     state.stale = false;
-    log(`模型已构建：词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
+    log(`模型已构建：[${arch} / ${tokLabel}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -189,7 +201,7 @@
     a.download = 'flagship-model.json';
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    log(`模型导出完成：${(json.length / 1024 / 1024).toFixed(2)} MB（含 ${state.tok.vocabSize} 字符词表）`);
+    log(`模型导出完成：${(json.length / 1024 / 1024).toFixed(2)} MB（含 ${state.tok.vocabSize} 词表 + 分词器元数据）`);
   }
 
   function handleImport(ev) {
@@ -265,6 +277,13 @@
   }
 
   /* ---------- 事件绑定 ---------- */
+  function markStale(msg) {
+    if (state.model) {
+      state.stale = true;
+      $('genBtn').disabled = true;
+      if (msg) $('modelInfo').textContent = msg;
+    }
+  }
   document.addEventListener('DOMContentLoaded', () => {
     $('buildBtn').addEventListener('click', buildModel);
     $('trainBtn').addEventListener('click', startTraining);
@@ -274,10 +293,10 @@
     $('exportBtn').addEventListener('click', doExport);
     $('importBtn').addEventListener('click', () => $('importFile').click());
     $('importFile').addEventListener('change', handleImport);
-    $('corpus').addEventListener('input', () => {
-      state.stale = true;
-      $('genBtn').disabled = true;
-      $('modelInfo').textContent = '语料已修改，重新构建后生效';
+    // 语料与模型结构/分词器/架构变动都需重新构建
+    $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize'].forEach((id) => {
+      $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     window.addEventListener('resize', drawChart);
     log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');

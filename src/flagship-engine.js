@@ -170,6 +170,105 @@
     return dX;
   }
 
+  /* ---- RMSNorm（Zhang & Sennrich 2019；LLaMA/Mistral 标准） ----
+   * y = g ⊙ (x / RMS(x))，RMS(x) = sqrt(mean(x²) + eps)。
+   * 与 LayerNorm 的差别：不去均值、无偏置 —— 更省算力，且实测在大模型上等价或更优。
+   * 反向用同一 xhat 约定（增益前归一化值），故与 layernormBwd 签名完全兼容。 */
+  const RMS_EPS = 1e-5;
+  // 签名与 layernormFwd 对齐（b 位置保留但忽略），这样前向分发可以无脑二选一
+  function rmsnormFwd(X, g, b, r, c) {
+    const Y = new Float64Array(r * c);
+    const xhat = new Float64Array(r * c);
+    const rstd = new Float64Array(r);
+    for (let i = 0; i < r; i++) {
+      const o = i * c;
+      let ss = 0;
+      for (let j = 0; j < c; j++) ss += X[o + j] * X[o + j];
+      const rs = 1 / Math.sqrt(ss / c + RMS_EPS);
+      rstd[i] = rs;
+      for (let j = 0; j < c; j++) {
+        const xh = X[o + j] * rs;
+        xhat[o + j] = xh;
+        Y[o + j] = g[j] * xh;
+      }
+    }
+    return { Y, xhat, rstd };
+  }
+  function rmsnormBwd(dY, xhat, rstd, g, r, c) {
+    const dX = new Float64Array(r * c);
+    const dg = new Float64Array(c);
+    for (let i = 0; i < r; i++) {
+      const o = i * c;
+      const rs = rstd[i];
+      let s = 0; // Σ_j (dY_j · g_j · xhat_j)
+      for (let j = 0; j < c; j++) s += dY[o + j] * g[j] * xhat[o + j];
+      const inv = 1 / c;
+      for (let j = 0; j < c; j++) {
+        const dy = dY[o + j] * g[j];
+        dg[j] += dY[o + j] * xhat[o + j];
+        dX[o + j] = rs * (dy - xhat[o + j] * inv * s);
+      }
+    }
+    return { dX, dg, db: null };
+  }
+
+  /* ---- SiLU / SwiGLU（Shazeer 2020；LLaMA/Mistral/PaLM 标准 FFN） ----
+   * SwiGLU(x) = SiLU(xW_gate) ⊙ (xW_up)，SiLU(z) = z·σ(z)。
+   * 本实现把 gate 与 up 拼成一次矩阵乘（w1: D → 2·FH），少一次 matmul。
+   * pre 布局：每行 [gate(FH) | up(FH)]。 */
+  function siluF(x) { return x / (1 + Math.exp(-x)); }
+  function swigluFwd(pre, r, h) {
+    const out = new Float64Array(r * h);
+    for (let i = 0; i < r; i++) {
+      const po = i * 2 * h, oo = i * h;
+      for (let j = 0; j < h; j++) out[oo + j] = siluF(pre[po + j]) * pre[po + h + j];
+    }
+    return out;
+  }
+  function swigluBwd(dout, pre, r, h) {
+    const dpre = new Float64Array(r * 2 * h);
+    for (let i = 0; i < r; i++) {
+      const po = i * 2 * h, oo = i * h;
+      for (let j = 0; j < h; j++) {
+        const g = pre[po + j], u = pre[po + h + j];
+        const sg = 1 / (1 + Math.exp(-g));
+        dpre[po + j] = dout[oo + j] * u * (sg + g * sg * (1 - sg)); // ∂/∂gate
+        dpre[po + h + j] = dout[oo + j] * g * sg;                    // ∂/∂up
+      }
+    }
+    return dpre;
+  }
+
+  /* ---- RoPE 旋转位置编码（Su et al. 2021；LLaMA/Mistral 标准） ----
+   * 对 Q/K 的每个相邻维度对施加角度 pos·θ_p 的旋转，θ_p = base^(-2p/dh)。
+   * 关键性质：旋转后 q_i·k_j 只依赖相对距离 (i-j) —— 故天然支持长度外推，
+   * 且使滑动窗口 KV cache 在任意绝对位置下都与全序列重算逐位一致。
+   * sign=+1 前向（逆时针）；sign=-1 反向（正交矩阵的逆 = 其转置）。 */
+  const ROPE_BASE = 10000;
+  function ropeApply(X, T, D, H, dh, posOff, sign) {
+    const half = dh >> 1;
+    if (half <= 0) return;
+    const bases = [0, D]; // Q 段与 K 段在 3D 行内的偏移
+    for (let i = 0; i < T; i++) {
+      const pos = i + posOff;
+      const row = i * 3 * D;
+      for (let p = 0; p < half; p++) {
+        const th = pos * Math.pow(ROPE_BASE, -2 * p / dh);
+        const cs = Math.cos(th), sn = Math.sin(th) * sign;
+        for (let b = 0; b < 2; b++) {
+          const o = row + bases[b] + (p << 1);
+          // 每个 head 的该维度对
+          for (let h = 0; h < H; h++) {
+            const q = o + h * dh;
+            const x0 = X[q], x1 = X[q + 1];
+            X[q] = x0 * cs - x1 * sn;
+            X[q + 1] = x0 * sn + x1 * cs;
+          }
+        }
+      }
+    }
+  }
+
   /* ---- Softmax（按行） ---- */
   function softmaxRows(S, r, c) {
     const P = new Float64Array(r * c);
@@ -222,6 +321,7 @@
   class Tokenizer {
     constructor(text) {
       const chars = [...new Set([...String(text)])].sort();
+      this.kind = 'char';
       this.chars = chars;
       this.stoi = new Map(chars.map((ch, i) => [ch, i]));
       this.itos = chars;
@@ -243,18 +343,179 @@
   }
 
   /* ==========================================================================
+   * 二之二、BPE 分词器（GPT-2 字节级标准实现）
+   *
+   * 三件套，与 GPT-2 / tiktoken 同源：
+   *   1. 字节级映射：把 256 个字节映射到 256 个可打印 Unicode 字符，
+   *      使任意 UTF-8 文本（含中文、emoji）都能无损表示为字符序列。
+   *   2. 预分词 regex（GPT-2 原文）：先把文本切成"词块"，BPE 只在块内合并，
+   *      避免跨词污染（这是 BPE 质量的关键，也是朴素实现的常见缺陷）。
+   *   3. 频率合并训练：反复统计相邻符号对频次、合并最高频者，直至词表达标。
+   * 编码用 merge-rank 贪心（等价 GPT-2 实现），解码一次性拼字节再 UTF-8 解码，
+   * 因此跨 token 的多字节汉字也能正确还原。
+   * ======================================================================== */
+  const BYTE_ENC = (() => {
+    const bs = [];
+    for (let b = 0x21; b <= 0x7e; b++) bs.push(b);   // '!' ~ '~'
+    for (let b = 0xa1; b <= 0xac; b++) bs.push(b);   // '¡' ~ '¬'
+    for (let b = 0xae; b <= 0xff; b++) bs.push(b);   // '®' ~ 'ÿ'
+    const map = new Map();
+    let n = 0;
+    for (const b of bs) map.set(b, String.fromCharCode(b));
+    for (let b = 0; b < 256; b++) {
+      if (!map.has(b)) map.set(b, String.fromCharCode(256 + n++));
+    }
+    return map;
+  })();
+  const BYTE_DEC = new Map([...BYTE_ENC].map(([b, c]) => [c, b]));
+
+  // GPT-2 预分词正则（原文照搬）：缩写 | 可选空格+字母 | 可选空格+数字 | 可选空格+其它非空白 | 尾随空白
+  const PRE_RE = new RegExp(
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+", 'gu');
+
+  /** UTF-8 文本 -> 字节级字符序列（可逆） */
+  function textToByteChars(s) {
+    const bytes = new TextEncoder().encode(s);
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) out += BYTE_ENC.get(bytes[i]);
+    return out;
+  }
+  /** 字节级字符序列 -> UTF-8 文本（可逆） */
+  function byteCharsToText(s) {
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) bytes[i] = BYTE_DEC.get(s[i]) ?? 63;
+    return new TextDecoder().decode(bytes);
+  }
+
+  class BPETokenizer {
+    /**
+     * @param {string} text 训练语料
+     * @param {number} vocabSize 目标词表大小（字节级下 ≥256）
+     * @param {Object} opts
+     *   minPairFreq: 最低合并频次（低于则提前停止，默认 2）
+     *   byteLevel:   基元选择 —— true = 256 字节（GPT-2 标准，覆盖任意 UTF-8）；
+     *                 false = 语料字符（中文语料下显著更省 token，且不会生成半截 UTF-8）
+     */
+    constructor(text, vocabSize = 512, opts) {
+      const o = Object.assign({ minPairFreq: 2, byteLevel: true }, opts || {});
+      this.kind = 'bpe';
+      this.byteLevel = !!o.byteLevel;
+      const target = Math.max(this.byteLevel ? 256 : 1, vocabSize | 0);
+      // 词块 <-> 符号序列（字节级要多一层 UTF-8 编解码）
+      const toSym = (w) => (this.byteLevel ? [...textToByteChars(w)] : [...w]);
+
+      // 1) 预分词并统计词频
+      const freq = new Map();
+      for (const m of String(text).matchAll(PRE_RE)) {
+        const w = m[0];
+        freq.set(w, (freq.get(w) || 0) + 1);
+      }
+      // 2) 每个词块转成符号数组（BPE 只在块内合并）
+      const seqs = [];
+      for (const [w, n] of freq) seqs.push({ s: toSym(w), n });
+
+      // 3) 初始词表：字节级 = 256 个字节基元；字符级 = 语料中的全部字符
+      const vocab = [];
+      if (this.byteLevel) { for (let b = 0; b < 256; b++) vocab.push(BYTE_ENC.get(b)); }
+      else { vocab.push(...[...new Set([...String(text)])].sort()); }
+      if (vocab.length > target) vocab.length = target;
+      const merges = []; // [[a, b], ...]，下标即 merge rank
+
+      // 4) 频率合并：每轮统计相邻对频次，合并最高频者
+      while (vocab.length < target) {
+        const cnt = new Map();
+        for (const { s, n } of seqs) {
+          for (let i = 0; i + 1 < s.length; i++) {
+            const key = s[i] + '\u0000' + s[i + 1];
+            cnt.set(key, (cnt.get(key) || 0) + n);
+          }
+        }
+        let best = null, bestN = o.minPairFreq - 1;
+        for (const [k, n] of cnt) if (n > bestN) { bestN = n; best = k; }
+        if (!best) break; // 没有再值得合并的对
+        const parts = best.split('\u0000');
+        const a = parts[0], b = parts[1], tok = a + b;
+        vocab.push(tok);
+        merges.push([a, b]);
+        for (const seq of seqs) {
+          const out = [];
+          let i = 0;
+          while (i < seq.s.length) {
+            if (i + 1 < seq.s.length && seq.s[i] === a && seq.s[i + 1] === b) { out.push(tok); i += 2; }
+            else { out.push(seq.s[i]); i++; }
+          }
+          seq.s = out;
+        }
+      }
+
+      this.chars = vocab;
+      this.merges = merges;
+      this.itos = vocab;
+      this.stoi = new Map(vocab.map((t, i) => [t, i]));
+      this.ranks = new Map(merges.map((m, i) => [m[0] + m[1], i]));
+    }
+
+    get vocabSize() { return this.chars.length; }
+
+    /** 文本 -> id 序列。逐词块用 merge-rank 贪心合并（等价 GPT-2/tiktoken） */
+    encode(text) {
+      const out = [];
+      for (const m of String(text).matchAll(PRE_RE)) {
+        let s = this.byteLevel ? [...textToByteChars(m[0])] : [...m[0]];
+        while (s.length > 1) {
+          let bestRank = Infinity, bestI = -1;
+          for (let i = 0; i + 1 < s.length; i++) {
+            const r = this.ranks.get(s[i] + s[i + 1]);
+            if (r !== undefined && r < bestRank) { bestRank = r; bestI = i; }
+          }
+          if (bestI < 0) break;
+          s.splice(bestI, 2, s[bestI] + s[bestI + 1]);
+        }
+        for (const t of s) {
+          const id = this.stoi.get(t);
+          if (id !== undefined) out.push(id);
+          else for (const ch of t) { // 兜底：拆到字节基元（理论上不会触发）
+            const cid = this.stoi.get(ch);
+            if (cid !== undefined) out.push(cid);
+          }
+        }
+      }
+      return out;
+    }
+
+    /** id 序列 -> 文本。字节级先拼全部字节再一次性 UTF-8 解码，跨 token 汉字无损 */
+    decode(ids) {
+      let s = '';
+      for (const id of ids) s += this.itos[id] ?? '';
+      return this.byteLevel ? byteCharsToText(s) : s;
+    }
+  }
+
+  /* ==========================================================================
    * 三、GPT 模型（前向 + 手写反向传播）
    * ======================================================================== */
   class GPTModel {
     /**
      * @param {Object} cfg { vocabSize, blockSize, nLayer, nHead, dModel, seed }
+     *   架构开关（默认全部为 GPT-2 原设计，保持向后兼容；'llama' 预设见 ARCH_PRESETS）：
+     *   norm: 'ln'（LayerNorm，GPT-2）| 'rmsnorm'（RMSNorm，LLaMA/Mistral）
+     *   ffn:  'gelu'（GPT-2）        | 'swiglu'（SiLU 门控，LLaMA/Mistral）
+     *   pos:  'learned'（可学习位置嵌入，GPT-2）| 'rope'（旋转位置编码，LLaMA/Mistral）
+     *   ffnHidden: FFN 隐藏层宽度，默认 4·dModel（LLaMA 惯例为 ⌊2/3·4D⌋，可显式传入）
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
         throw new Error(`dModel(${cfg.dModel}) 必须能被 nHead(${cfg.nHead}) 整除`);
       }
-      this.cfg = Object.assign({ seed: 42 }, cfg);
+      this.cfg = Object.assign({ seed: 42, norm: 'ln', ffn: 'gelu', pos: 'learned' }, cfg);
       const { vocabSize: V, blockSize: T, nLayer: L, nHead: H, dModel: D } = this.cfg;
+      if (this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
+        throw new Error(`RoPE 要求每个 head 维度 dh=${D / H} 为偶数`);
+      }
+      this.useRope = this.cfg.pos === 'rope';
+      this.useRms = this.cfg.norm === 'rmsnorm';
+      this.useSwi = this.cfg.ffn === 'swiglu';
+      this.fh = this.cfg.ffnHidden || 4 * D;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
       const add = (name, r, c, scale) => {
@@ -270,18 +531,21 @@
         P[name] = p;
       };
       add('tokEmb', V, D);
-      add('posEmb', T, D);
+      if (!this.useRope) add('posEmb', T, D); // RoPE 不需要位置嵌入
       const rscale = 1 / Math.sqrt(2 * L); // GPT-2：按残差深度缩放输出投影初始化
+      const FH = this.fh;
       for (let l = 0; l < L; l++) {
         const k = `l${l}.`;
         add(k + 'wqkv', D, 3 * D); zeros(k + 'bqkv', 3 * D);
         add(k + 'wproj', D, D, rscale); zeros(k + 'bproj', D);
-        add(k + 'w1', D, 4 * D); zeros(k + 'b1', 4 * D);
-        add(k + 'w2', 4 * D, D, rscale); zeros(k + 'b2', D);
-        ones(k + 'ln1.g', D); zeros(k + 'ln1.b', D);
-        ones(k + 'ln2.g', D); zeros(k + 'ln2.b', D);
+        // SwiGLU 的 w1 一次产出 gate 与 up 两半（D → 2·FH），少一次矩阵乘
+        add(k + 'w1', D, this.useSwi ? 2 * FH : FH);
+        zeros(k + 'b1', this.useSwi ? 2 * FH : FH);
+        add(k + 'w2', FH, D, rscale); zeros(k + 'b2', D);
+        ones(k + 'ln1.g', D); if (!this.useRms) zeros(k + 'ln1.b', D);
+        ones(k + 'ln2.g', D); if (!this.useRms) zeros(k + 'ln2.b', D);
       }
-      ones('lnf.g', D); zeros('lnf.b', D);
+      ones('lnf.g', D); if (!this.useRms) zeros('lnf.b', D);
       // 输出头与 tokEmb 权重共享（weight tying，GPT-1/2 标准做法）
       this.grads = {};
       for (const key in P) this.grads[key] = new Float64Array(P[key].d.length);
@@ -306,25 +570,32 @@
       const T = Math.min(tokens.length, B);
       const toks = tokens.length > B ? tokens.slice(tokens.length - B) : tokens;
 
-      // 1) token 嵌入 + 位置嵌入
+      const NF = this.useRms ? rmsnormFwd : layernormFwd;
+      const nb = (key) => (P[key] ? P[key].d : null);
+
+      // 1) token 嵌入 + 位置嵌入（RoPE 模式下无位置嵌入）
       let X = new Float64Array(T * D);
-      const tokEmb = P.tokEmb.d, posEmb = P.posEmb.d;
+      const tokEmb = P.tokEmb.d, posEmb = P.posEmb ? P.posEmb.d : null;
       for (let i = 0; i < T; i++) {
         const t = toks[i], o = i * D;
-        for (let j = 0; j < D; j++) X[o + j] = tokEmb[t * D + j] + posEmb[o + j];
+        for (let j = 0; j < D; j++) {
+          X[o + j] = posEmb ? tokEmb[t * D + j] + posEmb[o + j] : tokEmb[t * D + j];
+        }
       }
 
       const layers = [];
       for (let l = 0; l < L; l++) {
         const k = `l${l}.`;
         // 2) pre-LN #1 -> 因果多头自注意力
-        const ln1 = layernormFwd(X, P[k + 'ln1.g'].d, P[k + 'ln1.b'].d, T, D);
+        const ln1 = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), T, D);
         const A = ln1.Y;
         const qkv = matmul(A, P[k + 'wqkv'].d, T, D, 3 * D);
         for (let i = 0; i < T; i++) {
           const o = i * 3 * D;
           for (let j = 0; j < 3 * D; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
         }
+        // RoPE：就地旋转 Q/K 段（V 段不旋转）
+        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1);
         const ctx = new Float64Array(T * D);
         const Ps = [];
         const scale = 1 / Math.sqrt(dh);
@@ -359,15 +630,17 @@
         for (let i = 0; i < T * D; i++) xMid[i] = X[i] + attn[i]; // 残差连接
 
         // 3) pre-LN #2 -> 前馈网络（GELU）
-        const ln2 = layernormFwd(xMid, P[k + 'ln2.g'].d, P[k + 'ln2.b'].d, T, D);
+        const ln2 = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), T, D);
         const M = ln2.Y;
-        const pre1 = matmul(M, P[k + 'w1'].d, T, D, 4 * D);
+        const FH = this.fh;
+        const pre1 = matmul(M, P[k + 'w1'].d, T, D, this.useSwi ? 2 * FH : FH);
+        const W1 = this.useSwi ? 2 * FH : FH;
         for (let i = 0; i < T; i++) {
-          const o = i * 4 * D;
-          for (let j = 0; j < 4 * D; j++) pre1[o + j] += P[k + 'b1'].d[j];
+          const o = i * W1;
+          for (let j = 0; j < W1; j++) pre1[o + j] += P[k + 'b1'].d[j];
         }
-        const h1 = geluFwd(pre1);
-        const ff = matmul(h1, P[k + 'w2'].d, T, 4 * D, D);
+        const h1 = this.useSwi ? swigluFwd(pre1, T, FH) : geluFwd(pre1);
+        const ff = matmul(h1, P[k + 'w2'].d, T, FH, D);
         for (let i = 0; i < T; i++) {
           const o = i * D;
           for (let j = 0; j < D; j++) ff[o + j] += P[k + 'b2'].d[j];
@@ -379,8 +652,8 @@
         X = xOut;
       }
 
-      // 4) 最终 LayerNorm + 权重共享输出头
-      const lnf = layernormFwd(X, P['lnf.g'].d, P['lnf.b'].d, T, D);
+      // 4) 最终归一化 + 权重共享输出头
+      const lnf = NF(X, P['lnf.g'].d, nb('lnf.b'), T, D);
       const Hf = lnf.Y;
       const logits = matmulAtB(Hf, P.tokEmb.d, T, D, V);
       return { logits, cache: { T, dh, H, D, L, layers, lnf, Hf, toks } };
@@ -391,15 +664,16 @@
       const { T, dh, H, D, L } = cache;
       const { vocabSize: V } = this.cfg;
       const P = this.params, G = this.grads;
+      const NB = this.useRms ? rmsnormBwd : layernormBwd;
 
       // 权重共享输出头反向：logits = Hf @ Wte^T
       //   dWte = dlogits^T @ Hf ；dHf = dlogits @ Wte
       addInto(G.tokEmb, matmulTA(dlogits, cache.Hf, T, V, D));
       const dHf = matmul(dlogits, P.tokEmb.d, T, V, D);
-      // 最终 LayerNorm 反向（dY 形状 T×D）
-      const lnfb = layernormBwd(dHf, cache.lnf.xhat, cache.lnf.rstd, P['lnf.g'].d, T, D);
+      // 最终归一化反向（dY 形状 T×D）
+      const lnfb = NB(dHf, cache.lnf.xhat, cache.lnf.rstd, P['lnf.g'].d, T, D);
       addInto(G['lnf.g'], lnfb.dg);
-      addInto(G['lnf.b'], lnfb.db);
+      if (G['lnf.b']) addInto(G['lnf.b'], lnfb.db);
       let dX = lnfb.dX;
 
       for (let l = L - 1; l >= 0; l--) {
@@ -407,16 +681,17 @@
         const c = cache.layers[l];
         // xOut = xMid + ff => dff = dX, dxMid = dX
         const dff = dX;
-        addInto(G[k + 'w2'], matmulTA(c.h1, dff, T, 4 * D, D));
+        const FH = this.fh, W1 = this.useSwi ? 2 * FH : FH;
+        addInto(G[k + 'w2'], matmulTA(c.h1, dff, T, FH, D));
         rowSumInto(G[k + 'b2'], dff, T, D);
-        const dh1 = matmulAtB(dff, P[k + 'w2'].d, T, D, 4 * D);
-        const dpre1 = geluBwd(dh1, c.pre1);
-        addInto(G[k + 'w1'], matmulTA(c.M, dpre1, T, D, 4 * D));
-        rowSumInto(G[k + 'b1'], dpre1, T, 4 * D);
-        const dM = matmulAtB(dpre1, P[k + 'w1'].d, T, 4 * D, D);
-        const ln2b = layernormBwd(dM, c.ln2.xhat, c.ln2.rstd, P[k + 'ln2.g'].d, T, D);
+        const dh1 = matmulAtB(dff, P[k + 'w2'].d, T, D, FH);
+        const dpre1 = this.useSwi ? swigluBwd(dh1, c.pre1, T, FH) : geluBwd(dh1, c.pre1);
+        addInto(G[k + 'w1'], matmulTA(c.M, dpre1, T, D, W1));
+        rowSumInto(G[k + 'b1'], dpre1, T, W1);
+        const dM = matmulAtB(dpre1, P[k + 'w1'].d, T, W1, D);
+        const ln2b = NB(dM, c.ln2.xhat, c.ln2.rstd, P[k + 'ln2.g'].d, T, D);
         addInto(G[k + 'ln2.g'], ln2b.dg);
-        addInto(G[k + 'ln2.b'], ln2b.db);
+        if (G[k + 'ln2.b']) addInto(G[k + 'ln2.b'], ln2b.db);
         const dxMid = new Float64Array(T * D);
         for (let i = 0; i < T * D; i++) dxMid[i] = dX[i] + ln2b.dX[i];
 
@@ -472,12 +747,14 @@
             for (let p = 0; p < dh; p++) dqkv[i * 3 * D + 2 * D + h * dh + p] = dVh[i * dh + p];
           }
         }
+        // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转
+        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1);
         addInto(G[k + 'wqkv'], matmulTA(c.A, dqkv, T, D, 3 * D));
         rowSumInto(G[k + 'bqkv'], dqkv, T, 3 * D);
         const dA = matmulAtB(dqkv, P[k + 'wqkv'].d, T, 3 * D, D);
-        const ln1b = layernormBwd(dA, c.ln1.xhat, c.ln1.rstd, P[k + 'ln1.g'].d, T, D);
+        const ln1b = NB(dA, c.ln1.xhat, c.ln1.rstd, P[k + 'ln1.g'].d, T, D);
         addInto(G[k + 'ln1.g'], ln1b.dg);
-        addInto(G[k + 'ln1.b'], ln1b.db);
+        if (G[k + 'ln1.b']) addInto(G[k + 'ln1.b'], ln1b.db);
         const dx0 = new Float64Array(T * D);
         for (let i = 0; i < T * D; i++) dx0[i] = dxMid[i] + ln1b.dX[i];
         dX = dx0;
@@ -488,7 +765,7 @@
         const t = cache.toks[i], o = i * D;
         for (let j = 0; j < D; j++) {
           G.tokEmb[t * D + j] += dX[o + j];
-          G.posEmb[o + j] += dX[o + j];
+          if (G.posEmb) G.posEmb[o + j] += dX[o + j];
         }
       }
     }
@@ -614,40 +891,57 @@
     return { K, V, n: 0 };
   }
 
-  /** 单步增量前向：处理位置 pos 上的单个 token，写入并复用 KV 缓存 */
+  /**
+   * 单步增量前向：处理绝对位置 pos 上的单个 token，写入并复用 KV 缓存。
+   * 缓存槽位（kv.n）与绝对位置（pos）解耦：
+   *  - 槽位是缓存数组下标，写满后靠 kvShift 平移；
+   *  - pos 只喂给 RoPE（可无限增长）与位置嵌入（钳位到 blockSize-1）。
+   *  RoPE 的注意力分数只依赖相对距离，因此滑动窗口后仍与全序列重算逐位一致。
+   */
   function forwardStep(model, tokenId, pos, kv) {
-    const { dModel: D, nHead: H, nLayer: L, vocabSize: V0 } = model.cfg;
+    const { dModel: D, nHead: H, nLayer: L, vocabSize: V0, blockSize: B } = model.cfg;
     const dh = D / H, scale = 1 / Math.sqrt(dh);
     const P = model.params;
+    const NF = model.useRms ? rmsnormFwd : layernormFwd;
+    const nb = (key) => (P[key] ? P[key].d : null);
+    const FH = model.fh;
+    const slot = kv.n;        // 写入槽位
+    const nValid = slot + 1;  // 参与注意力的有效位置数（含当前 token）
 
     // 1) token 嵌入 + 位置嵌入（单行）
     let X = new Float64Array(D);
-    for (let j = 0; j < D; j++) X[j] = P.tokEmb.d[tokenId * D + j] + P.posEmb.d[pos * D + j];
+    const posIdx = Math.min(pos, B - 1);
+    for (let j = 0; j < D; j++) {
+      X[j] = P.posEmb
+        ? P.tokEmb.d[tokenId * D + j] + P.posEmb.d[posIdx * D + j]
+        : P.tokEmb.d[tokenId * D + j];
+    }
 
     for (let l = 0; l < L; l++) {
       const k = `l${l}.`;
-      // 2) pre-LN #1 -> QKV
-      const A = layernormFwd(X, P[k + 'ln1.g'].d, P[k + 'ln1.b'].d, 1, D).Y;
+      // 2) pre-norm #1 -> QKV
+      const A = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), 1, D).Y;
       const qkv = matmul(A, P[k + 'wqkv'].d, 1, D, 3 * D);
       for (let j = 0; j < 3 * D; j++) qkv[j] += P[k + 'bqkv'].d[j];
+      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1);
 
       // 3) 写入缓存（K 取 QKV 中段，V 取尾段）
-      const Ko = kv.K[l], Vo = kv.V[l], o = pos * D;
+      const Ko = kv.K[l], Vo = kv.V[l], o = slot * D;
       for (let j = 0; j < D; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[2 * D + j]; }
 
-      // 4) 因果注意力：仅对已缓存的 pos+1 个位置 attend
+      // 4) 因果注意力：仅对已缓存的 nValid 个位置 attend
       const ctx = new Float64Array(D);
       for (let h = 0; h < H; h++) {
-        const S = new Float64Array(pos + 1);
-        for (let j = 0; j <= pos; j++) {
+        const S = new Float64Array(nValid);
+        for (let j = 0; j < nValid; j++) {
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * Ko[j * D + h * dh + p];
           S[j] = s * scale;
         }
-        const Pm = softmaxRows(S, 1, pos + 1);
+        const Pm = softmaxRows(S, 1, nValid);
         for (let p = 0; p < dh; p++) {
           let s = 0;
-          for (let j = 0; j <= pos; j++) s += Pm[j] * Vo[j * D + h * dh + p];
+          for (let j = 0; j < nValid; j++) s += Pm[j] * Vo[j * D + h * dh + p];
           ctx[h * dh + p] = s;
         }
       }
@@ -656,19 +950,22 @@
       const xMid = new Float64Array(D);
       for (let j = 0; j < D; j++) xMid[j] = X[j] + attn[j];
 
-      // 5) pre-LN #2 -> FFN
-      const M = layernormFwd(xMid, P[k + 'ln2.g'].d, P[k + 'ln2.b'].d, 1, D).Y;
-      const pre1 = matmul(M, P[k + 'w1'].d, 1, D, 4 * D);
-      for (let j = 0; j < 4 * D; j++) pre1[j] += P[k + 'b1'].d[j];
-      const ff = matmul(geluFwd(pre1), P[k + 'w2'].d, 1, 4 * D, D);
+      // 5) pre-norm #2 -> FFN
+      const M = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), 1, D).Y;
+      const W1 = model.useSwi ? 2 * FH : FH;
+      const pre1 = matmul(M, P[k + 'w1'].d, 1, D, W1);
+      for (let j = 0; j < W1; j++) pre1[j] += P[k + 'b1'].d[j];
+      const h1 = model.useSwi ? swigluFwd(pre1, 1, FH) : geluFwd(pre1);
+      const ff = matmul(h1, P[k + 'w2'].d, 1, FH, D);
       for (let j = 0; j < D; j++) ff[j] += P[k + 'b2'].d[j];
       const xOut = new Float64Array(D);
       for (let j = 0; j < D; j++) xOut[j] = xMid[j] + ff[j];
       X = xOut;
     }
 
-    // 6) 最终 LayerNorm + 权重共享输出头
-    const Hf = layernormFwd(X, P['lnf.g'].d, P['lnf.b'].d, 1, D).Y;
+    // 6) 最终归一化 + 权重共享输出头
+    const Hf = NF(X, P['lnf.g'].d, nb('lnf.b'), 1, D).Y;
+    kv.n = slot + 1;
     return { logits: matmulAtB(Hf, P.tokEmb.d, 1, D, V0) };
   }
 
@@ -702,9 +999,12 @@
     const params = {};
     for (const key in model.params) params[key] = Array.from(model.params[key].d);
     return JSON.stringify({
-      format: 'flagship-ai', version: 1,
+      format: 'flagship-ai', version: 2,
       cfg: model.cfg, params,
       vocab: tok ? tok.chars : null,
+      tokKind: tok ? (tok.kind || 'char') : null,
+      merges: tok && tok.kind === 'bpe' ? tok.merges : null,
+      bpeByteLevel: tok && tok.kind === 'bpe' ? !!tok.byteLevel : null,
     });
   }
 
@@ -712,7 +1012,19 @@
   function loadTokenizer(json) {
     const obj = typeof json === 'string' ? JSON.parse(json) : json;
     if (!obj || !Array.isArray(obj.vocab)) return null;
+    if (obj.tokKind === 'bpe') {
+      const t = Object.create(BPETokenizer.prototype);
+      t.kind = 'bpe';
+      t.chars = obj.vocab;
+      t.itos = obj.vocab;
+      t.stoi = new Map(obj.vocab.map((s, i) => [s, i]));
+      t.merges = obj.merges || [];
+      t.byteLevel = obj.bpeByteLevel !== false;
+      t.ranks = new Map(t.merges.map((m, i) => [m[0] + m[1], i]));
+      return t;
+    }
     const t = Object.create(Tokenizer.prototype);
+    t.kind = 'char';
     t.chars = obj.vocab;
     t.stoi = new Map(obj.vocab.map((ch, i) => [ch, i]));
     t.itos = obj.vocab;
@@ -806,30 +1118,41 @@
       ids.push(idx);
       out.push(idx);
 
-      // 推进 KV 缓存
+      // 推进 KV 缓存（pos 为绝对位置，可无限增长；槽位由 kv.n 管理）
       // - 序列长度 < blockSize：纯增量，与全序列 forward 严格逐位等价
-      // - 超出后：滑动窗口丢弃最旧 token（新 token 落在饱和位置 B-1）
+      // - 超出后：滑动窗口丢弃最旧 token。RoPE 下注意力只依赖相对距离，
+      //   故窗口滑动后仍与全序列重算逐位一致；可学习位置嵌入下为有界近似。
       if (kv) {
-        if (pos < B) {
-          logits = forwardStep(model, idx, pos, kv).logits;
-          pos++;
-          kv.n++;
-        } else {
-          kvShift(model, kv);
-          logits = forwardStep(model, idx, B - 1, kv).logits;
-          kv.n = B;
-        }
+        if (pos >= B) kvShift(model, kv);
+        logits = forwardStep(model, idx, pos, kv).logits;
+        pos++;
       }
     }
     return { text: tok.decode(out), ids: out };
   }
 
+  /* 架构预设：一行切换到现代 LLM 的标准配方 */
+  const ARCH_PRESETS = {
+    gpt2: { norm: 'ln', ffn: 'gelu', pos: 'learned' },                 // GPT-2 / 本项目默认
+    llama: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope' },            // LLaMA / Mistral
+  };
+  /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
+  function applyPreset(cfg, preset) {
+    const p = ARCH_PRESETS[preset];
+    if (!p) throw new Error(`未知架构预设：${preset}（可用：${Object.keys(ARCH_PRESETS).join(', ')}）`);
+    return Object.assign({}, cfg, p);
+  }
+
   return {
     mulberry32, randn,
     matmul, matmulAtB, matmulTA,
-    layernormFwd, layernormBwd, geluFwd, geluBwd, softmaxRows, softmaxBwd,
+    layernormFwd, layernormBwd,
+    rmsnormFwd, rmsnormBwd,
+    geluFwd, geluBwd, siluF, swigluFwd, swigluBwd,
+    ropeApply, softmaxRows, softmaxBwd,
     crossEntropy,
-    Tokenizer, GPTModel, train, generate,
+    Tokenizer, BPETokenizer, GPTModel, train, generate,
     initKVCache, forwardStep, warmupKV, kvShift, saveModel, loadModel, loadTokenizer,
+    ARCH_PRESETS, applyPreset, textToByteChars, byteCharsToText,
   };
 });

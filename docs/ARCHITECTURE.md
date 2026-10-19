@@ -97,6 +97,71 @@ y    = g ⊙ xhat + b
 
 `logits = h @ Wteᵀ`：输入嵌入与输出投影共享同一矩阵（GPT-1/2 标准做法），省 `V×D` 参数并提升小语料下的收敛。
 
+### 2.7 模块化架构开关（v3.0）
+
+归一化 / 前馈 / 位置编码三者解耦，可独立组合；`applyPreset` 提供两套已验证配方：
+
+```
+cfg.norm: 'ln'（LayerNorm，GPT-2）      | 'rmsnorm'（RMSNorm，LLaMA/Mistral）
+cfg.ffn:  'gelu'（GPT-2）               | 'swiglu'（SiLU 门控，LLaMA/Mistral）
+cfg.pos:  'learned'（可学习位置嵌入）    | 'rope'（旋转位置编码，LLaMA/Mistral）
+cfg.ffnHidden: 默认 4·D；LLaMA 惯例用 ⌊2/3·4D⌋ 可显式传入
+```
+
+| 预设 | norm | ffn | pos | 备注 |
+|---|---|---|---|---|
+| `gpt2` | ln | gelu | learned | 项目默认，向后兼容 |
+| `llama` | rmsnorm | swiglu | rope | 现代 LLM 标准配方 |
+
+> 每个开关分支均**手写下反向**并经中心差分梯度检验（见 3.4 节）。
+
+### 2.8 BPE 分词器（v3.0）
+
+复刻 GPT-2 / tiktoken 的字节对编码，但基元可切换：
+
+- **字节级**（`byteLevel:true`，GPT-2 标准）：初始词表 = 256 个字节（经 GPT-2 字节映射避免半截 UTF-8），覆盖任意 UTF-8。
+- **字符级**（`byteLevel:false`）：初始词表 = 语料全部字符。中文语料下显著更省 token——每汉字 3 字节的 UTF-8 在字节级下必须先"合并回来"才不亏，`scripts/probe-v3.js` 实测中文语料字符级相对字节级 **1.14x** 压缩率。
+
+```
+算法：逐词块（正则预切分）统计相邻对频次 → 每轮合并最高频对 → 直到达到 vocabSize
+编码：词块内按 merge-rank 贪心合并（等价 tiktoken 的 get_pairs 递归）
+解码：字节级先拼全部基元再一次性 UTF-8 解码 → 跨 token 多字节汉字无损
+```
+
+不变量：`encode∘decode = id`（含中文 / emoji / 标点 / 跨 token 汉字），`scripts/probe-v3.js` 第 1 项逐例验证。
+
+### 2.9 RMSNorm / SwiGLU / RoPE（v3.0）
+
+**RMSNorm**（省去均值中心化，LLaMA）：
+
+```
+xhat = x / √(mean(x²) + eps)
+y    = g ⊙ xhat          # 无偏置项 b
+```
+
+**SwiGLU**（SiLU 门控前馈，LLaMA）：
+
+```
+FFN(x) = (SiLU(x @ W₁ + b₁) ⊙ (x @ W₃ + b₃)) @ W₂ + b₂   # 隐层扩为 2·FH
+SiLU(z) = z · σ(z) = z / (1 + e^{-z})
+```
+
+相比 GPT-2 的 `GELU → D×4D×D`，SwiGLU 用 `2·FH` 宽门控（`FH` 默认 4D，对齐时 ⌊8D/3⌋），参数略多但收敛更好（见 3.4 对照）。
+
+**RoPE**（旋转位置编码，相对位置不变性）：
+
+```
+对每头 q,k 按奇偶维度配对 (x_{2i}, x_{2i+1})，绕原点旋转 θ_m·pos：
+  [q̂_{2i}, q̂_{2i+1}] = R(θ_m · pos) · [q_{2i}, q_{2i+1}]
+  R(φ) = [[cos φ, -sin φ], [sin φ, cos φ]]   θ_m = base^{-2m/D}
+```
+
+关键性质：**注意力分数只依赖相对距离**（旋转矩阵复合 `R(φ_j-φ_i)`）。因此：
+
+- 天然支持长度外推（无需 learnable 位置嵌入）；
+- 滑动窗口下 KV cache 与全量重算**逐位一致**（`scripts/probe-v3.js` 第 3 项：整体平移 5 位后分数最大差异 **1.33e-15**）；
+- 反向即反向旋转（`ropeApply(..., -1)`），与正向共用同一组 θ。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -133,13 +198,35 @@ dh   += dlogits @ Wte       # 流回主干再经 LN_f 反传
 
 ### 3.3 验证金标准
 
-395 个抽样参数做中心差分检验（ε=1e-5）：
+默认 GPT-2 配置下，395 个抽样参数做中心差分检验（ε=1e-5）：
 
 ```
 num_i = (L(θ+εeᵢ) − L(θ−εeᵢ)) / 2ε
 判据：|ana − num| ≤ atol + rtol·max(|ana|, |num|)，atol=1e-7, rtol=1e-4
-实测最大 err/tol = 4.22e-4
+实测最大 err/tol = 4.22e-4（GPT-2）
 ```
+
+### 3.4 多架构梯度检验（v3.0）
+
+`scripts/probe-v3.js` 对 5 种架构组合逐一做中心差分检验，最大 err/tol 均 < 3e-3，证明每个模块分支的反向都正确：
+
+| 架构 | 检验分量（跳过零梯度） | 最大 err/tol |
+|---|---|---|
+| GPT-2（LN+GELU+learned） | 1243（跳 45） | 2.86e-3 |
+| LLaMA（RMS+SwiGLU+RoPE） | 1068（跳 0） | 1.91e-3 |
+| 仅 RMSNorm | 1083（跳 45） | 1.43e-3 |
+| 仅 SwiGLU | 1243（跳 45） | 9.42e-4 |
+| 仅 RoPE | 1228（跳 0） | 1.24e-3 |
+
+**参数对齐架构对照**（同语料/同种子/同步数，小语料过拟合）：
+
+| 配置 | 参数量 | loss | 准确率 |
+|---|---|---|---|
+| gpt2 | 124,480 | 1.910 | 34.9% |
+| llama(4D) | 153,344 | 0.779 | 39.7% |
+| llama(对齐 4D→FH=181) | 124,244 | 0.859 | **47.6%** |
+
+结论：在**参数对齐**条件下，LLaMA 配方（RMSNorm+SwiGLU+RoPE）收敛更快、准确率更高——与业界"现代架构优于经典 GPT-2 配方"的共识一致。
 
 ---
 
@@ -212,9 +299,10 @@ logits = LN_f(x)·Wteᵀ
 | 场景 | 行为 | 与全量重算的关系 |
 |---|---|---|
 | 序列长度 < blockSize | 纯增量，零重算 | **严格逐位相等**（实测 logits 差异 0） |
-| 序列长度 ≥ blockSize | 滑动窗口：丢弃最旧 token（`copyWithin` memmove），新 token 落在饱和位置 B-1 | **不再等价** —— 绝对位置嵌入的固有约束 |
+| 序列长度 ≥ blockSize（pos='learned'） | 滑动窗口：丢弃最旧 token（`copyWithin` memmove），新 token 落在饱和位置 B-1 | **不再等价** —— 绝对位置嵌入的固有约束 |
+| 序列长度 ≥ blockSize（pos='rope'） | 滑动窗口：丢弃最旧 token | **逐位一致** —— RoPE 注意力只依赖相对距离，窗口平移不改变分数 |
 
-第二条不可消除：GPT-2 的位置嵌入是绝对位置，窗口一旦滑动，剩余 token 的位置索引就变了，要严格等价必须全量重算。业界（llama.cpp / Mistral sliding window）同样采用近似。
+`pos='learned'` 第二条不可消除：GPT-2 的位置嵌入是绝对位置，窗口一旦滑动，剩余 token 的位置索引就变了，要严格等价必须全量重算。业界（llama.cpp / Mistral sliding window）同样采用近似。`pos='rope'` 则天然规避此问题——这也是现代架构更适合超长生成的原因。
 
 ### 一个被实测抓出的性能陷阱
 
@@ -248,13 +336,16 @@ logits = LN_f(x)·Wteᵀ
 存档格式（JSON，无损双精度）：
 
 ```json
-{ "format": "flagship-ai", "version": 1,
-  "cfg": { "vocabSize": 291, "blockSize": 64, "nLayer": 2, "nHead": 4, "dModel": 64, "seed": 42 },
+{ "format": "flagship-ai", "version": 2,
+  "cfg": { "vocabSize": 291, "blockSize": 64, "nLayer": 2, "nHead": 4, "dModel": 64, "seed": 42,
+           "norm": "ln", "ffn": "gelu", "pos": "learned", "ffnHidden": 256 },
+  "tokKind": "char" | "bpe",
+  "merges": [["a","b"], ...], "bpeByteLevel": true | null,
   "params": { "tokEmb": [...], "posEmb": [...], "l0.wqkv": [...], ... },
   "vocab": ["\n", "，", "一", ...] }
 ```
 
-`vocab` 必须一并存档：字符级分词器的字符→id 映射丢失后，参数再多也无法正确编解码。验证项 12 显式检查词表恢复（30 字符往返 encode/decode 一致）。
+`vocab` 与分词器元数据（`tokKind` / `merges` / `bpeByteLevel`）必须一并存档：字符级/字节级分词器的字符→id 映射丢失后，参数再多也无法正确编解码。验证项 12 显式检查词表恢复（30 字符往返 encode/decode 一致）与 BPE merge 往返无损。
 
 
 ---

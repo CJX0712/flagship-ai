@@ -84,7 +84,7 @@
 
   <div class="grid">
     <div class="card">
-      <h2>语料与模型 <span class="tag">字符级 tokenizer</span></h2>
+      <h2>语料与模型 <span class="tag">char / BPE tokenizer</span></h2>
       <label for="corpus">训练语料（可自由替换，建议 300 字以上）</label>
       <textarea id="corpus" rows="7"></textarea>
       <div class="row">
@@ -123,6 +123,27 @@
         <div>
           <label for="seed">随机种子 seed</label>
           <input id="seed" type="number" value="42" min="0" step="1">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="tokenizer">分词器</label>
+          <select id="tokenizer">
+            <option value="char" selected>字符级（中文友好）</option>
+            <option value="bpe-byte">BPE 字节级（GPT-2 标准）</option>
+            <option value="bpe-char">BPE 字符级（中文更省 token）</option>
+          </select>
+        </div>
+        <div>
+          <label for="arch">架构预设</label>
+          <select id="arch">
+            <option value="gpt2" selected>GPT-2（LN+GELU+位置嵌入）</option>
+            <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
+          </select>
+        </div>
+        <div>
+          <label for="vocabSize">BPE 目标词表</label>
+          <input id="vocabSize" type="number" value="320" min="64" step="32">
         </div>
       </div>
       <div class="btns">
