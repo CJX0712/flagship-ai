@@ -42,6 +42,9 @@ jobs:
       - name: MoE x INT8 combined probe
         run: node scripts/probe-moe-quant.js
 
+      - name: Sliding-Window Attention (SWA) probe
+        run: node scripts/probe-swa.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

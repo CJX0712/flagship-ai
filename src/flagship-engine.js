@@ -660,6 +660,8 @@
      *   nExp:    专家数量（每层 N 个独立 FFN + 1 个路由网络）
      *   topK:    top-k 门控（每个 token 仅激活 topK 个专家，默认 1）
      *   auxWeight: 负载均衡辅助损失权重（Switch/GDP-MoE，默认 0.01；非 MoE 为 0）
+     *   稀疏注意力开关（Mistral/Gemma 谱系）：
+     *   window: 滑动窗口大小（查询 i 仅 attend 键 [i-window+1, i]，0 = 全因果，默认）
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -688,6 +690,9 @@
       this.topK = Math.min(cfg.topK || 1, this.nExp);
       this.useMoE = this.nExp > 1;
       this.auxWeight = cfg.auxWeight != null ? cfg.auxWeight : (this.useMoE ? 0.01 : 0);
+      // 滑动窗口注意力（SWA，Mistral/Gemma）：window>0 时查询 i 只 attend 键 [i-window+1, i]；
+      // window=0（默认）即标准全因果，逐位兼容旧模型。
+      this.window = cfg.window > 0 ? Math.floor(cfg.window) : 0;
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -760,6 +765,7 @@
       m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
+      m.window = this.window;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -825,22 +831,27 @@
           const ko = D + kvh * dh;                 // K 段偏移
           const vo = D + KV * dh + kvh * dh;        // V 段偏移
           const S = new Float64Array(T * T);
+          const win = this.window; // 0 = 全因果（GPT-2 原行为）
           for (let i = 0; i < T; i++) {
             const qi = i * qkvDim + h * dh;
-            for (let j = 0; j <= i; j++) { // 因果掩码：只 attend 到 j <= i
+            // 因果掩码（j <= i）叠加滑动窗口左边界（j >= i-window+1，Mistral/Gemma）
+            const jLo = win > 0 && i - win + 1 > 0 ? i - win + 1 : 0;
+            for (let j = jLo; j <= i; j++) { // 窗口内：计算注意力分数
               const kj = j * qkvDim + ko;
               let s = 0;
               for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
               S[i * T + j] = s * scale;
             }
+            for (let j = 0; j < jLo; j++) S[i * T + j] = -1e9;  // 窗口左侧屏蔽（窗外历史）
             for (let j = i + 1; j < T; j++) S[i * T + j] = -1e9; // 未来位置屏蔽
           }
           const Pm = softmaxRows(S, T, T);
           Ps.push(Pm);
           for (let i = 0; i < T; i++) {
+            const jLo = win > 0 && i - win + 1 > 0 ? i - win + 1 : 0;
             for (let p = 0; p < dh; p++) {
               let s = 0;
-              for (let j = 0; j <= i; j++) s += Pm[i * T + j] * qkv[j * qkvDim + vo + p];
+              for (let j = jLo; j <= i; j++) s += Pm[i * T + j] * qkv[j * qkvDim + vo + p];
               ctx[i * D + h * dh + p] = s;
             }
           }
@@ -1179,20 +1190,22 @@
       const Ko = kv.K[l], Vo = kv.V[l], o = slot * kvDim;
       for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
 
-      // 4) 因果注意力：仅对已缓存的 nValid 个位置 attend
+      // 4) 因果 + 滑动窗口注意力：仅对窗口内的缓存位置 attend（窗外槽位不影响输出）
+      const win = model.window > 0 ? Math.min(model.window, nValid) : nValid;
+      const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
       const ctx = new Float64Array(D);
       for (let h = 0; h < H; h++) {
         const kvh = (h / model.g) | 0;
-        const S = new Float64Array(nValid);
-        for (let j = 0; j < nValid; j++) {
+        const S = new Float64Array(win);
+        for (let j = jLo; j < nValid; j++) {
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * Ko[j * kvDim + kvh * dh + p];
-          S[j] = s * scale;
+          S[j - jLo] = s * scale;
         }
-        const Pm = softmaxRows(S, 1, nValid);
+        const Pm = softmaxRows(S, 1, win);
         for (let p = 0; p < dh; p++) {
           let s = 0;
-          for (let j = 0; j < nValid; j++) s += Pm[j] * Vo[j * kvDim + kvh * dh + p];
+          for (let j = 0; j < win; j++) s += Pm[j] * Vo[(j + jLo) * kvDim + kvh * dh + p];
           ctx[h * dh + p] = s;
         }
       }
@@ -1425,6 +1438,8 @@
     'llama-gqa': { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2 }, // LLaMA + GQA 演示
     // Mixtral 风格：LLaMA 配方 + GQA + MoE（4 专家 top-2 路由）。nExp/topK 可在 cfg 覆盖。
     mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
+    // 滑动窗口注意力（SWA）：LLaMA 配方 + GQA + window=64（Mistral/Gemma 稀疏注意力）。
+    swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {

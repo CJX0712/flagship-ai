@@ -136,6 +136,10 @@
           <label for="topK">激活专家 topK（留空=跟随 nExp/预设）</label>
           <input id="topK" type="number" min="1" step="1" placeholder="留空=自动">
         </div>
+        <div>
+          <label for="window">滑动窗口 window（0=全因果；&gt;0 启用 SWA 稀疏注意力）</label>
+          <input id="window" type="number" min="0" step="1" value="0" placeholder="0=全因果">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -153,6 +157,7 @@
             <option value="llama">LLaMA（RMSNorm+SwiGLU+RoPE）</option>
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
             <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
+            <option value="swa">SWA（LLaMA+GQA+滑动窗口注意力）</option>
           </select>
         </div>
         <div>

@@ -219,6 +219,17 @@ MHA 中 K/V 与 Q 同头数（H）。GQA 让 K/V 只用 `KV ≤ H` 组（LLaMA-2
 - **无损实证**：logits maxΔ<0.1；量化 KV-cache 末位与全序列前向 Δ=0；存档往返 Δ=0；in-RAM 线性权重恰好 8x、整体 6.90x；JSON 存档 5.67x；量化后路由不坍缩（最大专家占用 63%）。
 - **验证**：`scripts/probe-moe-quant.js` —— 14 项全绿。
 
+### 2.14 滑动窗口注意力 SWA（v9.0，Mistral/Gemma 稀疏注意力）
+
+`window > 0` 时，查询位置 `i` **只 attend 键位置 `[i-window+1, i]`**（因果掩码 ⊇ 滑动窗口左边界）；`window = 0`（默认）即标准全因果，旧模型逐位兼容。
+
+- **前向（T×T 路径）**：行 `i` 的分数掩码为 `S[i][j] = -1e9`（`j < i-window+1` 或 `j > i`）；`exp(-1e9 - max)` 在 float64 下溢为**精确 0.0**，窗外概率严格归零，`ctx` 累加随之只含窗口内项。单头注意力计算量从 O(T²) 降为 O(T·window)。
+- **前向（单 token 增量路径）**：缓存槽位 `j` 对应绝对位置 `pos-(slot-j)`，窗口左边界即槽位 `slot-window+1`；只对窗口切片 `[jLo, nValid)` 计算分数与 softmax，与全序列重算**逐位一致**（RoPE 下注意力分数只依赖相对距离）。
+- **反向（零新增代码）**：窗口是**静态掩码**，梯度经缓存 `Ps` 自动继承——`P[i][j]=0` 处 `dS=0`，`dQ/dK/dV` 的窗外贡献恒为 0。这是 SWA 选型的关键优势：固定掩码无离散决策，天然满足中心差分梯度检验。
+- **感受野**：L 层、窗口 w 的网络，末位 token 的理论感受野半径 `(w-1)·L`——超出该距离的输入扰动对末位 logits **零影响**（探针实测逐位 0），窗内扰动必须可见。
+- **量化与持久化**：`quantize()` 复制 `window` 字段；`cfg.window` 随 `saveModel` 存档，`loadModel` 重建后语义不变。
+- **验证**：`scripts/probe-swa.js` —— 梯度检验（RoPE+SwiGLU+RMSNorm+GQA+window 全组合 err/tol=5.2e-4）、窗口局部性（深度锥语义）、KV 缓存逐步一致（maxΔ=0）、window=0 零回归、window≥T 等价全因果、过拟合训练、缓存/重算贪心解码一致、持久化+INT8 往返，8 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -416,6 +427,7 @@ logits = LN_f(x)·Wteᵀ
 | `train` | nanoGPT `train.py` | AdamW 超参、warmup+cosine、梯度裁剪 |
 | `generate` | GPT-2 采样逻辑 | temperature / top-k / top-p、贪心 |
 | MoE 稀疏 FFN + top-k 路由 | Mixtral / DeepSeek / Switch Transformer | 每层 N 专家 + 1 路由、top-k 门控、`N·Σ f_e·P_e` 负载均衡辅助损失（冻结 f_e） |
+| 滑动窗口注意力 | Mistral 7B / Gemma | 查询 i 仅 attend `[i-window+1, i]`，窗外掩码 -1e9（softmax 后精确 0）；固定掩码 → 反向经缓存 Ps 自动继承 |
 | 单文件风格 | picoGPT | 零依赖、可通读、公式即代码 |
 | 验证方法论 | 各 forge 系列硬不变量 | 行和=1、正交/因果掩码、数值梯度检验、过拟合收敛 |
 

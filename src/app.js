@@ -65,7 +65,7 @@
         dModel: dModel,
         seed: +$('seed').value || 42,
       };
-      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral') cfg = F.applyPreset(cfg, arch);
+      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa') cfg = F.applyPreset(cfg, arch);
       if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
       // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
       const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
@@ -80,6 +80,13 @@
         } else if (!cfg.topK) cfg.topK = 1;
       } else if (topKRaw !== '' && cfg.nExp) {
         cfg.topK = Math.min(+topKRaw, cfg.nExp);
+      }
+      // SWA 覆盖：window=0=全因果（默认）；>0 启用滑动窗口（swa 预设为 64）
+      const winRaw = $('window').value.trim();
+      if (winRaw !== '') {
+        const w = +winRaw;
+        if (!(w >= 0)) { log('window 需 ≥ 0', 'err'); return false; }
+        cfg.window = w;
       }
       state.arch = arch;
       state.tokMode = tokMode;
@@ -322,7 +329,7 @@
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     window.addEventListener('resize', drawChart);
