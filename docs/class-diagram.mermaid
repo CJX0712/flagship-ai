@@ -1,0 +1,249 @@
+%% Flagship AI v12 · 十层分解架构 —— 类图 / 数据结构与接口
+%% 出自 docs/ARCHITECTURE-v12.md §4.1
+%% 说明：另两张时序图见 docs/sequence-diagram.mermaid 与 ARCHITECTURE-v12.md §5.2 §5.3
+classDiagram
+    class NS {
+        <<namespace>>
+        +L0 : Object
+        +L1..L10 : Object
+        +__loadOrder : string[]
+        +buildPublicAPI() Object
+    }
+
+    class MicroISA {
+        +registry : Map~string, MicroOp~
+        +slots : number
+        +register(spec) void
+        +key(domain, n) string
+        +display(key) string
+        +get(key) MicroOp
+        +stats() DomainStat[]
+        +check(key, seed) CheckResult
+        +run(key, args) any
+    }
+    class MicroOp {
+        +key : string
+        +id : string
+        +domain : string
+        +fn : Function
+        +invariants : Invariant[]
+        +ref : string
+        +complexity : string
+        +impl : enum
+    }
+    class Invariant {
+        +kind : enum
+        +bound : number
+        +oracle : Function
+        +gen : Function
+        +report() CheckResult
+    }
+
+    class NumBase {
+        +rng(seed) RngStream
+        +randn(r) number
+        +twoSum(a,b) Pair
+        +kahanStep(sum,comp,x) Pair
+        +ulpDiff(a,b) number
+        +safeExp(x) number
+        +erf(x) number
+        +lgamma(x) number
+        +hypot(a,b) number
+    }
+    class RngStream {
+        +seed : number
+        +state : number
+        +next() number
+        +split(n) RngStream[]
+    }
+    class Assert {
+        +assert(cond, msg) void
+        +assertClose(a, b, tol, msg) void
+        +assertBitExact(a, b, msg) void
+        +sentinel(arr, ctx) void
+        +budget(name) number
+    }
+
+    class Kernel {
+        +matmul(A, B, r, k, c) Float64Array
+        +matmulAtB(A, B, r, k, c) Float64Array
+        +matmulTA(A, B, r, k, c) Float64Array
+        +mm(A, P, r, k, c) Float64Array
+        +mmAtB(A, P, r, k, c) Float64Array
+        +addInto(dst, src) void
+        +rowSumInto(dst, M, r, c) void
+        +quantizeRow(d) QuantRow
+        +dequantRow(q) Float64Array
+    }
+
+    class Tensor {
+        +data : Float64Array
+        +shape : number[]
+        +stride : number[]
+        +offset : number
+        +dtype : string
+        +get(idx) number
+        +view(ranges) Tensor
+        +permute(axes) Tensor
+        +slice(dim, a, b) Tensor
+        +reshape(s) Tensor
+        +contiguous() Tensor
+    }
+    class Shape {
+        +strideFromShape(s) number[]
+        +linearize(stride, offset, idx) number
+        +broadcastAlign(a, b) number[]
+        +checkCompat(a, b) boolean
+    }
+    class Arena {
+        +alloc(n, dtype) Float64Array
+        +reset() void
+        +usedBytes() number
+    }
+    class KVCache {
+        +K : Float64Array[]
+        +V : Float64Array[]
+        +n : number
+        +alloc(model) KVCache
+        +append(layer, kVec, vVec) void
+        +gather(layer, jLo, jHi) Tensor
+        +shift() void
+    }
+
+    class KernelRegistry {
+        +register(name, fn) void
+        +kernel(name) Function
+        +has(name) boolean
+    }
+    class Backend {
+        <<interface>>
+        +id : string
+        +profile : enum
+        +write(data, shape) Handle
+        +read(handle) Float64Array
+        +dispose(handle) void
+        +memory() Object
+        +time(fn) number
+        +caps() Object
+    }
+    class CPUBackend {
+        +id : string
+        +kernel(name) Function
+    }
+    class BackendRegistry {
+        +register(b) void
+        +set(id) void
+        +current() Backend
+        +fallback(order) Backend
+    }
+
+    class VJPRegistry {
+        +register(opName, vjpFn) void
+        +get(opName) Function
+        +list() string[]
+    }
+    class Tape {
+        +push(opName, cache) void
+        +pop() Entry
+        +toCache() Object
+    }
+    class GradCheck {
+        +centralDiff(fn, params, eps) Report
+        +report(opName) Report
+    }
+
+    class OpRegistry {
+        +register(name, spec) void
+        +get(name) Op
+    }
+    class Op {
+        +name : string
+        +forward(args, cfg) Result
+        +vjp(result, grad) Grad
+        +invariants : Invariant[]
+    }
+
+    class GPTModel {
+        +cfg : Object
+        +params : Object
+        +grads : Object
+        +forward(tokens) Result
+        +backward(cache, dlogits) void
+        +zeroGrads() void
+        +paramCount() number
+        +quantize() GPTModel
+        +evaluate(tokens) number
+    }
+    class Block {
+        +idx : number
+        +window : number
+        +forward(x, layer) Tensor
+        +backward(dX, layer) Tensor
+    }
+
+    class Trainer {
+        +train(model, tokens, opts) TrainResult
+    }
+    class Generator {
+        +generate(model, tok, prompt, opts) GenResult
+    }
+    class Sampler {
+        +sample(logits, opts, rng) number
+    }
+    class Persistence {
+        +saveModel(model, tok) string
+        +loadModel(json) GPTModel
+        +loadTokenizer(json) Tokenizer
+    }
+
+    class App {
+        +mount() void
+        +runSelfCheck() void
+    }
+    class Panels {
+        +renderLayerNav() void
+        +renderDashboard() void
+        +renderMicroOp(key) void
+    }
+
+    NS --> MicroISA : L10
+    NS --> NumBase : L9
+    NS --> Kernel : L8
+    NS --> Tensor : L7
+    NS --> Backend : L6
+    NS --> VJPRegistry : L5
+    NS --> OpRegistry : L4
+    NS --> GPTModel : L3
+    NS --> Trainer : L2
+    NS --> App : L1
+
+    MicroISA "1" *-- "1024" MicroOp
+    MicroOp "1" *-- "1..n" Invariant
+    NumBase ..> MicroISA : 使用 μop
+    NumBase --> RngStream
+    NumBase --> Assert
+    Kernel ..> MicroISA : 使用 μop
+    Kernel ..> NumBase : 依赖
+    Tensor --> Shape
+    Tensor --> Arena
+    Tensor <.. KVCache : 持有
+    BackendRegistry o-- Backend
+    Backend <|.. CPUBackend
+    BackendRegistry --> KernelRegistry
+    KernelRegistry ..> Kernel : 派发
+    Op ..> VJPRegistry : 注册 vjp
+    Op ..> KernelRegistry : 调用 kernel
+    Op ..> Tensor : 视图
+    VJPRegistry --> Tape
+    VJPRegistry --> GradCheck
+    GPTModel "1" *-- "n" Block
+    Block ..> Op : 组装
+    Trainer ..> GPTModel
+    Trainer ..> Op : loss
+    Generator ..> GPTModel
+    Generator ..> Sampler
+    Generator ..> KVCache
+    Persistence ..> GPTModel
+    App ..> Trainer
+    App ..> Generator
+    Panels ..> MicroISA

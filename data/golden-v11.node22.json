@@ -1,0 +1,56 @@
+{
+  "node": "22",
+  "generatedAt": "2026-10-20T16:51:29.373Z",
+  "results": [
+    {
+      "name": "R1 params Δ=0",
+      "pass": true,
+      "detail": "params maxΔ=0"
+    },
+    {
+      "name": "R2 forward logits Δ=0",
+      "pass": true,
+      "detail": "logits maxΔ=0"
+    },
+    {
+      "name": "R3 backward grads Δ=0",
+      "pass": true,
+      "detail": "grads maxΔ=0"
+    },
+    {
+      "name": "R4 train loss 序列 + 末态 params Δ=0",
+      "pass": true,
+      "detail": "loss maxΔ=0 · params maxΔ=0"
+    },
+    {
+      "name": "R5 generate ids+text Δ=0",
+      "pass": true,
+      "detail": "完全一致"
+    },
+    {
+      "name": "R6 KV 增量 vs 全量重算 Δ=0",
+      "pass": false,
+      "detail": "gpt2/s1: cache vs full mismatch"
+    },
+    {
+      "name": "R7 存档往返 Δ=0",
+      "pass": true,
+      "detail": "logits maxΔ=0"
+    },
+    {
+      "name": "R8 quantize logits maxΔ<0.03",
+      "pass": true,
+      "detail": "quant maxΔ=0.00000"
+    },
+    {
+      "name": "R9 逐算子 Δ=0",
+      "pass": false,
+      "detail": "maxΔ=Infinity"
+    },
+    {
+      "name": "R10 8 probe 全绿（断言快照）",
+      "pass": true,
+      "detail": "8/8 探针 exit 0"
+    }
+  ]
+}

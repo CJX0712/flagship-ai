@@ -1,0 +1,44 @@
+%% Flagship AI v12 · 十层分解架构 —— 时序图 ① 训练一步的完整跨层调用
+%% 出自 docs/ARCHITECTURE-v12.md §5.1
+%% 另两张图（带 KV Cache 的自回归生成 / 一条微指令的调用链路）见 ARCHITECTURE-v12.md §5.2 §5.3
+sequenceDiagram
+    autonumber
+    participant UI as L1 App
+    participant TR as L2 train.js
+    participant MD as L3 GPTModel/blocks
+    participant OP as L4 ops
+    participant AD as L5 vjp-registry
+    participant BE as L6 backend(cpu/exact)
+    participant TS as L7 Tensor/KV
+    participant KN as L8 kernel
+    participant NB as L9 numbase
+    participant ISA as L10 microisa
+
+    UI->>TR: train(model, tokens, {steps,lr,seed,state})
+    TR->>NB: rng(seed) / randn
+    NB->>ISA: μH rng_pcg64 / rng_split
+    TR->>TR: 采样 batchToks（RNG 状态随 step 延续）
+    TR->>MD: model.forward(batchToks)
+    MD->>OP: embed(x) → linear(wqkv) → qkNorm → ropeApply
+    OP->>BE: kernel('mm'|'ropeApply'|'rmsnormFwd')
+    BE->>KN: mm(A,P,r,k,c)（exact 通道：v11 原序）
+    KN->>NB: sentinel(arr,'mm') / fp-ops
+    NB->>ISA: μC gemm_ref / μA safe_exp
+    KN-->>OP: Float64Array
+    OP->>OP: attention.score(μG score_qk) → softmaxRows → ctx
+    OP->>AD: 前向同时向 vjp-registry 登记 cache
+    MD->>OP: linear(wproj) → 残差 → FFN/MoE → 残差
+    MD-->>TR: { logits, cache }
+    TR->>OP: crossEntropy(logits, targets)
+    OP-->>TR: { loss, dlogits }
+    TR->>MD: model.backward(cache, dlogits)
+    loop l = L-1 .. 0（顺序与 v11 完全一致）
+        MD->>AD: vjp('rmsnorm'|'swiglu'|'attention'|'moe', cache_l, dY)
+        AD->>BE: kernel('rmsnormBwd'|'swigluBwd'|'matmulTA')
+        BE->>KN: 反向内核
+        KN->>ISA: μF vjp_* / μC gemm_nt
+        KN-->>MD: dX, dW
+    end
+    MD-->>TR: grads 累加完成
+    TR->>TR: gradClip(norm) → AdamW.step（μH adamw_step）
+    TR-->>UI: onStep(step, loss, lr, norm)

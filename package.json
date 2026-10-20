@@ -1,11 +1,14 @@
 {
   "name": "flagship-ai",
-  "version": "11.0.0",
-  "description": "零依赖纯 JavaScript 手写 GPT 引擎：多架构(GPT-2/LLaMA/LLaMA-GQA/Mixtral-MoE/SWA/Gemma完整配方) + BPE 分词 + INT8 权重量化 + MoE 混合专家 + 滑动窗口/层交错稀疏注意力 + QK-norm/logit-softcap + 手写反向传播 + AdamW + KV Cache。Node 与浏览器双端运行，全探针绿。",
-  "main": "src/flagship-engine.js",
+  "version": "12.0.0-alpha.0",
+  "description": "零依赖纯 JavaScript 手写 GPT 引擎 + 十层分解架构（L1 应用 → L10 微指令 1024 项）：多架构(GPT-2/LLaMA/LLaMA-GQA/Mixtral-MoE/SWA/Gemma完整配方) + BPE 分词 + INT8 权重量化 + MoE 混合专家 + 滑动窗口/层交错稀疏注意力 + QK-norm/logit-softcap + 手写反向传播 + AdamW + KV Cache + 1024 项可验证微指令。Node 与浏览器双端运行，全探针绿。",
+  "main": "src/index.js",
   "scripts": {
     "test": "node src/verify.js",
     "test:all": "node src/verify.js && node scripts/probe-v3.js && node scripts/probe-v4-gqa.js && node scripts/probe-v5-quant.js && node scripts/probe-moe.js && node scripts/probe-moe-quant.js && node scripts/probe-swa.js && node scripts/probe-gemma.js && node scripts/probe-gemma2.js",
+    "regression": "node scripts/regression-v11.js",
+    "lint": "node scripts/lint-layers.js",
+    "verify:ci": "npm test && npm run lint && npm run regression && npm run test:all",
     "bench": "node scripts/bench.js",
     "bench:full": "node scripts/bench.js --full",
     "build": "node scripts/build-demo.js",
@@ -13,7 +16,8 @@
   },
   "keywords": [
     "gpt", "transformer", "llm", "deep-learning", "backpropagation",
-    "attention", "zero-dependency", "javascript", "from-scratch", "educational"
+    "attention", "zero-dependency", "javascript", "from-scratch", "educational",
+    "microisa", "ten-layer"
   ],
   "author": "晨星 (Chenxing)",
   "license": "MIT",
@@ -27,5 +31,8 @@
   "bugs": {
     "url": "https://github.com/CJX0712/flagship-ai/issues"
   },
-  "homepage": "https://github.com/CJX0712/flagship-ai#readme"
+  "homepage": "https://github.com/CJX0712/flagship-ai#readme",
+  "devDependencies": {
+    "fast-check": "^3.22.0"
+  }
 }
