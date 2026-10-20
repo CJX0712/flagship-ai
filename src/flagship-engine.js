@@ -251,6 +251,49 @@
     return { dX, dg, db: null };
   }
 
+  /* ---- QK-norm（Gemma 2/3 / Chameleon / ViT-22B）----
+   * 对每个注意力头的 Q/K 向量做 RMSNorm（增益按 head_dim 维、跨头共享），
+   * 在 RoPE 旋转之前应用：稳定注意力 logits 尺度，抑制训练发散。
+   * 行布局：每个头向量长 dh，起始偏移 off，行间跨度 stride（qkvDim）。 */
+  function qkNormFwd(qkv, rows, nHeads, dh, stride, off, g) {
+    const xhat = new Float64Array(rows * nHeads * dh);
+    const rstd = new Float64Array(rows * nHeads);
+    for (let i = 0; i < rows; i++) {
+      for (let h = 0; h < nHeads; h++) {
+        const o = i * stride + off + h * dh;
+        const hi = (i * nHeads + h) * dh;
+        let ss = 0;
+        for (let p = 0; p < dh; p++) ss += qkv[o + p] * qkv[o + p];
+        const rs = 1 / Math.sqrt(ss / dh + RMS_EPS);
+        rstd[i * nHeads + h] = rs;
+        for (let p = 0; p < dh; p++) {
+          const xh = qkv[o + p] * rs;
+          xhat[hi + p] = xh;
+          qkv[o + p] = g[p] * xh; // 就地归一（RoPE 前的 Q/K 段）
+        }
+      }
+    }
+    return { xhat, rstd };
+  }
+  // 反向：dX = rs·(dY·g − xhat·mean(dY·g·xhat))；dg 跨头跨行累加（增益共享）
+  function qkNormBwd(dqkv, xhat, rstd, rows, nHeads, dh, stride, off, g, dg) {
+    const inv = 1 / dh;
+    for (let i = 0; i < rows; i++) {
+      for (let h = 0; h < nHeads; h++) {
+        const o = i * stride + off + h * dh;
+        const hi = (i * nHeads + h) * dh;
+        const rs = rstd[i * nHeads + h];
+        let s = 0; // Σ_p (dY_p · g_p · xhat_p)
+        for (let p = 0; p < dh; p++) s += dqkv[o + p] * g[p] * xhat[hi + p];
+        for (let p = 0; p < dh; p++) {
+          const dy = dqkv[o + p] * g[p];
+          dg[p] += dqkv[o + p] * xhat[hi + p];
+          dqkv[o + p] = rs * (dy - xhat[hi + p] * inv * s);
+        }
+      }
+    }
+  }
+
   /* ---- SiLU / SwiGLU（Shazeer 2020；LLaMA/Mistral/PaLM 标准 FFN） ----
    * SwiGLU(x) = SiLU(xW_gate) ⊙ (xW_up)，SiLU(z) = z·σ(z)。
    * 本实现把 gate 与 up 拼成一次矩阵乘（w1: D → 2·FH），少一次 matmul。
@@ -663,6 +706,9 @@
      *   稀疏注意力开关（Mistral/Gemma 谱系）：
      *   window: 滑动窗口。标量=所有层同窗口；数组=逐层窗口（长度须=nLayer，Gemma 2/3 局部/全局交错）；
      *           哨兵 {alt:N}=偶数层全因果(0)、奇数层窗口 N 的 1:1 交错。0 = 全因果，默认
+     *   稳定化开关（Gemma 2 配方，默认全关 = 逐位兼容旧模型）：
+     *   qkNorm:  true 时对每个头的 Q/K 向量做 RMSNorm（RoPE 前，增益 head_dim 维跨头共享）
+     *   logitCap: 最终 logits 软帽 logits = cap·tanh(logits/cap)（Gemma 2 用 30；0 = 不启用）
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -714,6 +760,9 @@
       this.windows = wArr;   // 逐层窗口（权威字段，0 = 该层全因果/全局）
       this.window = Array.isArray(wRaw) ? wArr.slice()
         : (wRaw && typeof wRaw === 'object' ? { alt: Math.floor(wRaw.alt) } : wArr[0]); // 兼容读取：原样反映配置
+      // Gemma 2 稳定化组件：QK-norm（RoPE 前逐头 RMSNorm）与 logit soft-cap。默认全关。
+      this.qkNorm = !!cfg.qkNorm;
+      this.logitCap = cfg.logitCap > 0 ? +cfg.logitCap : 0;
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -755,6 +804,7 @@
         }
         ones(k + 'ln1.g', D); if (!this.useRms) zeros(k + 'ln1.b', D);
         ones(k + 'ln2.g', D); if (!this.useRms) zeros(k + 'ln2.b', D);
+        if (this.qkNorm) { ones(k + 'qg', dh); ones(k + 'kg', dh); } // QK-norm 增益（head_dim 维跨头共享）
       }
       ones('lnf.g', D); if (!this.useRms) zeros('lnf.b', D);
       // 输出头与 tokEmb 权重共享（weight tying，GPT-1/2 标准做法）
@@ -787,6 +837,7 @@
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
       m.window = this.window; m.windows = this.windows.slice();
+      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -842,7 +893,13 @@
           const o = i * qkvDim;
           for (let j = 0; j < qkvDim; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
         }
-        // RoPE：就地旋转 Q/K 段（V 段不旋转）
+        // RoPE：就地旋转 Q/K 段（V 段不旋转）。QK-norm 先于 RoPE（Gemma 2 顺序）
+        let qk = null;
+        if (this.qkNorm) {
+          const qn = qkNormFwd(qkv, T, H, dh, qkvDim, 0, P[k + 'qg'].d);  // Q 段（偏移 0，H 个头）
+          const kn = qkNormFwd(qkv, T, KV, dh, qkvDim, D, P[k + 'kg'].d); // K 段（偏移 D，KV 个头）
+          qk = { qx: qn.xhat, qr: qn.rstd, kx: kn.xhat, kr: kn.rstd };
+        }
         if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim);
         const ctx = new Float64Array(T * D);
         const Ps = [];
@@ -910,15 +967,19 @@
         const xOut = new Float64Array(T * D);
         for (let i = 0; i < T * D; i++) xOut[i] = xMid[i] + ff[i]; // 残差连接
 
-        layers.push({ ln1, A, qkv, Ps, ctx, xMid, ln2, M, pre1, h1, moe });
+        layers.push({ ln1, A, qkv, Ps, ctx, xMid, ln2, M, pre1, h1, moe, qk });
         X = xOut;
       }
 
-      // 4) 最终归一化 + 权重共享输出头
+      // 4) 最终归一化 + 权重共享输出头（+ Gemma 2 logit soft-cap：cap·tanh(x/cap)）
       const lnf = NF(X, P['lnf.g'].d, nb('lnf.b'), T, D);
       const Hf = lnf.Y;
-      const logits = mmAtB(Hf, P.tokEmb, T, D, V);
-      return { logits, cache: { T, dh, H, D, L, layers, lnf, Hf, toks } };
+      let logits = mmAtB(Hf, P.tokEmb, T, D, V);
+      if (this.logitCap > 0) {
+        const cap = this.logitCap;
+        for (let i = 0; i < logits.length; i++) logits[i] = cap * Math.tanh(logits[i] / cap);
+      }
+      return { logits, cache: { T, dh, H, D, L, layers, lnf, Hf, toks, logits } };
     }
 
     /** 反向传播：dlogits(T×V) -> 累加至 this.grads */
@@ -930,6 +991,15 @@
 
       // 权重共享输出头反向：logits = Hf @ Wte^T
       //   dWte = dlogits^T @ Hf ；dHf = dlogits @ Wte
+      // Gemma 2 logit soft-cap 反向：lg = cap·tanh(x/cap) ⇒ dlg/dx = sech²(x/cap) = 1 − (lg/cap)²
+      // （lg 为缓存中的 capped logits，lg/cap 即 tanh(x/cap)，不可再套一层 tanh）
+      if (this.logitCap > 0) {
+        const cap = this.logitCap, lg = cache.logits;
+        for (let i = 0; i < dlogits.length; i++) {
+          const u = lg[i] / cap;
+          dlogits[i] *= 1 - u * u;
+        }
+      }
       addInto(G.tokEmb, matmulTA(dlogits, cache.Hf, T, V, D));
       const dHf = matmul(dlogits, P.tokEmb.d, T, V, D);
       // 最终归一化反向（dY 形状 T×D）
@@ -1020,6 +1090,11 @@
         }
         // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转
         if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1, KV, qkvDim);
+        // QK-norm 反向（前向顺序：norm → RoPE，反向顺序：RoPE⁻¹ → norm⁻¹）
+        if (this.qkNorm) {
+          qkNormBwd(dqkv, c.qk.qx, c.qk.qr, T, H, dh, qkvDim, 0, P[k + 'qg'].d, G[k + 'qg']);
+          qkNormBwd(dqkv, c.qk.kx, c.qk.kr, T, KV, dh, qkvDim, D, P[k + 'kg'].d, G[k + 'kg']);
+        }
         addInto(G[k + 'wqkv'], matmulTA(c.A, dqkv, T, D, qkvDim));
         rowSumInto(G[k + 'bqkv'], dqkv, T, qkvDim);
         const dA = matmulAtB(dqkv, P[k + 'wqkv'].d, T, qkvDim, D);
@@ -1205,6 +1280,11 @@
       const A = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), 1, D).Y;
       const qkv = mm(A, P[k + 'wqkv'], 1, D, qkvDim);
       for (let j = 0; j < qkvDim; j++) qkv[j] += P[k + 'bqkv'].d[j];
+      // QK-norm（RoPE 前，逐头 RMSNorm，与 forward 同序）
+      if (model.qkNorm) {
+        qkNormFwd(qkv, 1, H, dh, qkvDim, 0, P[k + 'qg'].d);
+        qkNormFwd(qkv, 1, KV, dh, qkvDim, D, P[k + 'kg'].d);
+      }
       if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim);
 
       // 3) 写入缓存（K 取 QKV 中段，V 取尾段；GQA 下 K/V 各 kvDim 维）
@@ -1270,10 +1350,15 @@
       X = xOut;
     }
 
-    // 6) 最终归一化 + 权重共享输出头
+    // 6) 最终归一化 + 权重共享输出头（+ logit soft-cap，与 forward 一致）
     const Hf = NF(X, P['lnf.g'].d, nb('lnf.b'), 1, D).Y;
     kv.n = slot + 1;
-    return { logits: mmAtB(Hf, P.tokEmb, 1, D, V0) };
+    let logits = mmAtB(Hf, P.tokEmb, 1, D, V0);
+    if (model.logitCap > 0) {
+      const cap = model.logitCap;
+      for (let j = 0; j < logits.length; j++) logits[j] = cap * Math.tanh(logits[j] / cap);
+    }
+    return { logits };
   }
 
   /** 滑动窗口：丢弃最旧的 1 个 token（copyWithin 原生 memmove，O(B·D) 无重算）。
@@ -1461,8 +1546,8 @@
     mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
     // 滑动窗口注意力（SWA）：LLaMA 配方 + GQA + window=64（Mistral/Gemma 稀疏注意力）。
     swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
-    // Gemma 2/3 风格：LLaMA 配方 + GQA + 局部/全局层交错（偶数层全因果，奇数层滑动窗口 64）。
-    gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 } },
+    // Gemma 2/3 完整配方：LLaMA 基座 + GQA + 局部/全局层交错 + QK-norm + logit soft-cap 30。
+    gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 }, qkNorm: true, logitCap: 30 },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {

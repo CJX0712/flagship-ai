@@ -243,6 +243,36 @@ v9 的 `window` 升级为**逐层**配置，构造时统一归一化为长度 `n
 - **不变量**：混合窗口 `[4,0,8]` 梯度检验 err/tol=5.2e-4；逐层窗口独立生效（`[4,0]`/`[0,4]`/`[4,4]`/`[0,0]` 四配置 logits 两两互异）；数组全 0 ≡ 不传 window（逐位一致）；单层数组 ≡ 标量；KV 缓存逐步一致 maxΔ=0；存档（数组/哨兵均 JSON 可序列化）与 INT8 量化后 `windows` 无损。
 - **验证**：`scripts/probe-gemma.js` —— 12 项全绿。
 
+### 2.16 Gemma 2 稳定化组件：QK-norm + logit soft-cap（v11.0）
+
+Gemma 2 在注意力 logits 与输出 logits 两端各加一道"限幅"，专门治大模型训练中的 logits 爆炸。两者都可关闭（默认关闭 = 逐位零回归）。
+
+- **QK-norm**（`qkNorm: true`）：对每个注意力头的 Q/K 向量做 RMSNorm，**在 RoPE 之前**施加（旋转是正交变换，不改变向量范数，故顺序为 norm→rope）：
+
+  ```
+  ss = Σ_p x[p]² ; rstd = 1/√(ss/dh + eps) ; x̂ = x·rstd ; Y = g ⊙ x̂
+  ```
+
+  增益 `g` 按 head_dim 维定义、跨头共享（`l{l}.qg` / `l{l}.kg`，各 dh 维）。反向按 RMSNorm 通式：
+
+  ```
+  dx = rstd·(g⊙dY) − (x̂·(g⊙dY)/dh)·rstd²·x·rstd   // 详见 rmsnormBwd
+  dg = Σ_{t,heads} x̂⊙dY
+  ```
+
+  **不变量**：归一后每头 RMS ≤ 1，且恒等式 `ss/dh + eps = 1/rstd²` 实测最大相对误差 **6.4e-16**（机器精度）。
+- **logit soft-cap**（`logitCap: N`）：最终 logits 套 `lg = N·tanh(x/N)`，输出**严格有界** `|lg| ≤ N`，softmax 前无爆炸风险（Gemma 2 用 cap=30）。反向链式法则：
+
+  ```
+  dx = dlg ⊙ sech²(x/N) = dlg ⊙ (1 − tanh²(x/N)) = dlg ⊙ (1 − (lg/N)²)
+  ```
+
+  ⚠️ 注意 `(lg/N)` 是**已加帽后的值除以 cap**，不能再套一次 tanh——v11 首版误写成 `tanh(lg/cap)`（二次 tanh），soft-cap 梯度检验 err/tol = 3.69 直接抓出，修正后 6.5e-3。这是"梯度检验是硬金标准"的又一次实证。
+- **生效范围**：`qkNorm` 同时接进 `forward`（T×T）与 `forwardStep`（单 token 缓存路径）；`logitCap` 接进 forward/forwardStep 输出与 `backward` 起点（乘 sech² 后再走输出头反向）。
+- **不变量**：QK-norm 梯度检验 err/tol=1.4e-3（含增益 qg/kg）；soft-cap 梯度检验 6.5e-3；双开关关闭时逐位零回归（且不产生 qg/kg 参数）；无帽模型训练后 max|logit|=6.05，cap=1.5 后压到 1.46（削峰生效）；KV 缓存逐步一致 maxΔ=0；存档 + INT8 往返无损。
+- **`gemma` 预设升级为完整 Gemma 2 配方**：`RMSNorm+SwiGLU+RoPE+GQA(nKvHead:2)+层交错(alt:64)+QK-norm+logitCap:30`。
+- **验证**：`scripts/probe-gemma2.js` —— 10 项全绿。
+
 ---
 
 ## 3. 反向传播（全部手写）
@@ -442,6 +472,8 @@ logits = LN_f(x)·Wteᵀ
 | MoE 稀疏 FFN + top-k 路由 | Mixtral / DeepSeek / Switch Transformer | 每层 N 专家 + 1 路由、top-k 门控、`N·Σ f_e·P_e` 负载均衡辅助损失（冻结 f_e） |
 | 滑动窗口注意力 | Mistral 7B / Gemma | 查询 i 仅 attend `[i-window+1, i]`，窗外掩码 -1e9（softmax 后精确 0）；固定掩码 → 反向经缓存 Ps 自动继承 |
 | 局部/全局层交错 | Gemma 2/3 | `window` 逐层配置（标量/数组/`{alt:N}` 哨兵），偶数层全局 + 奇数层滑动窗口的 1:1 交错；归一化为 `model.windows` |
+| QK-norm | Gemma 2/3、Chameleon、ViT-22B | 每头 Q/K 做 RMSNorm（RoPE 前），增益按 head_dim 跨头共享；稳定注意力 logits 尺度 |
+| logit soft-cap | Gemma 2（cap=30） | `N·tanh(x/N)` 严格有界输出；反向 `dlg ⊙ (1 − (lg/N)²)` |
 | 单文件风格 | picoGPT | 零依赖、可通读、公式即代码 |
 | 验证方法论 | 各 forge 系列硬不变量 | 行和=1、正交/因果掩码、数值梯度检验、过拟合收敛 |
 

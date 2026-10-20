@@ -148,6 +148,18 @@
           <label for="window">窗口大小 N（统一/交错模式生效）</label>
           <input id="window" type="number" min="1" step="1" value="32" placeholder="32">
         </div>
+        <div>
+          <label for="qkNorm">QK-norm（每头 Q/K RMSNorm，RoPE 前）</label>
+          <select id="qkNorm">
+            <option value="" selected>跟随架构预设</option>
+            <option value="on">开启</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+        <div>
+          <label for="logitCap">logit soft-cap N（留空=跟随预设，0=不启用）</label>
+          <input id="logitCap" type="number" min="0" step="1" placeholder="留空=跟随预设">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -166,7 +178,7 @@
             <option value="llama-gqa">LLaMA + GQA（分组查询注意力）</option>
             <option value="mixtral">Mixtral（LLaMA+GQA+MoE 混合专家）</option>
             <option value="swa">SWA（LLaMA+GQA+滑动窗口注意力）</option>
-            <option value="gemma">Gemma（LLaMA+GQA+局部/全局层交错）</option>
+            <option value="gemma">Gemma 2（+层交错+QK-norm+soft-cap 完整配方）</option>
           </select>
         </div>
         <div>

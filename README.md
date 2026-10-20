@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v10.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v11.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
 
 </div>
 
@@ -93,6 +93,16 @@
 | **`gemma` 预设** | Gemma 配方 | `applyPreset(cfg,'gemma')` 一行得到 `RMSNorm+SwiGLU+RoPE+GQA(nKvHead:2)+局部/全局层交错(window:64)` |
 
 > 层交错梯度检验（windows=[4,0,8] 混合）err/tol = **5.2e-4**；逐层窗口独立生效（[4,0]/[0,4]/[4,4]/[0,0] 四配置 logits 两两互异）；数组全 0 ≡ 不传 window（零回归逐位一致）；KV 缓存逐步一致 maxΔ=**0**；存档（数组/哨兵）与 INT8 量化后 windows 无损。详见 `scripts/probe-gemma.js`（12 项全绿）。
+
+### v11.0 新增（Gemma 2 稳定化组件：QK-norm + logit soft-cap）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **QK-norm** | Gemma 2/3 / Chameleon / ViT-22B | `qkNorm:true` 时对每个头的 Q/K 向量做 RMSNorm（RoPE **前**，增益按 head_dim 跨头共享）；稳定注意力 logits 尺度，抑制训练发散。归一后每头 RMS ≤ 1（恒等式 `ss/dh+eps=1/rstd²` 实测误差 6.4e-16） |
+| **logit soft-cap** | Gemma 2（cap=30） | `logitCap:N` 时最终 logits 套 `N·tanh(x/N)`，输出**严格有界** `\|logits\|≤N`；反向乘 `sech²(x/N)=1−(lg/N)²`。无帽模型训练后 max\|logit\|=6.05，cap=1.5 后压到 1.46（削峰生效） |
+| **`gemma` 预设升级** | Gemma 2 完整配方 | `applyPreset(cfg,'gemma')` = `RMSNorm+SwiGLU+RoPE+GQA(nKvHead:2)+层交错(alt:64)+QK-norm+logitCap:30` |
+
+> QK-norm 与 soft-cap 梯度检验（含增益 qg/kg）err/tol 分别 = **1.4e-3** / **6.5e-3**；双开关默认全关 = 逐位零回归（关闭时不产生 qg/kg 参数）。soft-cap 反向曾因误写 `tanh(lg/cap)`（二次 tanh）被梯度检验抓出（err/tol=3.69），修正为 `1−(lg/cap)²` 后闭环。详见 `scripts/probe-gemma2.js`（10 项全绿）。
 
 
 
@@ -211,6 +221,12 @@ const gemma = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: 64, nLayer: 
   window: { alt: 32 } });                                // 也可 applyPreset(cfg,'gemma')
 // 逐层显式写法：window: [0, 32, 0, 32]（长度须 = nLayer）；model.windows 为归一化逐层数组
 
+// ── v11.0：Gemma 2 稳定化组件（QK-norm + logit soft-cap）──
+const gemma2 = new F.GPTModel({ vocabSize: tok.vocabSize, blockSize: 64, nLayer: 4,
+  nHead: 4, nKvHead: 2, dModel: 64, norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope',
+  window: { alt: 32 }, qkNorm: true, logitCap: 30 });    // gemma 预设已含这两项
+// QK-norm：每头 Q/K  RMSNorm（RoPE 前）；logitCap：logits = 30·tanh(x/30)，输出严格有界
+
 // ── v3.0：BPE 分词器（字符级基元，中文语料更省 token）──
 const bpe = new F.BPETokenizer(CORPUS, 320, { byteLevel: false }); // 词表 317 · 往返无损
 console.log('bpe tokens:', bpe.encode('旗舰 AI 锻造世界顶级模型').length);
@@ -244,8 +260,8 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 |---|---|---|
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
-| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） |
-| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64}}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
+| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用） |
+| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64},qkNorm:true,logitCap:30}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
 | `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
@@ -271,6 +287,7 @@ flagship-ai/
 ├── scripts/probe-moe-quant.js # v8 验证：MoE × INT8 组合保真 / 压缩 / 不坍缩
 ├── scripts/probe-swa.js      # v9 验证：SWA 梯度检验 / 窗口局部性 / KV 一致性 / 零回归
 ├── scripts/probe-gemma.js    # v10 验证：层交错梯度检验 / 逐层生效 / alt 展开 / 存档量化往返
+├── scripts/probe-gemma2.js   # v11 验证：QK-norm 恒等式+梯度 / soft-cap 有界+梯度 / 零回归
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导

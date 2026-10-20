@@ -48,6 +48,9 @@ jobs:
       - name: Interleaved sparse attention (Gemma-style) probe
         run: node scripts/probe-gemma.js
 
+      - name: Gemma-2 stabilizers (QK-norm + logit soft-cap) probe
+        run: node scripts/probe-gemma2.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 
