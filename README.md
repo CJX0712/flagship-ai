@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v11.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v12.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -105,6 +105,17 @@
 > QK-norm 与 soft-cap 梯度检验（含增益 qg/kg）err/tol 分别 = **1.4e-3** / **6.5e-3**；双开关默认全关 = 逐位零回归（关闭时不产生 qg/kg 参数）。soft-cap 反向曾因误写 `tanh(lg/cap)`（二次 tanh）被梯度检验抓出（err/tol=3.69），修正为 `1−(lg/cap)²` 后闭环。详见 `scripts/probe-gemma2.js`（10 项全绿）。
 
 
+
+### v12.0 新增（KV Cache INT8 量化缓存，推理期显存压缩）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **KV INT8 量化** | LLM.int8 / 推理优化谱系 | `kvQuant:8` 时 K/V 缓存存 `Int8Array`，per-(token,KV头) 对称 absmax 量化（scale=max\|x\|/127）；写入即量化、无需校准集；误差硬界 `|dequant−x| ≤ absmax/254`（相对 ≤ 1/254 ≈ 0.39%） |
+| **显存压缩** | — | KV 缓存由 Float64(8B) → Int8(1B) + per-(token,head) scale(8B)；典型 L=4/B=64/KV头=2/dh=16 下 Float64 128KB → INT8+scale 24KB（**5.33x**），对解码无损（logits maxΔ<5e-4） |
+| **全组合兼容** | — | 与 INT8 权重量化、SWA、层交错窗口、GQA、MoE、QK-norm、logit soft-cap 任意组合均经探针验证；`kvQuant=0`（默认）逐位等价于旧版 Float64 缓存 |
+| **kvShift 同步** | — | 滑动窗口平移时 scale 与码字同步 `copyWithin`，解量化不错位 |
+
+> KV INT8 与 F32 缓存逐步末位 logits 差异有界（占动态范围 <0.02%）；贪心解码 INT8-KV 与 F32-KV 生成 token 逐字一致；端到端采样无 NaN/Inf、同种子可复现。详见 `scripts/probe-kvquant.js`（11 项全绿）。
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -260,7 +271,7 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 |---|---|---|
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
-| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用） |
+| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用）/ `kvQuant`（KV 缓存 INT8 量化，8=启用；0=关闭，默认） |
 | `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64},qkNorm:true,logitCap:30}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
 | `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
@@ -288,6 +299,7 @@ flagship-ai/
 ├── scripts/probe-swa.js      # v9 验证：SWA 梯度检验 / 窗口局部性 / KV 一致性 / 零回归
 ├── scripts/probe-gemma.js    # v10 验证：层交错梯度检验 / 逐层生效 / alt 展开 / 存档量化往返
 ├── scripts/probe-gemma2.js   # v11 验证：QK-norm 恒等式+梯度 / soft-cap 有界+梯度 / 零回归
+├── scripts/probe-kvquant.js # v12 验证：KV INT8 量化保真 / 误差硬界 / kvShift 同步 / 全组合 / 端到端生成
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导

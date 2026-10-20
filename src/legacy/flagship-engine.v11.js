@@ -709,6 +709,7 @@
      *   稳定化开关（Gemma 2 配方，默认全关 = 逐位兼容旧模型）：
      *   qkNorm:  true 时对每个头的 Q/K 向量做 RMSNorm（RoPE 前，增益 head_dim 维跨头共享）
      *   logitCap: 最终 logits 软帽 logits = cap·tanh(logits/cap)（Gemma 2 用 30；0 = 不启用）
+     *   kvQuant: KV 缓存量化（8 = INT8，per-(token,KV头) 对称 absmax；0 = Float64，默认）
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -763,6 +764,8 @@
       // Gemma 2 稳定化组件：QK-norm（RoPE 前逐头 RMSNorm）与 logit soft-cap。默认全关。
       this.qkNorm = !!cfg.qkNorm;
       this.logitCap = cfg.logitCap > 0 ? +cfg.logitCap : 0;
+      // KV 缓存 INT8 量化：仅影响 forwardStep 增量路径（forward 全序列不走缓存）
+      this.kvQuant = cfg.kvQuant === 8 ? 8 : 0;
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -837,7 +840,7 @@
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
       m.window = this.window; m.windows = this.windows.slice();
-      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap;
+      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -1234,15 +1237,43 @@
    * ======================================================================== */
 
   /** 初始化 KV 缓存：每层 K/V 各预分配 blockSize×D */
+  /**
+   * KV 缓存量化写入：把一行 K/V（kvDim 维）按「每 token × 每 KV 头」粒度做对称 absmax 量化。
+   * 粒度选 per-(token,head) 而非 per-token：RoPE 后同一头内数值量级接近，分头可显著压低动态范围，
+   * 且写入时即可确定 scale（无需校准集、无需回填重标量），天然适配增量追加。
+   * 误差硬界：|dequant(x) − x| ≤ scale/2 = absmax/254（相对误差 ≤ 1/254 ≈ 0.39%）。
+   */
+  function kvWriteRow(buf, sc, row, kvDim, KV, dh, src, srcOff) {
+    const o = row * kvDim;
+    for (let hh = 0; hh < KV; hh++) {
+      let ab = 0;
+      for (let p = 0; p < dh; p++) { const v = Math.abs(src[srcOff + hh * dh + p]); if (v > ab) ab = v; }
+      const s = ab > 0 ? ab / 127 : 1; // 全零行 scale 取 1（解量化仍为 0）
+      sc[row * KV + hh] = s;
+      const b = o + hh * dh;
+      for (let p = 0; p < dh; p++) {
+        let q = Math.round(src[srcOff + hh * dh + p] / s);
+        if (q > 127) q = 127; else if (q < -127) q = -127;
+        buf[b + p] = q;
+      }
+    }
+  }
+
+  /**
+   * 初始化 KV 缓存。kvQuant=8 时 K/V 存 Int8Array（+ per-(token,head) scale），
+   * 每元素 1 字节 + 每头 8 字节 scale；kvQuant=0（默认）为 Float64Array，逐位兼容旧行为。
+   */
   function initKVCache(model) {
     const { nLayer: L, blockSize: B } = model.cfg;
     const kvDim = model.KV * model.dh; // GQA 下 K/V 每位置维度 = KV 头数 · headDim
-    const K = [], V = [];
+    const KV = model.KV, q8 = model.kvQuant === 8;
+    const K = [], V = [], Ks = [], Vs = [];
     for (let l = 0; l < L; l++) {
-      K.push(new Float64Array(B * kvDim));
-      V.push(new Float64Array(B * kvDim));
+      K.push(q8 ? new Int8Array(B * kvDim) : new Float64Array(B * kvDim));
+      V.push(q8 ? new Int8Array(B * kvDim) : new Float64Array(B * kvDim));
+      if (q8) { Ks.push(new Float64Array(B * KV)); Vs.push(new Float64Array(B * KV)); }
     }
-    return { K, V, n: 0 };
+    return { K, V, Ks, Vs, n: 0, q8 };
   }
 
   /**
@@ -1288,25 +1319,37 @@
       if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim);
 
       // 3) 写入缓存（K 取 QKV 中段，V 取尾段；GQA 下 K/V 各 kvDim 维）
+      //    kvQuant=8：写入即量化（Int8 + per-(token,head) scale）；否则原样存 Float64
       const Ko = kv.K[l], Vo = kv.V[l], o = slot * kvDim;
-      for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
+      if (kv.q8) {
+        kvWriteRow(Ko, kv.Ks[l], slot, kvDim, KV, dh, qkv, D);
+        kvWriteRow(Vo, kv.Vs[l], slot, kvDim, KV, dh, qkv, D + KV * dh);
+      } else {
+        for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
+      }
 
       // 4) 因果 + 滑动窗口注意力：仅对窗口内的缓存位置 attend（窗外槽位不影响输出）
       const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
       const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
       const ctx = new Float64Array(D);
+      const kSc = kv.q8 ? kv.Ks[l] : null, vSc = kv.q8 ? kv.Vs[l] : null;
       for (let h = 0; h < H; h++) {
         const kvh = (h / model.g) | 0;
         const S = new Float64Array(win);
         for (let j = jLo; j < nValid; j++) {
+          // kvQuant=8 时缓存里是 int8 码字，读出时乘回该 (token,head) 的 scale 即解量化
+          const ks = kSc ? kSc[j * KV + kvh] : 1;
           let s = 0;
-          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * Ko[j * kvDim + kvh * dh + p];
+          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
           S[j - jLo] = s * scale;
         }
         const Pm = softmaxRows(S, 1, win);
         for (let p = 0; p < dh; p++) {
           let s = 0;
-          for (let j = 0; j < win; j++) s += Pm[j] * Vo[(j + jLo) * kvDim + kvh * dh + p];
+          for (let j = 0; j < win; j++) {
+            const vs = vSc ? vSc[(j + jLo) * KV + kvh] : 1;
+            s += Pm[j] * (Vo[(j + jLo) * kvDim + kvh * dh + p] * vs);
+          }
           ctx[h * dh + p] = s;
         }
       }
@@ -1365,11 +1408,15 @@
    * K/V 向量在写入时已携带当时的绝对位置信息，搬移不改变其数值。 */
   function kvShift(model, kv) {
     const { nLayer: L } = model.cfg;
-    const kvDim = model.KV * model.dh;
+    const kvDim = model.KV * model.dh, KV = model.KV;
     const n = kv.n;
     for (let l = 0; l < L; l++) {
       kv.K[l].copyWithin(0, kvDim, n * kvDim);
       kv.V[l].copyWithin(0, kvDim, n * kvDim);
+      if (kv.q8) { // scale 与码字必须同步平移，否则解量化错位
+        kv.Ks[l].copyWithin(0, KV, n * KV);
+        kv.Vs[l].copyWithin(0, KV, n * KV);
+      }
     }
     kv.n = n - 1;
   }

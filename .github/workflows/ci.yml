@@ -60,6 +60,9 @@ jobs:
       - name: Gemma-2 stabilizers (QK-norm + logit soft-cap) probe
         run: node scripts/probe-gemma2.js
 
+      - name: KV Cache INT8 quantization probe
+        run: node scripts/probe-kvquant.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

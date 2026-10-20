@@ -159,6 +159,12 @@
         <div>
           <label for="logitCap">logit soft-cap N（留空=跟随预设，0=不启用）</label>
           <input id="logitCap" type="number" min="0" step="1" placeholder="留空=跟随预设">
+          <label for="kvQuant">KV 缓存量化 kvQuant（留空=跟随预设 / 0=Float64 / 8=INT8）</label>
+          <select id="kvQuant">
+            <option value="" selected>跟随架构预设（默认 Float64）</option>
+            <option value="0">关闭（Float64，精确）</option>
+            <option value="8">开启（INT8，省显存）</option>
+          </select>
         </div>
       </div>
       <div class="row">

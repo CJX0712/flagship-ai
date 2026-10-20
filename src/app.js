@@ -102,6 +102,13 @@
         if (!(cap >= 0)) { log('logitCap 需 ≥ 0（0=不启用）', 'err'); return false; }
         cfg.logitCap = cap;
       }
+      // KV 缓存 INT8 量化（推理期显存压缩）：8=启用，0=关闭（默认）
+      const kvqRaw = $('kvQuant').value.trim();
+      if (kvqRaw !== '') {
+        const kvq = +kvqRaw;
+        if (!(kvq === 0 || kvq === 8)) { log('kvQuant 仅支持 0（关闭）或 8（INT8）', 'err'); return false; }
+        cfg.kvQuant = kvq;
+      }
       state.arch = arch;
       state.tokMode = tokMode;
       state.model = new F.GPTModel(cfg);
@@ -120,10 +127,11 @@
       : '全因果';
     const stabLabel = (state.model.qkNorm ? 'QK-norm' : '') + (state.model.logitCap > 0 ? `+cap${state.model.logitCap}` : '');
     const stabFull = stabLabel ? ` / ${stabLabel}` : '';
-    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const kvqFull = state.model.kvQuant === 8 ? ' / KV-INT8' : '';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -348,7 +356,7 @@
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式（gemma 预设自带 QK-norm/soft-cap，留空即跟随）

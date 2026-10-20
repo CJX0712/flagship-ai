@@ -156,6 +156,26 @@ allPass = gradCheck(new F.GPTModel(Object.assign({}, gbase, { pos: 'rope' })), s
   rec('量化', '模型整体 in-RAM 压缩', `${(totalF32 / qb).toFixed(2)}x`, '> 4x', totalF32 / qb > 4);
 })();
 
+/* ---------- 5.5 KV Cache INT8 量化（写入即量化，per-(token,KV头) 对称 absmax） ---------- */
+(function () {
+  const V = 65, B = 256, L = 4, H = 4, KVh = 2, dModel = 64;
+  const model = new F.GPTModel({ vocabSize: V, blockSize: B, nLayer: L, nHead: H, nKvHead: KVh, dModel, norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', seed: 3 });
+  const dh = dModel / H, kvDim = KVh * dh;
+  const rng = F.mulberry32(7);
+  const ids = Array.from({ length: B }, () => Math.floor(rng() * V));
+  // Float64 真值缓存
+  model.kvQuant = 0; const kv0 = F.initKVCache(model);
+  let lgF = null; for (let i = 0; i < ids.length; i++) lgF = F.forwardStep(model, ids[i], i, kv0).logits;
+  // INT8 量化缓存
+  model.kvQuant = 8; const kv8 = F.initKVCache(model);
+  let lgQ = null; for (let i = 0; i < ids.length; i++) lgQ = F.forwardStep(model, ids[i], i, kv8).logits;
+  let md = 0; for (let i = 0; i < lgF.length; i++) md = Math.max(md, Math.abs(lgF[i] - lgQ[i]));
+  rec('量化', 'KV INT8 logits 保真', `max|Δ|=${md.toExponential(2)}`, '< 0.1', md < 0.1);
+  const bytesF = L * 2 * B * kvDim * 8;                                  // K、V 各 Float64Array
+  const bytesQ = L * 2 * (B * kvDim * 1 + B * KVh * 8);                   // 码字 1B + per-(token,head) scale 8B
+  rec('量化', 'KV cache 内存压缩', `Float64=${(bytesF / 1024).toFixed(0)}KB → INT8+scale=${(bytesQ / 1024).toFixed(0)}KB (${(bytesF / bytesQ).toFixed(2)}x)`, '> 3x', bytesF / bytesQ > 3);
+})();
+
 /* ---------- 6. KV cache 增量推理加速比 ---------- */
 function kvSpeed(model, N, runs) {
   const V = model.cfg.vocabSize, rng = F.mulberry32(3);

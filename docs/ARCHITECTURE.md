@@ -275,6 +275,26 @@ Gemma 2 在注意力 logits 与输出 logits 两端各加一道"限幅"，专门
 
 ---
 
+### 2.17 KV Cache INT8 量化（v12.0，推理期显存压缩）
+
+KV cache 是长序列推理的显存瓶颈（每层 K/V 各 `blockSize×KV×dh` 个 Float64）。v12 在缓存层引入**写入即量化**的 INT8 方案，与 v5 的权重 INT8 正交、可叠加（双重 PTQ）。
+
+- **存储布局**：`kvQuant=8` 时 `initKVCache` 为每层分配 `Int8Array(B×kvDim)` 存码字 + `Float64Array(B×KV)` 存 per-(token,KV头) scale；`kvQuant=0`（默认）保持原 `Float64Array`，逐位兼容旧行为。
+- **量化公式**（对称 absmax，每 token×每 KV 头独立）：
+
+  ```
+  s = max|x|/127 ; q = round(x/s) clamp[-127,127] ; x̂ = q·s
+  ```
+
+  误差硬界：`|x̂ − x| ≤ s/2 = max|x|/254`（相对误差 ≤ 1/254 ≈ 0.39%）；最大码字恰 ±127 ⇒ 解量化后 per-head absmax 相对误差 ≈ 1e-16（机器精度）。
+- **零校准**：写入缓存的那一刻即可算出该 (token,head) 的 absmax，无需校准集、无需回填重标量，天然适配 `forwardStep` 的增量追加。
+- **kvShift 同步**：滑动窗口平移时 scale 与码字同步 `copyWithin`（原生 memmove），否则解量化错位——这是该方案唯一需要额外 care 的点，已在 `kvShift` 内闭合。
+- **组合兼容**：与 INT8 权重、SWA、层交错窗口、GQA、MoE、QK-norm、logit soft-cap 任意组合均经探针验证；`kvQuant=0` 逐位等价于 Float64 缓存（零回归）。
+- **不变量**：INT8-KV vs F32-KV 逐步末位 logits maxΔ<5e-4（占 logits 动态范围 <0.02%）；贪心解码两模式生成 token 逐字一致；kvShift 后误差仍有界；端到端采样无 NaN/Inf、同种子可复现；典型 L=4/B=64/KV头=2/dh=16 下显存 **5.33x** 压缩。
+- **验证**：`scripts/probe-kvquant.js` —— 11 项全绿。
+
+---
+
 ## 3. 反向传播（全部手写）
 
 ### 3.1 损失与起点
