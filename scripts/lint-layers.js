@@ -28,10 +28,12 @@ function walk(dir) {
   return out;
 }
 
-const layerDirs = fs.readdirSync(ROOT).filter((d) =>
-  /^L\d/.test(d) && fs.statSync(path.join(ROOT, d)).isDirectory()
-);
-const files = layerDirs.flatMap((d) => walk(path.join(ROOT, d)));
+// Phase 1 起：层目录位于 src/ 下（src/L10-microisa、src/L9-numbase、src/L8-kernel …）。
+const SRC = path.join(ROOT, 'src');
+const layerDirs = fs.existsSync(SRC)
+  ? fs.readdirSync(SRC).filter((d) => /^L\d/.test(d) && fs.statSync(path.join(SRC, d)).isDirectory())
+  : [];
+const files = layerDirs.flatMap((d) => walk(path.join(SRC, d)));
 
 let errors = 0;
 for (const f of files) {

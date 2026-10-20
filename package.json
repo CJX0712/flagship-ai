@@ -8,6 +8,8 @@
     "test:all": "node src/verify.js && node scripts/probe-v3.js && node scripts/probe-v4-gqa.js && node scripts/probe-v5-quant.js && node scripts/probe-moe.js && node scripts/probe-moe-quant.js && node scripts/probe-swa.js && node scripts/probe-gemma.js && node scripts/probe-gemma2.js && node scripts/probe-kvquant.js && node scripts/probe-streaming.js && node scripts/probe-yarn.js",
     "regression": "node scripts/regression-v11.js",
     "lint": "node scripts/lint-layers.js",
+    "isa": "node scripts/isa.js",
+    "test:layers": "node --test tests/",
     "verify:ci": "npm test && npm run lint && npm run regression && npm run test:all",
     "bench": "node scripts/bench.js",
     "bench:full": "node scripts/bench.js --full",
@@ -15,9 +17,18 @@
     "demo": "node scripts/build-demo.js && echo '打开 demo.html 即可（file:// 协议直接运行）'"
   },
   "keywords": [
-    "gpt", "transformer", "llm", "deep-learning", "backpropagation",
-    "attention", "zero-dependency", "javascript", "from-scratch", "educational",
-    "microisa", "ten-layer"
+    "gpt",
+    "transformer",
+    "llm",
+    "deep-learning",
+    "backpropagation",
+    "attention",
+    "zero-dependency",
+    "javascript",
+    "from-scratch",
+    "educational",
+    "microisa",
+    "ten-layer"
   ],
   "author": "晨星 (Chenxing)",
   "license": "MIT",
@@ -33,6 +44,6 @@
   },
   "homepage": "https://github.com/CJX0712/flagship-ai#readme",
   "devDependencies": {
-    "fast-check": "^3.22.0"
+    "fast-check": "^3.23.2"
   }
 }
