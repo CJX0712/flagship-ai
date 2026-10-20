@@ -9,7 +9,7 @@
     "regression": "node scripts/regression-v11.js",
     "lint": "node scripts/lint-layers.js",
     "isa": "node scripts/isa.js",
-    "test:layers": "node --test tests/",
+    "test:layers": "node --test",
     "verify:ci": "npm test && npm run lint && npm run regression && npm run test:all",
     "bench": "node scripts/bench.js",
     "bench:full": "node scripts/bench.js --full",
