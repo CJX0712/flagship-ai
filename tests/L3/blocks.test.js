@@ -1,7 +1,7 @@
 'use strict';
 /* L3 架构组装 · 模型级 Δ=0 比对（T03 验收 ②/③）
- * 把 legacy GPTModel 的 forward/backward 用 L4 重组装（= V12.GPTModel 子类）后，
- * 与 legacy 单体（= V11.GPTModel）在 5 预设 × 2 seed 下逐位全等。
+ * 十层实现接管后（V12.GPTModel = NS.L3.gpt_model.GPTModel），与 legacy 单体
+ * （= V11.GPTModel）在 5 预设 × 2 seed 下逐位全等。
  *   - gemma 预设走 QK-norm + logit soft-cap；mixtral 走 MoE + top-k；swa 走滑动窗口；
  *   - 构造器/RNG 顺序一致 → 参数逐位相同 → 差异只可能来自 forward/backward 重组装。
  */
@@ -46,10 +46,13 @@ test('L3 backward grads 与 legacy Δ=0（5 预设 × 2 seed）', () => {
   }
 });
 
-test('V12.GPTModel 是 legacy.GPTModel 子类且构造不改变参数布局', () => {
+test('V12.GPTModel 为独立 L3 类（T04 切换）且构造不改变参数布局', () => {
+  // T04 起 V12.GPTModel = NS.L3.gpt_model.GPTModel（verbatim lift 的独立类），
+  // 不再继承 legacy.GPTModel —— 「继承 legacy」是 Phase 2 子类覆写策略的遗产，已废弃。
+  // 仍需守护的硬契约：构造器 RNG 消费顺序与 legacy 冻结一致 → 参数逐位相同。
   const c = V11.applyPreset(Object.assign({}, CFG, { seed: 5 }), 'llama');
   const m = new V12.GPTModel(c);
-  assert.ok(m instanceof V11.GPTModel, 'V12.GPTModel 应继承 legacy.GPTModel');
+  assert.notStrictEqual(V12.GPTModel, V11.GPTModel, 'V12.GPTModel 不应再是 legacy 类');
   const ref = new V11.GPTModel(V11.applyPreset(Object.assign({}, CFG, { seed: 5 }), 'llama'));
   for (const k in ref.params) assert.ok(bitExact(ref.params[k].d, m.params[k].d), `param ${k} 布局改变`);
 });

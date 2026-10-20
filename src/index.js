@@ -1,25 +1,26 @@
 /* 旗舰 AI v12 · 公共 API 入口
  * 加载顺序（自底向上）：L10 → L9 → … → L1（见 src/namespace.js __loadOrder）。
  *
- * Phase 1（T02）策略（安全网式拆层）：
- *   1) 自底向上加载十层，把 L8/L9 数值内核与 L10 微指令登记中心挂到
- *      globalThis.FlagshipAI 命名空间（K3/K4）。
- *   2) 整体复制 v11 legacy 的 34 个导出键 —— 模型壳（GPTModel / train /
- *      generate / persistence）仍走 legacy 实现，构造器 RNG 消费顺序冻结（R1 安全）。
- *   3) 仅用「与 v11 逐字一致」的 L8/L9 内核覆盖 6 个逐算子导出键
- *      （matmul / matmulAtB / matmulTA / softmaxRows / mulberry32 / randn），
- *      使 R9 真正逐位验证新内核代码（Δ=0 契约）。
- *
- * Phase 2（T03）策略（拆 forward+backward 单体 → L4 算子 + L3 组装）：
- *   4) 导出 GPTModel 换为一个【子类】：构造器/zeroGrads/paramCount/quantize 全部继承
- *      legacy（RNG 顺序不变，R1 安全），仅 forward/backward 覆写为 L3 blocks 重组装
- *      （调用顺序与 legacy 逐行一致 → R2 logits / R3 grads / R4 train / R5 generate 全 Δ=0）。
- *      注意：必须用子类而非改 legacy.GPTModel.prototype —— 否则 regression 的 V11 与 V12
- *      会共享同一被改原型，R2/R3 退化成自比自（琐碎绿），失去零回归意义。
+ * Phase 1（T02）：L10/L9/L8 抽离 + 192 项微指令逐位验证；模型壳整体复制 legacy 导出。
+ * Phase 2（T03）：forward+backward 单体拆为 L4 算子 + L3 组装（GPTModel 子类覆写）。
+ * Phase 3（T04）：十层实现正式接管本入口 —— 不再转发 legacy：
+ *   - GPTModel                 = NS.L3.gpt_model.GPTModel
+ *     （构造器/zeroGrads/paramCount/quantize 为 verbatim lift，RNG 消费顺序与 legacy
+ *      冻结一致 → R1 安全；forward/backward 委托 L3 blocks 重组装）
+ *   - train / generate         = NS.L2.{train,generate}
+ *     （verbatim lift，内部依赖改引 L4.loss / L7.kv_cache / L9.rng；采样逻辑逐字保留，
+ *      不提取公共函数 —— 保 RNG 消费顺序 → R4/R5 安全）
+ *   - saveModel/loadModel/loadTokenizer = NS.L2.persistence
+ *     （loadModel 造 L3 模型 → R7 存档闭环由十层真正接管）
+ *   - Tokenizer/BPETokenizer/textToByteChars/byteCharsToText = NS.L2.tokenizer
+ *   - ARCH_PRESETS/applyPreset = NS.L3.presets
+ *   - 逐算子导出               = L8/L9/L4 verbatim lift（R9 逐位验证）
+ *   - KV 四件套                = NS.L7.kv_cache
+ *   legacy 自此仅作为 scripts/regression-v11.js 的 V11 基准被加载，不在本文件出现。
  *
  * 关键不变量（K15）：导出键集合与 v11 的 return 完全一致（34 个键，不多不少）。
- * 因此本文件【不】向 api 追加任何额外键；命名空间经 globalThis.FlagshipAI 暴露，
- * 供 scripts/isa.js 与 tests/ 读取，不影响导出契约。
+ *   加载期有计数硬门禁（下方）；键集逐名一致性由 tests/api-contract.test.js
+ *   对 legacy 逐键断言（测试文件允许 require legacy，层文件不允许）。
  */
 'use strict';
 const NS = require('./namespace.js');
@@ -30,34 +31,66 @@ for (const rel of NS.__loadOrder) {
   require(path.join(__dirname, rel));
 }
 
-// 2) v11 legacy 引擎：提供 34 个导出键，满足 K15 完全一致。
-const legacy = require('./legacy/flagship-engine.v11.js');
+// 2) 构建公共 API：34 个键全部由十层实现提供（K15：与 v11 return 完全一致）。
+const api = {
+  // L9 · 数值基础（RNG）
+  mulberry32: NS.L9.rng.mulberry32,
+  randn: NS.L9.rng.randn,
+  // L8 · 数值内核（矩阵乘）
+  matmul: NS.L8.matmul.matmul,
+  matmulAtB: NS.L8.matmul.matmulAtB,
+  matmulTA: NS.L8.matmul.matmulTA,
+  // L4 · 神经算子（归一化）
+  layernormFwd: NS.L4.norm.layernormFwd,
+  layernormBwd: NS.L4.norm.layernormBwd,
+  rmsnormFwd: NS.L4.norm.rmsnormFwd,
+  rmsnormBwd: NS.L4.norm.rmsnormBwd,
+  // L4 · 神经算子（激活 / 门控）
+  geluFwd: NS.L4.activation.geluFwd,
+  geluBwd: NS.L4.activation.geluBwd,
+  siluF: NS.L4.activation.siluF,
+  swigluFwd: NS.L4.activation.swigluFwd,
+  swigluBwd: NS.L4.activation.swigluBwd,
+  // L4 · 神经算子（位置编码）
+  ropeApply: NS.L4.positional.ropeApply,
+  // L8 · 数值内核（softmax：模型热路径走 L8 内核，L4.softmax 为其语义门面）
+  softmaxRows: NS.L8.reduce.softmaxRows,
+  softmaxBwd: NS.L8.reduce.softmaxBwd,
+  // L4 · 神经算子（损失）
+  crossEntropy: NS.L4.loss.crossEntropy,
+  // L2 · 编排管线（分词器）
+  Tokenizer: NS.L2.tokenizer.Tokenizer,
+  BPETokenizer: NS.L2.tokenizer.BPETokenizer,
+  textToByteChars: NS.L2.tokenizer.textToByteChars,
+  byteCharsToText: NS.L2.tokenizer.byteCharsToText,
+  // L3 · 架构组装（模型壳 + 架构预设）
+  GPTModel: NS.L3.gpt_model.GPTModel,
+  ARCH_PRESETS: NS.L3.presets.ARCH_PRESETS,
+  applyPreset: NS.L3.presets.applyPreset,
+  // L2 · 编排管线（训练 / 生成）
+  train: NS.L2.train.train,
+  generate: NS.L2.generate.generate,
+  // L7 · 张量与内存（KV Cache）
+  initKVCache: NS.L7.kv_cache.initKVCache,
+  forwardStep: NS.L7.kv_cache.forwardStep,
+  warmupKV: NS.L7.kv_cache.warmupKV,
+  kvShift: NS.L7.kv_cache.kvShift,
+  // L2 · 编排管线（持久化）
+  saveModel: NS.L2.persistence.saveModel,
+  loadModel: NS.L2.persistence.loadModel,
+  loadTokenizer: NS.L2.persistence.loadTokenizer,
+};
 
-// 3) 构建公共 API：先整体复制 legacy 导出（模型壳仍走 legacy 实现）。
-const api = Object.assign({}, legacy);
-
-// 3b) 覆盖逐位等价的 L8/L9 算子（R9 Δ=0 契约）：这些导出键被覆盖供 R9 逐算子比对；
-//     legacy GPTModel 内部调用的是闭包内的同名函数，不受此覆盖影响。
-api.matmul      = NS.L8.matmul.matmul;       // 含 if(a===0) continue，逐字 v11
-api.matmulAtB   = NS.L8.matmul.matmulAtB;
-api.matmulTA    = NS.L8.matmul.matmulTA;
-api.softmaxRows = NS.L8.reduce.softmaxRows;  // 数值稳定 softmax，逐字 v11
-api.mulberry32  = NS.L9.rng.mulberry32;      // 确定性 PRNG，逐字 v11
-api.randn       = NS.L9.rng.randn;           // Box–Muller，逐字 v11
-
-// 4) T03：导出 GPTModel 换成子类，forward/backward 覆写为 L3 blocks 重组装。
-//    构造器与全部非前向/反向方法继承 legacy（RNG 顺序冻结，R1 安全）；
-//    legacy.GPTModel.prototype 保持不动，V11 仍走 legacy 单体 → R2/R3 是真·零回归比对。
-class GPTModelL3 extends legacy.GPTModel {
-  forward(tokens) { return NS.L3.blocks.forward(this, tokens); }
-  backward(cache, dlogits) { return NS.L3.blocks.backward(this, cache, dlogits); }
+// 3) K15 加载期硬门禁：键数必须为 34（键集逐名一致性见 tests/api-contract.test.js）。
+if (Object.keys(api).length !== 34) {
+  throw new Error('K15 违例：公共 API 导出键数量 ' + Object.keys(api).length + ' ≠ 34');
 }
-api.GPTModel = GPTModelL3;
 
-// 5) L4 算子目录自举（仅登记元数据供自检/文档，不改数值路径，Δ=0 无影响）。
+// 4) 各层注册中心自举（仅登记元数据供自检/文档，不改数值路径，Δ=0 无影响）。
+//    L4 算子目录：把 L4 算子登记为可检索元数据。
 if (NS.L4 && NS.L4.registry && NS.L4.registry.bootstrap) NS.L4.registry.bootstrap();
-// 5b) L5 VJP 注册中心 + L6 kernel 注册中心自举：把 L4 backward / L4+L8 内核登记为
-//     VJP 与 kernel（L5/L6 先于 L4 加载，故在全部层加载完后补登；幂等、惰性守卫）。
+//    L5 VJP 注册中心 + L6 kernel 注册中心：把 L4 backward / L4+L8 内核登记为
+//    VJP 与 kernel（L5/L6 先于 L4 加载，故在全部层加载完后补登；幂等、惰性守卫）。
 if (NS.L5 && NS.L5.registry && NS.L5.registry.bootstrap) NS.L5.registry.bootstrap();
 if (NS.L6 && NS.L6.kernel && NS.L6.kernel.bootstrap) NS.L6.kernel.bootstrap();
 if (NS.L6 && NS.L6.backend && NS.L6.backend.refreshBackends) NS.L6.backend.refreshBackends();

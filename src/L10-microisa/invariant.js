@@ -42,6 +42,21 @@
     matInt:      { kind: 'matrix', integer: true, min: -1000, max: 1000, defDims: [4, 4] },
     matFinite:   { kind: 'matrix', min: -1e4, max: 1e4, defDims: [4, 4] },
     matSmall:    { kind: 'matrix', min: -10, max: 10, defDims: [4, 4] },
+    // 向量（B 域）：kind 'vector'，defLen 为默认长度；per-input 长度可由 op.vecDims 覆盖
+    vecInt:      { kind: 'vector', integer: true, min: -1000, max: 1000, defLen: 8 },
+    vecFinite:   { kind: 'vector', min: -1e4, max: 1e4, defLen: 8 },
+    vecSmall:    { kind: 'vector', min: -10, max: 10, defLen: 8 },
+    vecNonNeg:   { kind: 'vector', min: 0, max: 10, defLen: 8 },
+    vecPos:      { kind: 'vector', min: 1e-3, max: 10, defLen: 8, nonZero: true },
+    vecUnit:     { kind: 'vector', min: 0, max: 1, defLen: 8 },
+    // 形状（E 域）：kind 'shape'，defLen = 维度个数，每个维度 ∈ [min,max] 的正整数
+    shape2:      { kind: 'shape', defLen: 2, min: 1, max: 8 },
+    shape3:      { kind: 'shape', defLen: 3, min: 1, max: 8 },
+    shape4:      { kind: 'shape', defLen: 4, min: 1, max: 8 },
+    // 首维 ≥2 的二阶形状：供「取首维下标 1」类微指令用（E023）。
+    // 原因：首维为 1 时下标 1 越界，linearize 会抛 —— 该类微指令的数学本就需要首维 ≥2，
+    // 属域声明缺失而非谓词缺陷，故在此显式声明该域，而非在谓词里退化放行。
+    shape2f2:    { kind: 'shape', defLen: 2, min: 1, max: 8, firstMin: 2 },
   };
 
   // 确定性标量采样（基于注入的 NS.L9.rng）。
@@ -67,6 +82,26 @@
   function genMatrix(rng, r, c, tag) {
     const out = new Float64Array(r * c);
     for (let i = 0; i < r * c; i++) out[i] = genScalar(rng, tag);
+    return out;
+  }
+
+  // 确定性向量采样（B 域）：长度 n 的行优先 Float64Array。
+  function genVector(rng, n, tag) {
+    const out = new Float64Array(n);
+    for (let i = 0; i < n; i++) out[i] = genScalar(rng, tag);
+    return out;
+  }
+
+  // 确定性形状采样（E 域）：长度 defLen 的正整数维度元组（普通 Array）。
+  // firstMin：可选的首维下界（其余维仍用 min）—— 供需要「首维下标 1」合法性的域使用。
+  function genShape(rng, tag) {
+    const t = TAGS[tag] || TAGS.shape3;
+    const len = t.defLen || 3;
+    const out = [];
+    for (let i = 0; i < len; i++) {
+      const lo = (i === 0 && t.firstMin != null) ? t.firstMin : t.min;
+      out.push(Math.floor(rng() * (t.max - lo + 1)) + lo);
+    }
     return out;
   }
 
@@ -116,6 +151,8 @@
   L10.TAGS = TAGS;
   L10.genScalar = genScalar;
   L10.genMatrix = genMatrix;
+  L10.genVector = genVector;
+  L10.genShape = genShape;
   L10.relClose = relClose;
   L10.check = check;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

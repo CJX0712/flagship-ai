@@ -37,6 +37,12 @@ NS.__loadOrder = [
   './L10-microisa/C-matrix-000.js',
   './L10-microisa/C-matrix-001.js',
   './L10-microisa/C-matrix-002.js',
+  './L10-microisa/B-vector-000.js',
+  './L10-microisa/B-vector-001.js',
+  './L10-microisa/B-vector-002.js',
+  './L10-microisa/E-shape-000.js',
+  './L10-microisa/E-shape-001.js',
+  './L10-microisa/E-shape-002.js',
   // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
   './L7-tensor/tensor.js',
   './L7-tensor/shape.js',
@@ -60,8 +66,18 @@ NS.__loadOrder = [
   './L4-ops/moe.js',
   './L4-ops/loss.js',
   './L4-ops/registry.js',
-  // L3 · 架构组装（forward/backward 重组装，替代 legacy 单体）
+  // L3 · 架构组装（forward/backward 重组装 + GPTModel + presets）
   './L3-arch/blocks.js',
+  './L3-arch/gpt-model.js',
+  './L3-arch/presets.js',
+  // L2 · 编排管线（T04 接管：tokenizer/train/generate/sampler/evaluate/persistence/config）
+  './L2-pipeline/tokenizer.js',
+  './L2-pipeline/train.js',
+  './L2-pipeline/generate.js',
+  './L2-pipeline/sampler.js',
+  './L2-pipeline/evaluate.js',
+  './L2-pipeline/persistence.js',
+  './L2-pipeline/config.js',
 ];
 
 // 公共 API 构建（Phase 0 暂未启用；后续接管后由 src/index.js 调用）。

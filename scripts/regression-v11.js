@@ -164,11 +164,22 @@ check('R7 存档往返 Δ=0', () => {
   for (const p of PRESETS) {
     const m11 = buildModel(V11, p, CFG, 11);
     const tok = new V11.Tokenizer('abcdefghijklmnopqrstuvwxyz');
-    const json = V11.saveModel(m11, tok);
-    const m12 = V11.loadModel(json);
     const seq = mkTokens(V11, 500, CFG.blockSize).slice(0, CFG.blockSize - 1);
-    const f1 = m11.forward(seq), f2 = m12.forward(seq);
-    md = Math.max(md, assertBitExact(f1.logits, f2.logits));
+    const f1 = m11.forward(seq);
+    // 路径 1：v11 存档 → v12 恢复（跨实现互认；T04 切换后 v12.loadModel 恢复出的
+    //   必须是十层 L3 模型而非 legacy 模型，故本路径是 L3 接管存档闭环的真门禁）
+    const j1 = V11.saveModel(m11, tok);
+    const m12a = V12.loadModel(j1);
+    md = Math.max(md, assertBitExact(f1.logits, m12a.forward(seq).logits));
+    // 路径 2：v12 存档 → v12 恢复（纯 v12 闭环）
+    const j2 = V12.saveModel(m11, tok);
+    const m12b = V12.loadModel(j2);
+    md = Math.max(md, assertBitExact(f1.logits, m12b.forward(seq).logits));
+    // 词表恢复：chars 逐位一致（saveModel 一并存词表的既定契约）
+    const t2 = V12.loadTokenizer(j2);
+    if (!t2 || t2.vocabSize !== tok.vocabSize || JSON.stringify(t2.chars) !== JSON.stringify(tok.chars)) {
+      return { pass: false, detail: 'loadTokenizer 词表恢复不一致' };
+    }
   }
   return { pass: md === 0, detail: 'logits maxΔ=' + md };
 });

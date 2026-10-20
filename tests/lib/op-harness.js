@@ -23,23 +23,34 @@ function genArgs(rng, op) {
       if (!dims) throw new Error(`op ${op.key} 矩阵参数 ${name} 缺 matrixDims`);
       return NS.L10.genMatrix(rng, dims[0], dims[1], tag);
     }
+    if (t.kind === 'vector') {
+      const n = (op.vecDims && op.vecDims[name]) || t.defLen || 8;
+      return NS.L10.genVector(rng, n, tag);
+    }
+    if (t.kind === 'shape') {
+      return NS.L10.genShape(rng, tag);
+    }
     return NS.L10.genScalar(rng, tag);
   });
 }
 
-function checkOp(op, n) {
+function checkOp(op, n, seed) {
   try {
     fc.assert(
-      fc.property(fc.integer(0, (1 << 30) - 1), (seed) => {
-        const rng = NS.L9.rng.mulberry32(seed >>> 0);
+      fc.property(fc.integer(0, (1 << 30) - 1), (s) => {
+        const rng = NS.L9.rng.mulberry32(s >>> 0);
         const args = genArgs(rng, op);
         return op.predicate.apply(null, args) === true;
       }),
-      { numRuns: n }
+      { numRuns: n, ...(seed !== undefined ? { seed } : {}) }
     );
     return { pass: true };
   } catch (e) {
-    const reason = (e && e.message ? e.message : String(e)).split('\n')[0].slice(0, 160);
+    // 保留 fast-check 完整诊断（seed / counterexample / shrunk / 失败详情）再截断：
+    // fast-check 未传 seed 时每次运行随机抽种子（持续模糊测试，有利于暴露不变量漏洞），
+    // 但失败必须可复现 —— 用报错中的 seed 调 checkOp(op, n, seed) 即可重放。
+    const msg = (e && e.message ? e.message : String(e));
+    const reason = msg.split('\n').slice(0, 8).join(' | ').slice(0, 500);
     return { pass: false, reason };
   }
 }
