@@ -316,6 +316,23 @@ KV cache 是长序列推理的显存瓶颈（每层 K/V 各 `blockSize×KV×dh` 
 - **不变量**：远超容量后 `slot[0..K)` 的 K/V 与初次写入**逐位一致**（锚点永不被淘汰，Δ=0）；末窗口槽位 == 最近一次写入 token（Δ=0）；StreamingLLM 末位 logits 与纯滑动窗口**明显不同**（maxΔ=2.5e-2，证明锚点确实被 attend）；greedy 300 token 同种子可复现、无 NaN/Inf；× KV INT8 末位 maxΔ<2e-4；kvShift 多次淘汰后 scale 全有限。
 - **验证**：`scripts/probe-streaming.js` —— 10 项全绿（零回归 / 短序列一致性 / 锚点不淘汰 / 滚动窗口 / 有效性 / 确定性 / 无限上下文 / ×KV-INT8 / ×SWA / scale 同步）。
 
+### 2.19 YaRN 长度外推（v14.0，RoPE 频率插值 + 注意力温度）
+
+RoPE 的旋转频率 `θ_i = base^(-2i/d)` 对位置敏感：短训练长度下拟合良好的模型，在远超训练长度的绝对位置上会因高频维相位回绕而失效。v14 引入 YaRN（Peng et al., 2023）的两件套，使模型可在**比训练更长**的序列上推理，且与 v9/v12/v13 的长上下文机制正交、可叠加。
+
+1. **NTK-by-parts RoPE 频率插值**：按修正区间（correction range）对每维频率做平滑插值——高频维（小 `i`，波长最短、对位置最敏感）基本保留，低频维（大 `i`）插值压缩。等效于逐维缩放 `inv_freq_i /= factor^mask_i`，`mask_i∈[0,1]` 由 `low/high` 修正区间与 smoothstep 决定（`type:'ntk'` 为全局基频缩放 `factor^(d/(d-2))` 的特例）。
+2. **注意力温度（mscale）**：softmax 前 logits 乘 `mscale = 0.1·ln(factor)/ln(2)`，补偿频率插值带来的幅度变化（`factor≤1` 时取 1，恒等）。
+
+- **配置**：`cfg.ropeScale = { type:'yarn'|'ntk', factor(>1), originalMaxLength(默认 blockSize), betaFast(默认32), betaSlow(默认1) }`；缺省或 `factor≤1` ⇒ `ropeFreqScale=null`、`attentionScaling=1`，RoPE 与旧版**逐位一致**（零回归）。
+- **实现契合点**：
+  - `ropeApply` 新增 `freqScale` 参数（位置无关），前后向共用同一 `model.ropeFreqScale`，保证旋转雅可比一致；
+  - 注意力 logits 缩放因子 `attentionScaling` 前后向共用（线性推送，softmax 前乘、softmaxBwd 后乘），链式一致；
+  - 增量路径 `forwardStep` 同步使用 `model.ropeFreqScale` / `model.attentionScaling`，故 `forward` 与 `forwardStep` 在 YaRN 下**逐位一致**。
+- **零干预训练**：仅改变 RoPE 旋转频率与注意力 logits 幅度（均为确定性、位置无关/线性因子），`forward` 全序列训练 + 反向传播 + 中心差分梯度检验**零改动**（`factor>1` 下 maxErr/Tol≈2e-3）。
+- **组合兼容**：与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、logit soft-cap 任意组合均经探针验证。
+- **不变量**：`factor=1` 与缺省逐位等价（Δ=0）；`forward`≡`forwardStep`（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
+- **验证**：`scripts/probe-yarn.js` —— 5 项全绿（零回归 / 梯度检验 yarn+ntk / mscale+freqScale / 长上下文外推 / 确定性+特征生效）。
+
 ---
 
 ## 3. 反向传播（全部手写）

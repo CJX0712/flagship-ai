@@ -172,6 +172,15 @@
           <label for="rollingWindow">滚动窗口滚动大小 rollingWindow（sink&gt;0 时必填方向，留空默认 256；与 SWA window 二选一）</label>
           <input id="rollingWindow" type="number" min="1" step="1" placeholder="留空=256">
         </div>
+        <div>
+          <label for="yarnFactor">YaRN 长度外推系数 factor（留空=关闭；&gt;1=NTK-by-parts RoPE 频率插值 + 注意力温度，长上下文外推）</label>
+          <input id="yarnFactor" type="number" min="1" step="0.5" placeholder="留空=关闭">
+          <label for="yarnType">YaRN 类型（factor&gt;1 时）</label>
+          <select id="yarnType">
+            <option value="yarn" selected>YaRN（NTK-by-parts，推荐）</option>
+            <option value="ntk">NTK-aware（全局基频缩放）</option>
+          </select>
+        </div>
       </div>
       <div class="row">
         <div>

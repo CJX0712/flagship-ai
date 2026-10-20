@@ -327,16 +327,24 @@
    * 且使滑动窗口 KV cache 在任意绝对位置下都与全序列重算逐位一致。
    * sign=+1 前向（逆时针）；sign=-1 反向（正交矩阵的逆 = 其转置）。 */
   const ROPE_BASE = 10000;
-  function ropeApply(X, T, D, H, dh, posOff, sign, Hk, stride) {
+  function ropeApply(X, T, D, H, dh, posOff, sign, Hk, stride, freqScale) {
     Hk = Hk || H;                 // K 段头数（GQA 下 < H）；默认 = H（MHA）
     stride = stride || 3 * D;     // qkv 行宽（GQA 下 = D + 2·KV·dh）
     const half = dh >> 1;
     if (half <= 0) return;
+    // YaRN/NTK：per-(dim-pair) 频率缩放（freqScale[p] = 1/scale_i，恒等时缺省）。
+    // 位置无关，故缓存的已旋转 K 与任意 Q 的相对角度一致。
+    const inv = new Float64Array(half);
+    for (let p = 0; p < half; p++) {
+      let f = Math.pow(ROPE_BASE, -2 * p / dh);
+      if (freqScale) f *= freqScale[p];
+      inv[p] = f;
+    }
     for (let i = 0; i < T; i++) {
       const pos = i + posOff;
       const row = i * stride;
       for (let p = 0; p < half; p++) {
-        const th = pos * Math.pow(ROPE_BASE, -2 * p / dh);
+        const th = pos * inv[p];
         const cs = Math.cos(th), sn = Math.sin(th) * sign;
         // Q 段：base 0，H 个头
         for (let h = 0; h < H; h++) {
@@ -768,6 +776,41 @@
       this.kvQuant = cfg.kvQuant === 8 ? 8 : 0;
       // Attention Sink（StreamingLLM）：恒驻缓存首 K 个锚点 token，支持无限上下文流式推理；0 = 关闭（逐位兼容）
       this.attentionSink = cfg.attentionSink > 0 ? Math.floor(cfg.attentionSink) : 0;
+      // YaRN 长度外推（RoPE 频率插值 + 注意力温度缩放）：
+      //   cfg.ropeScale = { type:'yarn'|'ntk', factor, originalMaxLength, betaFast, betaSlow }
+      //   factor<=1 或未配置 -> 恒等变换（freqScale=null、attnScale=1，逐位兼容）。
+      let ropeFreqScale = null, attentionScaling = 1;
+      const rs = cfg.ropeScale;
+      if (rs && (rs.factor || 0) > 1) {
+        const factor = +rs.factor;
+        const dim = dh;                       // 旋转维 = 头维度 dh（YaRN 公式的 rotary dim）
+        const base = ROPE_BASE;
+        const orig = rs.originalMaxLength || T || 2048;
+        const half = dh >> 1;
+        ropeFreqScale = new Float64Array(half);
+        if (rs.type === 'ntk') {
+          // 简单 NTK-aware：全局基频缩放 ntk = factor^(dim/(dim-2))
+          const ntk = Math.pow(factor, dim / (dim - 2));
+          for (let p = 0; p < half; p++) ropeFreqScale[p] = 1 / ntk;
+        } else {
+          // YaRN NTK-by-parts：高频维（小 p）保留、低频维（大 p）插值，平滑过渡（HF 同式）
+          const betaFast = rs.betaFast || 32, betaSlow = rs.betaSlow || 1;
+          const low = Math.max(0, Math.floor(dim * Math.log(orig / (2 * Math.PI * betaFast)) / (2 * Math.log(base))));
+          const high = Math.min(half - 1, Math.ceil(dim * Math.log(orig / (2 * Math.PI * betaSlow)) / (2 * Math.log(base))));
+          for (let p = 0; p < half; p++) {
+            let ramp;
+            if (p <= low) ramp = 0;
+            else if (p >= high) ramp = 1;
+            else { const r = (p - low) / Math.max(1, high - low); ramp = r * r * (3 - 2 * r); } // smoothstep
+            const mask = 1 - ramp;                 // HF: inv_freq_mask = 1 - ramp
+            ropeFreqScale[p] = Math.pow(factor, -mask); // inv_freq /= factor^mask（∈ [1/factor, 1]）
+          }
+        }
+        // 注意力温度（YaRN mscale）：缩放 softmax 前 logits，补偿频率插值带来的幅度变化
+        attentionScaling = factor > 1 ? 0.1 * Math.log(factor) / Math.log(2) : 1;
+      }
+      this.ropeFreqScale = ropeFreqScale;
+      this.attentionScaling = attentionScaling;
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -843,6 +886,7 @@
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
       m.window = this.window; m.windows = this.windows.slice();
       m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant; m.attentionSink = this.attentionSink;
+      m.ropeFreqScale = this.ropeFreqScale; m.attentionScaling = this.attentionScaling;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -905,10 +949,11 @@
           const kn = qkNormFwd(qkv, T, KV, dh, qkvDim, D, P[k + 'kg'].d); // K 段（偏移 D，KV 个头）
           qk = { qx: qn.xhat, qr: qn.rstd, kx: kn.xhat, kr: kn.rstd };
         }
-        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim);
+        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim, this.ropeFreqScale);
         const ctx = new Float64Array(T * D);
         const Ps = [];
         const scale = 1 / Math.sqrt(dh);
+        const attnScale = this.attentionScaling; // YaRN 注意力温度（=1 恒等）
         for (let h = 0; h < H; h++) {
           const kvh = (h / g) | 0;                 // 该 Q 头对应的 KV 头
           const ko = D + kvh * dh;                 // K 段偏移
@@ -923,7 +968,7 @@
               const kj = j * qkvDim + ko;
               let s = 0;
               for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
-              S[i * T + j] = s * scale;
+              S[i * T + j] = s * scale * attnScale;
             }
             for (let j = 0; j < jLo; j++) S[i * T + j] = -1e9;  // 窗口左侧屏蔽（窗外历史）
             for (let j = i + 1; j < T; j++) S[i * T + j] = -1e9; // 未来位置屏蔽
@@ -1069,6 +1114,7 @@
           }
           const dS = softmaxBwd(dP, Pm, T, T);
           const scale = 1 / Math.sqrt(dh);
+          const attnScale = this.attentionScaling; // 与 forward 同因子（线性推送）
           // dQ[i] = Σ_{j≤i} dS[i][j] · K[j]（因果掩码右侧为零）
           for (let i = 0; i < T; i++) {
             for (let p = 0; p < dh; p++) {
@@ -1076,7 +1122,7 @@
               for (let j = 0; j <= i; j++) {
                 sq += dS[i * T + j] * c.qkv[j * qkvDim + ko + p];
               }
-              dqkv[i * qkvDim + h * dh + p] = sq * scale;
+              dqkv[i * qkvDim + h * dh + p] = sq * scale * attnScale;
             }
           }
           // dK[i] = Σ_{a≥i} dS[a][i] · Q[a]（列方向：所有 a≥i 的行都向 K[i] 传梯度）
@@ -1086,15 +1132,15 @@
               for (let a = i; a < T; a++) {
                 sk += dS[a * T + i] * c.qkv[a * qkvDim + h * dh + p];
               }
-              dqkv[i * qkvDim + ko + p] += sk * scale; // 共享 KV 头：多个 Q 头累加
+              dqkv[i * qkvDim + ko + p] += sk * scale * attnScale; // 共享 KV 头：多个 Q 头累加
             }
           }
           for (let i = 0; i < T; i++) {
             for (let p = 0; p < dh; p++) dqkv[i * qkvDim + vo + p] += dVh[i * dh + p];
           }
         }
-        // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转
-        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1, KV, qkvDim);
+        // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转（频率缩放与正向一致）
+        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1, KV, qkvDim, this.ropeFreqScale);
         // QK-norm 反向（前向顺序：norm → RoPE，反向顺序：RoPE⁻¹ → norm⁻¹）
         if (this.qkNorm) {
           qkNormBwd(dqkv, c.qk.qx, c.qk.qr, T, H, dh, qkvDim, 0, P[k + 'qg'].d, G[k + 'qg']);
@@ -1293,6 +1339,7 @@
   function forwardStep(model, tokenId, pos, kv) {
     const { dModel: D, nHead: H, nLayer: L, vocabSize: V0, blockSize: B } = model.cfg;
     const dh = model.dh, scale = 1 / Math.sqrt(dh);
+    const attnScale = model.attentionScaling || 1; // YaRN 注意力温度（与 forward 同因子）
     const KV = model.KV, qkvDim = model.qkvDim, kvDim = KV * dh;
     const P = model.params;
     const NF = model.useRms ? rmsnormFwd : layernormFwd;
@@ -1323,7 +1370,7 @@
         qkNormFwd(qkv, 1, H, dh, qkvDim, 0, P[k + 'qg'].d);
         qkNormFwd(qkv, 1, KV, dh, qkvDim, D, P[k + 'kg'].d);
       }
-      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim);
+      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim, model.ropeFreqScale);
 
       // 3) 写入缓存（K 取 QKV 中段，V 取尾段；GQA 下 K/V 各 kvDim 维）
       //    kvQuant=8：写入即量化（Int8 + per-(token,head) scale）；否则原样存 Float64
@@ -1354,13 +1401,13 @@
           const ks = kSc ? kSc[j * KV + kvh] : 1;
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-          S[si++] = s * scale;
+          S[si++] = s * scale * attnScale;
         }
         for (let j = 0; j < sinkCount; j++) {
           const ks = kSc ? kSc[j * KV + kvh] : 1;
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-          S[si++] = s * scale;
+          S[si++] = s * scale * attnScale;
         }
         const Pm = softmaxRows(S, 1, attnLen);
         for (let p = 0; p < dh; p++) {

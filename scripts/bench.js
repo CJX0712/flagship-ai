@@ -198,6 +198,34 @@ allPass = gradCheck(new F.GPTModel(Object.assign({}, gbase, { pos: 'rope' })), s
   rec('推理', 'StreamingLLM 无限上下文（500 token >> cap=20）', `kv.n=${a.n}=cap=${a.cap}· 末位有限=${a.finite}· 确定性 maxΔ=${d.toExponential(1)}`, 'n=cap 且 Δ=0', capOk && a.finite && d === 0);
 })();
 
+/* ---------- 5.7 YaRN 长度外推（NTK-by-parts RoPE + 注意力温度） ---------- */
+(function () {
+  const V = 13, T = 5, B = 6, factor = 4;
+  const base = { vocabSize: V, blockSize: B, nLayer: 1, nHead: 2, dModel: 8, norm: 'rmsnorm', pos: 'rope', seed: 7 };
+  const yarn = new F.GPTModel(Object.assign({}, base, { ropeScale: { type: 'yarn', factor, originalMaxLength: B } }));
+  const rng = F.mulberry32(5), tokens = [];
+  for (let i = 0; i < T; i++) tokens.push(Math.floor(rng() * V));
+  const targets = []; for (let i = 1; i < T; i++) targets.push(tokens[i]);
+  // 中心差分梯度检验（验证反向传播与频率插值/注意力温度一致）
+  const { logits, cache } = yarn.forward(tokens);
+  const { dlogits } = F.crossEntropy(logits, targets, T - 1, V, T);
+  yarn.backward(cache, dlogits);
+  const lossOf = () => F.crossEntropy(yarn.forward(tokens).logits, targets, T - 1, V).loss;
+  const all = []; for (const k in yarn.params) { const p = yarn.params[k].d; for (let i = 0; i < p.length; i++) all.push([k, i]); }
+  let sr = F.mulberry32(99), cand = all; if (all.length > 300) { cand = all.slice(); for (let i = cand.length - 1; i > 0; i--) { const j = Math.floor(sr() * (i + 1)); const t = cand[i]; cand[i] = cand[j]; cand[j] = t; } cand = cand.slice(0, 300); }
+  const e = 1e-5; let maxR = 0, chk = 0, skip = 0;
+  for (const [k, i] of cand) { const p = yarn.params[k].d, o = p[i]; p[i] = o + e; const lp = lossOf(); p[i] = o - e; const lm = lossOf(); p[i] = o; const num = (lp - lm) / (2 * e), ana = yarn.grads[k][i]; if (Math.abs(ana) < 1e-12 && Math.abs(num) < 1e-12) { skip++; continue; } maxR = Math.max(maxR, Math.abs(ana - num) / (1e-7 + 1e-4 * Math.max(Math.abs(ana), Math.abs(num)))); chk++; }
+  // 长上下文外推：pos≫blockSize 有限且确定性（相同输入两缓存应逐位一致）
+  const warm = []; for (let i = 0; i < B - 1; i++) warm.push(Math.floor(rng() * V));
+  const kv = F.initKVCache(yarn), kv2 = F.initKVCache(yarn);
+  for (let i = 0; i < warm.length; i++) { F.forwardStep(yarn, warm[i], i, kv); F.forwardStep(yarn, warm[i], i, kv2); }
+  const lf1 = F.forwardStep(yarn, 0, 3000, kv).logits, lf2 = F.forwardStep(yarn, 0, 3000, kv2).logits;
+  let dd = 0; for (let i = 0; i < lf1.length; i++) dd = Math.max(dd, Math.abs(lf1[i] - lf2[i]));
+  const finite = lf1.every(Number.isFinite);
+  rec('外推', 'YaRN 梯度检验（NTK-by-parts）', `maxErr/Tol=${maxR.toExponential(2)}(检${chk})`, '≤ 1', chk > 100 && maxR <= 1);
+  rec('外推', 'YaRN 长上下文外推 pos≫B 有限且确定性', `pos=3000 有限=${finite}· 重算Δ=${dd.toExponential(1)}`, '有限 且 Δ=0', finite && dd === 0);
+})();
+
 /* ---------- 6. KV cache 增量推理加速比 ---------- */
 function kvSpeed(model, N, runs) {
   const V = model.cfg.vocabSize, rng = F.mulberry32(3);

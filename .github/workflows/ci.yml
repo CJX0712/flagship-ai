@@ -66,6 +66,9 @@ jobs:
       - name: Attention Sink / StreamingLLM probe
         run: node scripts/probe-streaming.js
 
+      - name: YaRN length extrapolation probe
+        run: node scripts/probe-yarn.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 
