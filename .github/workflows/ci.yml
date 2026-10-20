@@ -69,6 +69,12 @@ jobs:
       - name: YaRN length extrapolation probe
         run: node scripts/probe-yarn.js
 
+      - name: Micro-ISA gate (L10 1024 slots / 192 impl / invariant sweep / engine zero-impact)
+        run: node scripts/probe-microisa.js
+
+      - name: Browser assembly gate (demo.html headless + dual-end bit-exact parity)
+        run: node scripts/probe-demo.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

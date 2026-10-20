@@ -546,3 +546,65 @@ logits = LN_f(x)·Wteᵀ
 - **续训等价性**：分块 vs 直训逐位一致，证明状态管理（Adam 矩 + RNG + 调度）无泄漏。
 - **KV cache 逐位一致**：增量推理与全量前向的末位 logits 差异必须为 **0**（不是"接近"）。这条把"缓存写错位置""漏拼接历史 K/V""掩码范围错"全部锁死。
 - **存档无损**：参数、logits、词表三者往返后必须逐位相等 —— 存档格式任何隐式精度损失都会在此暴露。
+
+---
+
+## 9. 十层分解架构与浏览器装配（v15.1）
+
+### 9.1 分层现状
+
+| 层 | 目录 | 责任 | 状态（v15.1） |
+|---|---|---|---|
+| L1 应用 | `src/app.js` | 语料编辑 / 训练 / 曲线 / 生成 UI | 仅浏览器 |
+| L2 | — | （规划中） | 未拆 |
+| L3 架构组装 | `src/L3-arch/blocks.js` | forward/backward 重组装（替代 legacy 单体） | 已拆（Δ=0） |
+| L4 神经算子 | `src/L4-ops/*` | norm/activation/positional/softmax/linear/attention/moe/loss/registry | 已拆 |
+| L5 自动微分 | `src/L5-autograd/*` | VJP 注册中心 / tape 契约 / 梯度检验工厂 | 已拆 |
+| L6 后端运行时 | `src/L6-backend/*` | kernel 注册与派发 / CPU(JS) exact 通道 / profile | 已拆 |
+| L7 张量与内存 | `src/L7-tensor/*` | tensor / shape / arena / kv-cache | 已拆 |
+| L8 数值内核 | `src/L8-kernel/*` | matmul / reduce / quantize | 已拆（与 legacy 逐位一致，Δ=0） |
+| L9 数值基础 | `src/L9-numbase/*` | rng / fp-ops / special / assert | 已拆 |
+| L10 微指令 | `src/L10-microisa/*` | 1024 槽位注册中心 + 七件套微指令（八域 × 128） | 192/1024 已实现（A 96 + C 96） |
+
+- **装配真源**：`src/namespace.js` 的 `__loadOrder`（自底向上 L10 → L9 → … → L3），Node 侧 `src/index.js` 与浏览器侧 `scripts/build-demo.js` 共读，杜绝两端顺序漂移。
+- **层红线（K5）**：`src/L*` 禁 `require( / module.exports / import / export / fetch( / new Worker / XMLHttpRequest / Math.random / Date.now`（`scripts/lint-layers.js` 硬门禁）——保证层文件可被浏览器 `file://` 内联且确定性可复现。
+- **零回归契约（R1–R10）**：`src/legacy/flagship-engine.v11.js` 是不可动的 oracle；新层只允许「与 v11 逐位一致」地覆盖导出键（当前为 6 个算子：matmul / matmulAtB / matmulTA / softmaxRows / mulberry32 / randn），模型壳走 legacy，forward/backward 由 L3 子类覆写。
+
+### 9.2 浏览器装配：双端同码（mini-require）
+
+浏览器无 `module`/`require`，朴素做法是「只内联引擎」。但那样浏览器跑的就是 legacy 单体，**十层拆解在浏览器完全失效**。v15.1 改为在 `demo.html` 产物中注入一个极小的 CommonJS 运行时：
+
+```
+demo.html
+ ├─ mini-require 运行时（__define/__require + path 桩）
+ ├─ 模块表：namespace.js · L10…L3 各层 · legacy/flagship-engine.v11.js · index.js
+ ├─ 装配入口：require('/src/index.js') → window.FlagshipAI（34 键，与 Node module.exports 同构）
+ │                              → window.FlagshipNS（层命名空间，L3–L10 挂载点）
+ ├─ verify.js（浏览器分支读 window.FlagshipAI）
+ └─ app.js
+```
+
+- **路径虚拟化**：浏览器侧 `__dirname = '/src'`，`path.join` 由 20 行 path 桩提供；`index.js` 里的 `require(path.join(__dirname, rel))` 与 Node 侧语义一致。
+- **UMD 兼容**：legacy 引擎是 UMD，在 mini-require 内 `module` 存在 → 走 CommonJS 分支（不污染 `window`）；在浏览器独立脚本中 `module` 不存在 → 走 `root.FlagshipAI` 分支。
+- **产物可复现**：行尾统一 `\n`，且 `git archive` 干净树重建与仓库内 `demo.html` 逐字节一致。
+- **双端同码判据**：`scripts/probe-demo.js` 在无头沙箱中执行 demo.html 的全部脚本块，并把浏览器侧前向 logits 与 Node 侧 `require('src/index.js')` 的前向结果**逐位比对**（当前 maxΔ=0，280 logits）。
+
+### 9.3 门禁矩阵
+
+| 门禁 | 命令 | 覆盖 |
+|---|---|---|
+| 零回归 R1–R10 | `npm run regression` | v11 ↔ 当前 导出清单/logits/grads/train/generate/算子逐位一致 |
+| 微指令门禁 | `npm run test:L10`（`scripts/probe-microisa.js`） | 1024 容量 · 192 实现计数诚实 · 192×2 种子不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响（K15 34 键） |
+| 性质测试 | `npm run test:layers`（`node --test` + fast-check） | A/C 域每项 ≥120 例任意子谓词检验 |
+| 浏览器装配 | `npm run test:demo`（`scripts/probe-demo.js`） | 脚本块无异常 · 34 键一致 · L3–L10 挂载 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性 |
+| 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
+
+### 9.4 事故记录：demo.html 浏览器损坏（v12.0–v14.0）
+
+- **现象**：`build-demo.js` 直接内联 `src/flagship-engine.js`（6 行 Node shim：`module.exports = require('./legacy/...')`），浏览器 classic script 执行到 `require` 即 `ReferenceError`，`demo.html` 整体不可用（连续三个版本无人察觉）。
+- **根因**：构建脚本缺少「产物是否真能在浏览器跑」的判据；Node 侧测试全部通过，掩盖了浏览器侧断裂。
+- **修复**（v15.1）：
+  1. 构建期硬校验：检测到 shim 特征即改内联 legacy 本体，并断言 `GPTModel` 存在，否则 exit 1；
+  2. 改为内联**完整十层栈**（mini-require），浏览器与 Node 跑同一份装配代码；
+  3. 新增 `scripts/probe-demo.js` 无头门禁（CI 硬门禁），把该类事故变成可检测失败；
+  4. 产物行尾归一 + 干净树重建逐字节一致，保证「可复现」不落空。

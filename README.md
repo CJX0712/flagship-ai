@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v14.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.1-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 192 项已实现）· 浏览器与 Node 双端同码*
 
 </div>
 
@@ -141,6 +141,34 @@
 | **全组合兼容** | — | 与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、soft-cap 任意组合均经探针验证；`ropeScale` 缺省或 `factor≤1` 逐位等价于旧版 RoPE |
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
+
+### v15.1 新增（十层分解架构实拆 + 浏览器双端同码）
+
+引擎从「单体」拆成十层可验证积木，并把「双端一致」从口号变成**逐位可测**的硬门禁：
+
+| 能力 | 说明 |
+|---|---|
+| **L3 架构组装** | `src/L3-arch/blocks.js` 重组装 forward/backward，替代 legacy 单体；模型壳仍走 legacy（构造器 RNG 顺序冻结），L3 仅覆写前/反向 → R2/R3/R4/R5 全部 Δ=0 |
+| **L4 神经算子** | `src/L4-ops/*`：norm / activation / positional / softmax / linear / attention / moe / loss / registry 十件算子目录 |
+| **L5 自动微分** | `src/L5-autograd/*`：VJP 注册中心 + tape 契约 + 梯度检验工厂（Path A） |
+| **L6 后端运行时** | `src/L6-backend/*`：kernel 注册与派发 + CPU(JS) exact 通道 + profile |
+| **L7 张量与内存** | `src/L7-tensor/*`：tensor / shape / arena（指针碰撞分配）/ kv-cache |
+| **L8 数值内核** | `src/L8-kernel/*`：matmul / reduce / quantize —— 与 legacy **逐位一致**（Δ=0），R9 契约 |
+| **L9 数值基础** | `src/L9-numbase/*`：rng（mulberry32 与 v11 同款）/ fp-ops / special / assert |
+| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**192 项已实现**（A 96 + C 96），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
+| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 38 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
+| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · C 96/128 · 合计 192/1024），不拿桩充数 |
+
+> **修复（历史事故）**：v12.0–v14.0 期间 `build-demo.js` 误把 6 行 Node shim（`module.exports = require(...)`）内联进 `demo.html`，浏览器 classic script 执行到 `require` 即 `ReferenceError` —— 连续三个版本 demo 全坏却无人察觉（Node 侧测试全绿掩盖了浏览器断裂）。v15.1 三处根治：① 构建期硬校验（shim 特征检测 + `GPTModel` 存在性断言，不符即 exit 1）；② 改为内联完整十层栈，浏览器与 Node 同码；③ 新增 `scripts/probe-demo.js` 无头门禁，把该类事故变成 CI 可检测失败。
+
+**v15.1 新增门禁**（`npm run test:all` 已纳入）：
+
+| 门禁 | 命令 | 项数 |
+|---|---|---|
+| 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 192 实现计数诚实 · 192 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
+| 浏览器装配门禁 | `npm run test:demo` | 9 项全绿（脚本块无异常 · 34 键一致 · L3–L10 挂载 · L10 容量双端一致 · 自检套件就位 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性） |
+| 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
+| 性质测试 | `npm run test:layers` | A/C 域每项 ≥120 例 fast-check 任意子谓词检验 |
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -305,17 +333,31 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 | `forwardStep` | `forwardStep(model, tokenId, pos, kv)` → `{logits}` | 单 token 增量前向，O(T·D)；注意力含锚点 `[0,sink)` + 窗口 `[jLo,n)` |
 | `kvShift` | `kvShift(model, kv)` | 缓存淘汰：sink>0 时恒驻锚点、仅平移窗口区；否则整体平移丢弃最旧 token（`copyWithin` 原生 memmove，K/V 与 INT8 scale 同步） |
 | `saveModel` / `loadModel` / `loadTokenizer` | `saveModel(model, tok?)` → JSON | 参数与词表无损持久化（自动携带 tokenizer 类型与 BPE merges） |
+| `globalThis.FlagshipAI`（层命名空间） | `FlagshipAI.L10.stats()` / `L10.ops[key].run(...)` / `L10.ops[key].predicate(...)` / `L10.display(key)` / `L9.rng.mulberry32(seed)` / `L8.matmul.matmul(...)` | 十层命名空间（Node：`require('src/index.js')` 后可读；浏览器：`window.FlagshipNS`）。**不影响** 34 键公共 API 导出清单（K15 契约） |
 
 ## 项目结构
 
 ```
 flagship-ai/
 ├── src/
-│   ├── flagship-engine.js   # 核心引擎（唯一必需文件，零依赖）
+│   ├── flagship-engine.js   # v11 引擎转发 shim（Node 入口；浏览器由构建脚本改内联 legacy 本体）
+│   ├── index.js             # 十层装配入口：按 __loadOrder 加载 L10→L3 并组装 34 键公共 API
+│   ├── namespace.js         # 装配真源：__loadOrder + 域定义（Node 与浏览器共读）
 │   ├── verify.js            # 12 项自检套件（Node + 浏览器双端）
 │   ├── corpus.js            # 默认中文语料（可随意替换）
-│   └── app.js               # demo 应用逻辑（字符级 / BPE / 架构选择）
-├── scripts/build-demo.js    # 把引擎+套件+应用内联进 demo.html
+│   ├── app.js               # demo 应用逻辑（字符级 / BPE / 架构选择）
+│   ├── legacy/              # v11 引擎本体（零回归 oracle，R1–R10 逐位对照）
+│   ├── L3-arch/             # 架构组装：forward/backward 重组装
+│   ├── L4-ops/              # 神经算子：norm/activation/positional/softmax/linear/attention/moe/loss
+│   ├── L5-autograd/         # 自动微分：VJP 注册中心 / tape 契约 / 梯度检验工厂
+│   ├── L6-backend/          # 后端运行时：kernel 注册派发 / CPU(JS) exact 通道
+│   ├── L7-tensor/           # 张量与内存：tensor / shape / arena / kv-cache
+│   ├── L8-kernel/           # 数值内核：matmul / reduce / quantize（与 legacy 逐位一致）
+│   ├── L9-numbase/          # 数值基础：rng / fp-ops / special / assert
+│   └── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（192 项已实现）
+├── tests/                   # node:test + fast-check 性质测试（L3–L10 各层）
+├── scripts/build-demo.js    # 把十层栈+套件+应用内联进 demo.html（mini-require 双端同码）
+├── scripts/isa.js           # 微指令覆盖率 CLI（逐域 impl/capacity 断言）
 ├── scripts/probe-v3.js      # v3 对照实验：BPE / 多架构梯度检验 / RoPE 不变性
 ├── scripts/probe-v4-gqa.js  # v4 验证：GQA 梯度检验 / KV 一致性 / 持久化 / 参数节省
 ├── scripts/probe-v5-quant.js # v5 验证：INT8 量化保真 / 存档体积 / in-RAM 压缩
@@ -327,9 +369,11 @@ flagship-ai/
 ├── scripts/probe-kvquant.js # v12 验证：KV INT8 量化保真 / 误差硬界 / kvShift 同步 / 全组合 / 端到端生成
 ├── scripts/probe-streaming.js # v13 验证：Attention Sink / StreamingLLM 锚点不淘汰 / 滚动窗口 / ×KV-INT8 / ×SWA / 确定性
 ├── scripts/probe-yarn.js      # v14 验证：YaRN 频率插值 / mscale / 梯度检验 / 长上下文外推 / 零回归
+├── scripts/probe-microisa.js # v15 门禁：L10 1024 槽位 / 192 实现诚实计数 / 不变量抽查 / 引擎零影响
+├── scripts/probe-demo.js     # v15 门禁：demo.html 浏览器装配无头验证 + 前向双端逐位一致
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
-├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导
+├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导 / 十层与双端装配（§9）
 ├── docs/BENCHMARK.md        # 自动生成的基准报告（bench.js 产出）
 └── package.json
 ```
