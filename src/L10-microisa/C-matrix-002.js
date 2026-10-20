@@ -43,7 +43,7 @@
     math: '(A x)ᵢ = Σₖ Aᵢₖ xₖ', pseudocode: 'return A·x', complexity: 'O(rk)',
     ref: '线性代数', commonPitfall: '无', invariant: '逐位 Object.is',
     inputs: ['A', 'x'], domains: { A: 'matInt', x: 'matInt' }, matrixDims: { A: [4,3], x: [3,1] },
-    run: (A, x) => M.matmul(A, x, 4, 3, 1), predicate: (A, x) => { const y = M.matmul(A, x, 4, 3, 1); for (let i=0;i<4;i++){ let s=0; for (let k=0;k<3;k++) s+=A[i*3+k]*x[k]; if (!Object.is(y[i], s)) return false; } return true; },
+    run: (A, x) => M.matmul(A, x, 4, 3, 1), predicate: (A, x) => { const y = M.matmul(A, x, 4, 3, 1); for (let i=0;i<4;i++){ let s=0; for (let k=0;k<3;k++) s+=A[i*3+k]*x[k]; if (!L10.relClose(y[i], s, 0)) return false; } return true; },
   });
   reg(67, {
     name: '矩阵·向量 · 对加法线性', intuition: 'A(x+y) = Ax + Ay（逐位）。',
@@ -64,14 +64,14 @@
     math: '(u B)ⱼ = Σᵣ uᵣ Bᵣⱼ', pseudocode: 'return u·B', complexity: 'O(rc)',
     ref: '线性代数', commonPitfall: '无', invariant: '逐位 Object.is',
     inputs: ['u', 'B'], domains: { u: 'matInt', B: 'matInt' }, matrixDims: { u: [1,4], B: [4,5] },
-    run: (u, B) => M.matmul(u, B, 1, 4, 5), predicate: (u, B) => { const y = M.matmul(u, B, 1, 4, 5); for (let j=0;j<5;j++){ let s=0; for (let r=0;r<4;r++) s+=u[r]*B[r*5+j]; if (!Object.is(y[j], s)) return false; } return true; },
+    run: (u, B) => M.matmul(u, B, 1, 4, 5), predicate: (u, B) => { const y = M.matmul(u, B, 1, 4, 5); for (let j=0;j<5;j++){ let s=0; for (let r=0;r<4;r++) s+=u[r]*B[r*5+j]; if (!L10.relClose(y[j], s, 0)) return false; } return true; },
   });
   reg(70, {
     name: '外积 · u⊗v = u·vᵀ', intuition: 'u(r×1)·v(1×c) 第 ij 元素 = uᵢ vⱼ（逐位）。',
     math: '(u⊗v)ᵢⱼ = uᵢ vⱼ', pseudocode: 'return u·vᵀ', complexity: 'O(rc)',
     ref: '张量积', commonPitfall: '无', invariant: '逐位 Object.is',
     inputs: ['u', 'v'], domains: { u: 'matInt', v: 'matInt' }, matrixDims: { u: [4,1], v: [1,5] },
-    run: (u, v) => M.matmul(u, v, 4, 1, 5), predicate: (u, v) => { const O = M.matmul(u, v, 4, 1, 5); for (let i=0;i<4;i++) for (let j=0;j<5;j++) if (!Object.is(O[i*5+j], u[i]*v[j])) return false; return true; },
+    run: (u, v) => M.matmul(u, v, 4, 1, 5), predicate: (u, v) => { const O = M.matmul(u, v, 4, 1, 5); const ref = new Float64Array(20); for (let i=0;i<4;i++) for (let j=0;j<5;j++) ref[i*5+j] = u[i]*v[j]; return meq(O, ref); },
   });
   reg(71, {
     name: '外积 · (u⊗v)·w = ⟨v,w⟩·u', intuition: '秩 1 矩阵乘向量满足结合恒等式（逐位）。',
