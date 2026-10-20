@@ -6,12 +6,14 @@
  * 这些在 file:// 下经典脚本中是 ReferenceError / SyntaxError（CORS 拦 import/export）；
  * 确定性要求禁止 Math.random / Date.now。
  *
- * Phase 0 尚无 src/L* 目录，本脚本扫描 0 文件并通过；Phase 1 起成为 CI 硬门禁。
+ * Phase 1 起为 CI 硬门禁：src/L9-numbase、src/L10-microisa 已落地，
+ * 任何层文件出现上述语法/全局即失败（保证 file:// 双击可跑 + 确定性）。
  */
 const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
+const SRC = path.join(ROOT, 'src'); // 层目录位于 src/L*（namespace.js __loadOrder 同源）
 const FORBIDDEN = [
   'require(', 'module.exports', 'import ', 'export ',
   'fetch(', 'new Worker', 'XMLHttpRequest', 'Math.random', 'Date.now',
@@ -28,10 +30,10 @@ function walk(dir) {
   return out;
 }
 
-const layerDirs = fs.readdirSync(ROOT).filter((d) =>
-  /^L\d/.test(d) && fs.statSync(path.join(ROOT, d)).isDirectory()
+const layerDirs = fs.readdirSync(SRC).filter((d) =>
+  /^L\d/.test(d) && fs.statSync(path.join(SRC, d)).isDirectory()
 );
-const files = layerDirs.flatMap((d) => walk(path.join(ROOT, d)));
+const files = layerDirs.flatMap((d) => walk(path.join(SRC, d)));
 
 let errors = 0;
 for (const f of files) {

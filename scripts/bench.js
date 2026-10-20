@@ -272,6 +272,27 @@ if (FULL) {
   }
 }
 
+/* ---------- 8. 十层架构 Phase 1：L9 数值基础 + L10 微指令注册中心 ---------- */
+(function () {
+  require('../src/index.js'); // 双端装配：按 __loadOrder 注入 L9/L10 至 globalThis.FlagshipAI
+  const NS = globalThis.FlagshipAI;
+  const st = NS.L10.stats();
+  const slotsOk = st.total === 1024 && Object.keys(st.byDomain).every(k => st.byDomain[k].total === 128);
+  rec('微指令', 'L10 注册中心槽位', `${st.done}/${st.total} 已实现（八域×128，未实现项显式 registered-not-implemented 桩）`, '1024 槽位完整', slotsOk);
+  let green = 0, fail = 0, firstFail = '';
+  for (const key of NS.L10.keys()) {
+    if (NS.L10.get(key).impl !== 'done') continue;
+    for (const seed of [1, 2]) {
+      const r = NS.L10.check(key, seed);
+      if (r.pass) green++; else { fail++; if (!firstFail) firstFail = NS.L10.display(key) + ': ' + r.detail; }
+    }
+  }
+  rec('微指令', 'L10 不变量自检（双种子）', `${green} 通过 / ${fail} 失败${fail ? '（首败 ' + firstFail + '）' : ''}`, `全绿（${st.done * 2} 项）`, fail === 0 && green === st.done * 2);
+  const l9 = NS.L9, l9ts = l9 && l9.runSelfTests ? l9.runSelfTests(1) : [];
+  const l9ok = l9ts.length > 0 && l9ts.every(t => t.pass);
+  rec('微指令', 'L9 数值基础层', l9 ? `${Object.keys(l9).length} 个符号 + ${l9ts.length} 项自检${l9ok ? '全绿' : '有败'}` : '缺失', '自检全绿', l9ok);
+})();
+
 /* ---------- 渲染 Markdown ---------- */
 function renderMarkdown() {
   const groups = [];

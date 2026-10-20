@@ -26,6 +26,13 @@
 │          （全部手写，Float64Array 行优先）                 │
 ├─────────────────────────────────────────────────────────┤
 │ 数基层   mulberry32 RNG + Box-Muller 正态采样             │
+├─────────────────────────────────────────────────────────┤
+│ L9 数值基础（v15） twoSum/Kahan/Neumaier 误差补偿 · ulpDiff/frexp │
+│          位级原语 · safeExp/logsumexpPair 稳定函数 · 断言库      │
+├─────────────────────────────────────────────────────────┤
+│ L10 微指令（v15） 八域×128=1024 槽位注册中心，120 项已实现       │
+│          每项纯函数 + selfTest 硬不变量（A标量/B向量/C矩阵/D分解  │
+│          /E形状/F微分/G注意力/H优化量化）                        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -332,6 +339,43 @@ RoPE 的旋转频率 `θ_i = base^(-2i/d)` 对位置敏感：短训练长度下�
 - **组合兼容**：与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、logit soft-cap 任意组合均经探针验证。
 - **不变量**：`factor=1` 与缺省逐位等价（Δ=0）；`forward`≡`forwardStep`（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
 - **验证**：`scripts/probe-yarn.js` —— 5 项全绿（零回归 / 梯度检验 yarn+ntk / mscale+freqScale / 长上下文外推 / 确定性+特征生效）。
+
+### 2.20 十层分解架构 Phase 1：L9 数值基础层 + L10 微指令层（v15.0）
+
+引擎（L1–L8）之下显式拆出两层数值地基。目标：把"每个算法一条硬不变量"从引擎级下沉到**指令级**，为后续层（L1 应用 → L8 引擎）的逐层替换提供可验证积木。
+
+#### 2.20.1 分层与装配
+
+```
+L1 应用（demo/app.js）
+L2–L8 引擎（flagship-engine，GPT-2/nanoGPT/picoGPT 谱系）
+L9  数值基础（src/L9-numbase/）：rng · fp-ops · assert
+L10 微指令（src/L10-microisa/）：registry（1024 槽位）+ 八域实现
+```
+
+- **层文件红线**（`scripts/lint-layers.js` 硬门禁，12 文件 0 违例）：`src/L*` 禁 `require/module.exports/import/export/fetch/new Worker/XMLHttpRequest/Math.random/Date.now`，必须是注入 `globalThis.FlagshipAI` 的 IIFE —— 保证浏览器 `file://` 直开可用。
+- **双端装配**：Node 入口 `src/index.js` 用 `fs+vm.runInThisContext` 按 `namespace.__loadOrder` 依次执行层 IIFE，再 `buildPublicAPI(engine)` 平权合并导出（`module.exports = engine` 保 R3 导出面恒等）；浏览器由 `build-demo.js` 按同序内联（引擎 UMD 先行设 `window.FlagshipAI`，namespace 以 `||` 保留，层再注入）。`scripts/probe-demo.js` 无头复播全部脚本块，锁死装配序。
+
+#### 2.20.2 L9 数值基础层（32 符号）
+
+| 组 | 符号 | 硬不变量 |
+|---|---|---|
+| 确定性随机 | `mulberry32` / `randn` / `rngSplit` | 同种子逐位复现；与 v11 引擎金值一致 |
+| 误差补偿 | `twoSum` / `fastTwoSum` / `kahanStep` / `neumaierStep` | `s+e===a+b` 精确恒等；`1e16` 累加 1000 次：朴素=0、Kahan=1000、Neumaier `sum+comp=1e16+1000` |
+| 位级操作 | `ulpDiff` / `frexp` / `ldexp` / `isNormal` / `float32Round` | 双字运算（禁 32 位位运算截断）：相邻浮点 ulp=1、1→2=2⁵²、跨零 `0x7FE0…`；`frexp` 数值化（`mant<2⁵²` 则翻倍）防死循环 |
+| 稳定超越函数 | `safeExp` / `expm1` / `log1p` / `logsumexpPair` / `sgSigmoid` / `softplus` / `tanhStable` | 全域有限；小值相对误差 <1e-14；`logsumexpPair(0,-100)` 稳定 |
+| 工具 | `hypot` / `cbrt` / `clip` / `sign` / `safeInv` | 3-4-5；`cbrt(8)=2`；零输入返回 1e308 非 Inf |
+| 断言库 | `assert` / `assertClose` / `assertBitExact` / `BUDGET` | 误差预算表统一各探针判据 |
+
+#### 2.20.3 L10 微指令层（1024 槽位 / 120 已实现）
+
+- **注册中心**（`registry.js`）：八域 × 128 = 1024 槽位预置 `registered-not-implemented` 桩（`notImpl(key)` 工厂闭包，调用抛错含 `μ<key>`）；实现项按同 key 覆盖（`impl:'done'`）。`stats()` 诚实分域计数，`check(key,seed)` 跑 selfTest。
+- **微指令契约**：纯函数（无隐藏状态，随机性由显式 RNG 注入保证可复现）+ `selfTest(rng)` 至少一条可独立交叉验证的不变量 + 文献出处（`ref` 字段）。
+- **八域进度**：A 标量数值与浮点 28 / B 向量归约与内存 16 / C 矩阵与 BLAS 微内核 12 / D 线性代数分解与求解 10 / E 张量形状与索引 13 / F 自动微分 11 / G 注意力与位置编码 15 / H 优化器·量化·随机 15 = **120/1024**。
+- **代表不变量**：`two_sum` 恒等；1e16 陷阱（B008）；INT8 GEMM 误差硬界 `|deq(q)A·B−A·B| ≤ (absmax/254)·Σ|B|`（C011）；Householder QR 的 `QᵀQ=I`+`R` 上三角+`QR=A`（D006）；`unravel∘linearize≡id`（E001/E002）；F 域全部解析梯度过中心差分；RoPE 相对位置不变性（G003）；mulberry32 金值逐位回归（H000，v11 同款）；量化往返硬界 `|x−deq(q)| ≤ absmax/254`（H009）。
+- **开发期实测修复**（selfTest 抓出的真 bug，非测试写错）：D006 Householder 反射器 `β=2/vᵀv` 被多乘 2（R 全错）；H008 `Math.round` 半值向上不对称（−63.5→−63，破坏量化对称性，改 round-half-away-from-zero）；A005/L9 `ulpDiff` 高低字装反（DataView 大端）+ 32 位位运算 ToInt32 截断导致死循环；A007 `frexp` 同类截断；A001/A004 补偿公式笔误；D007 Jacobi 旋转符号；G004 退化区间阈值；E 域 5 处 selfTest 误用 `this.fn` 调错签名（改 `L10.run` 跨域引用）。
+- **不注水原则**：120 是已交付实数，1024 是槽位路线图；未实现项在 `stats` 显式计数、调用即抛错。宁可 120 项全部带硬不变量，不要 1024 项桩充数。
+- **验证**：`scripts/probe-microisa.js` 8 项全绿（1024 槽位 / 诚实核算 / 双种子 240 项 selfTest / stub 行为 / 确定性 / L9 / 引擎零影响——`require` 恒等 + 34 API 一致 + 前向有限）；CLI `node scripts/isa.js --stats|--check[=域]|--run=KEY`；bench.js 第 8 节将上述度量纳入 `docs/BENCHMARK.md`。
 
 ---
 
