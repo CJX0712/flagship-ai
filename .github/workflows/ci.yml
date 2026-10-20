@@ -63,6 +63,9 @@ jobs:
       - name: KV Cache INT8 quantization probe
         run: node scripts/probe-kvquant.js
 
+      - name: Attention Sink / StreamingLLM probe
+        run: node scripts/probe-streaming.js
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

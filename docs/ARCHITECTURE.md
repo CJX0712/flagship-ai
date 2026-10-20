@@ -293,6 +293,29 @@ KV cache 是长序列推理的显存瓶颈（每层 K/V 各 `blockSize×KV×dh` 
 - **不变量**：INT8-KV vs F32-KV 逐步末位 logits maxΔ<5e-4（占 logits 动态范围 <0.02%）；贪心解码两模式生成 token 逐字一致；kvShift 后误差仍有界；端到端采样无 NaN/Inf、同种子可复现；典型 L=4/B=64/KV头=2/dh=16 下显存 **5.33x** 压缩。
 - **验证**：`scripts/probe-kvquant.js` —— 11 项全绿。
 
+### 2.18 Attention Sink / StreamingLLM（v13.0，推理期无限上下文）
+
+长文本生成时 KV 缓存随序列线性膨胀，且注意力会无谓地把大量权重浪费在最开头 token 上（即使它们已与当前语义脱钩）。v13 引入 StreamingLLM（Xiao et al., 2023）的两条机制，使缓存容量与序列长度**解耦**：
+
+1. **Attention Sink（锚点）**：固定缓存最前的 K 个 token 永不淘汰——经验与理论都表明，注意力需要若干"锚点"来稳定 softmax 的分母（mass），丢弃首 token 会导致 perplexity 暴涨、生成崩坏。
+2. **滚动窗口**：其余缓存为最近 R 个 token，超出则淘汰最旧的非锚点 token。
+
+- **缓存容量**：`cap = sink>0 ? K + R : blockSize`（R = SWA `window`（若设）或 `rollingWindow`，默认 256）。`initKVCache` 据此分配 `cap×kvDim`，并附带 `cap`（容量）与 `sink`（锚点数）字段供增量路径使用。
+- **淘汰原语 `kvShift` 的锚点感知**：
+
+  ```
+  sink>0：仅平移窗口区 [sink+1, n) → [sink, n-1)（copyWithin 原生 memmove），锚点 [0,sink) 原地不动；n -= 1
+  sink=0：整体平移 [1, n) → [0, n-1)（旧滑动窗口行为，逐位兼容）
+  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位
+  ```
+
+- **注意力公式（增量路径）**：查询在位置 `pos` 的注意力范围为 `sink 锚点 [0, sink) ∩ 窗口外` ∪ `窗口 [jLo, n)`（`jLo = nValid − win`，`win = min(windows[l], nValid)`）；`sinkCount = min(sink, jLo)` 为需显式补入的窗口外锚点数。`sink=0` 时 `sinkCount=0`，与旧窗口注意力**逐位一致**（零回归）。缓存中实际驻留的正是 `sink + 窗口` 两段，中段 token 已被淘汰，故"锚点 ∪ 窗口"恰好覆盖全部有效槽位。
+- **RoPE 兼容性**：缓存存的是写入时已按绝对位置 `pos` 旋转过的 K/V；`kvShift` 平移不改其数值，新查询按当前 `pos` 旋转，注意力只依赖相对距离——与 v9/v12 的滑动窗口结论一致。
+- **零干预训练**：StreamingLLM 仅作用于 `forwardStep` / `kvShift`，`forward` 全序列训练路径完全不变，**反向传播与中心差分梯度检验零改动**（训练本就不走 KV 缓存）。
+- **组合兼容**：与 KV INT8 量化、SWA 滑动窗口、INT8 权重量化、GQA、MoE、QK-norm、logit soft-cap 任意组合均经探针验证；`attentionSink=0`（默认）逐位等价于旧版滑动窗口。
+- **不变量**：远超容量后 `slot[0..K)` 的 K/V 与初次写入**逐位一致**（锚点永不被淘汰，Δ=0）；末窗口槽位 == 最近一次写入 token（Δ=0）；StreamingLLM 末位 logits 与纯滑动窗口**明显不同**（maxΔ=2.5e-2，证明锚点确实被 attend）；greedy 300 token 同种子可复现、无 NaN/Inf；× KV INT8 末位 maxΔ<2e-4；kvShift 多次淘汰后 scale 全有限。
+- **验证**：`scripts/probe-streaming.js` —— 10 项全绿（零回归 / 短序列一致性 / 锚点不淘汰 / 滚动窗口 / 有效性 / 确定性 / 无限上下文 / ×KV-INT8 / ×SWA / scale 同步）。
+
 ---
 
 ## 3. 反向传播（全部手写）

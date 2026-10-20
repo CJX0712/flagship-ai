@@ -766,6 +766,8 @@
       this.logitCap = cfg.logitCap > 0 ? +cfg.logitCap : 0;
       // KV 缓存 INT8 量化：仅影响 forwardStep 增量路径（forward 全序列不走缓存）
       this.kvQuant = cfg.kvQuant === 8 ? 8 : 0;
+      // Attention Sink（StreamingLLM）：恒驻缓存首 K 个锚点 token，支持无限上下文流式推理；0 = 关闭（逐位兼容）
+      this.attentionSink = cfg.attentionSink > 0 ? Math.floor(cfg.attentionSink) : 0;
       this.quantized = false;
       const rng = mulberry32(this.cfg.seed);
       const P = (this.params = {});
@@ -840,7 +842,7 @@
       m.qkvDim = this.qkvDim; m.quantized = true;
       m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
       m.window = this.window; m.windows = this.windows.slice();
-      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant;
+      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant; m.attentionSink = this.attentionSink;
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -1267,13 +1269,18 @@
     const { nLayer: L, blockSize: B } = model.cfg;
     const kvDim = model.KV * model.dh; // GQA 下 K/V 每位置维度 = KV 头数 · headDim
     const KV = model.KV, q8 = model.kvQuant === 8;
+    // Attention Sink / StreamingLLM：缓存容量 = 锚点 K + 滚动窗口 R；无锚点时退化为原滑动窗口（容量 = blockSize）
+    const sink = model.attentionSink > 0 ? model.attentionSink : 0;
+    const maxWin = model.windows.reduce((a, b) => (b > a ? b : a), 0);
+    const R = maxWin > 0 ? maxWin : (model.cfg.rollingWindow > 0 ? Math.floor(model.cfg.rollingWindow) : 256);
+    const cap = sink > 0 ? sink + R : B;
     const K = [], V = [], Ks = [], Vs = [];
     for (let l = 0; l < L; l++) {
-      K.push(q8 ? new Int8Array(B * kvDim) : new Float64Array(B * kvDim));
-      V.push(q8 ? new Int8Array(B * kvDim) : new Float64Array(B * kvDim));
-      if (q8) { Ks.push(new Float64Array(B * KV)); Vs.push(new Float64Array(B * KV)); }
+      K.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
+      V.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
+      if (q8) { Ks.push(new Float64Array(cap * KV)); Vs.push(new Float64Array(cap * KV)); }
     }
-    return { K, V, Ks, Vs, n: 0, q8 };
+    return { K, V, Ks, Vs, n: 0, q8, cap, sink };
   }
 
   /**
@@ -1328,27 +1335,43 @@
         for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
       }
 
-      // 4) 因果 + 滑动窗口注意力：仅对窗口内的缓存位置 attend（窗外槽位不影响输出）
+      // 4) 因果 + 滑动窗口 + Attention Sink 注意力：
+      //    窗口 [jLo, nValid) 内 attend；若启用锚点(sink>0) 且锚点在窗口左侧，额外补 [0, sinkCount) 恒驻锚点（StreamingLLM）。
+      //    sink=0 时退化为原窗口注意力（逐位兼容）。
       const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
       const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
+      const sink = model.attentionSink > 0 ? model.attentionSink : 0;
+      const sinkCount = sink > 0 ? Math.min(sink, jLo) : 0; // 窗口外、需显式补的锚点数
+      const attnLen = win + sinkCount;
       const ctx = new Float64Array(D);
       const kSc = kv.q8 ? kv.Ks[l] : null, vSc = kv.q8 ? kv.Vs[l] : null;
       for (let h = 0; h < H; h++) {
         const kvh = (h / model.g) | 0;
-        const S = new Float64Array(win);
+        const S = new Float64Array(attnLen);
+        let si = 0;
         for (let j = jLo; j < nValid; j++) {
           // kvQuant=8 时缓存里是 int8 码字，读出时乘回该 (token,head) 的 scale 即解量化
           const ks = kSc ? kSc[j * KV + kvh] : 1;
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-          S[j - jLo] = s * scale;
+          S[si++] = s * scale;
         }
-        const Pm = softmaxRows(S, 1, win);
-        for (let p = 0; p < dh; p++) {
+        for (let j = 0; j < sinkCount; j++) {
+          const ks = kSc ? kSc[j * KV + kvh] : 1;
           let s = 0;
-          for (let j = 0; j < win; j++) {
-            const vs = vSc ? vSc[(j + jLo) * KV + kvh] : 1;
-            s += Pm[j] * (Vo[(j + jLo) * kvDim + kvh * dh + p] * vs);
+          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
+          S[si++] = s * scale;
+        }
+        const Pm = softmaxRows(S, 1, attnLen);
+        for (let p = 0; p < dh; p++) {
+          let s = 0, pi = 0;
+          for (let j = jLo; j < nValid; j++) {
+            const vs = vSc ? vSc[j * KV + kvh] : 1;
+            s += Pm[pi++] * (Vo[j * kvDim + kvh * dh + p] * vs);
+          }
+          for (let j = 0; j < sinkCount; j++) {
+            const vs = vSc ? vSc[j * KV + kvh] : 1;
+            s += Pm[pi++] * (Vo[j * kvDim + kvh * dh + p] * vs);
           }
           ctx[h * dh + p] = s;
         }
@@ -1404,25 +1427,51 @@
     return { logits };
   }
 
-  /** 滑动窗口：丢弃最旧的 1 个 token（copyWithin 原生 memmove，O(B·D) 无重算）。
-   * K/V 向量在写入时已携带当时的绝对位置信息，搬移不改变其数值。 */
+  /** 缓存淘汰（Attention Sink / 滑动窗口）：
+   *  - sink>0（StreamingLLM）：恒驻 [0,sink) 锚点，仅平移窗口区 [sink, n) 左移 1，丢弃最旧的非锚点 token；
+   *  - sink=0：整体平移（丢弃最旧 token，含首 token）—— 纯滑动窗口，逐位兼容旧行为。
+   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。 */
   function kvShift(model, kv) {
     const { nLayer: L } = model.cfg;
     const kvDim = model.KV * model.dh, KV = model.KV;
-    const n = kv.n;
-    for (let l = 0; l < L; l++) {
-      kv.K[l].copyWithin(0, kvDim, n * kvDim);
-      kv.V[l].copyWithin(0, kvDim, n * kvDim);
-      if (kv.q8) { // scale 与码字必须同步平移，否则解量化错位
-        kv.Ks[l].copyWithin(0, KV, n * KV);
-        kv.Vs[l].copyWithin(0, KV, n * KV);
+    const n = kv.n, sink = kv.sink || 0;
+    if (sink > 0) {
+      // 仅滚动窗口区 [sink+1, n) -> [sink, n-1)，锚点 [0,sink) 原地不动（copyWithin 处理重叠左移）
+      const from = (sink + 1) * kvDim, to = sink * kvDim, cnt = (n - sink) * kvDim;
+      for (let l = 0; l < L; l++) {
+        kv.K[l].copyWithin(to, from, from + cnt);
+        kv.V[l].copyWithin(to, from, from + cnt);
+        if (kv.q8) { // scale 与码字必须同步平移，否则解量化错位
+          const Ksf = (sink + 1) * KV, Kst = sink * KV, Ksc = (n - sink) * KV;
+          kv.Ks[l].copyWithin(Kst, Ksf, Ksf + Ksc);
+          kv.Vs[l].copyWithin(Kst, Ksf, Ksf + Ksc);
+        }
+      }
+    } else {
+      for (let l = 0; l < L; l++) {
+        kv.K[l].copyWithin(0, kvDim, n * kvDim);
+        kv.V[l].copyWithin(0, kvDim, n * kvDim);
+        if (kv.q8) {
+          kv.Ks[l].copyWithin(0, KV, n * KV);
+          kv.Vs[l].copyWithin(0, KV, n * KV);
+        }
       }
     }
     kv.n = n - 1;
   }
 
-  /** 用给定 ids 预热缓存，返回末位 logits（超出 blockSize 时取最后 blockSize 个） */
+  /** 用给定 ids 预热缓存，返回末位 logits。
+   *  - sink>0（StreamingLLM）：处理整段 prompt，缓存满则按「锚点 + 滚动窗口」淘汰中段（保留首 sink 个锚点）。
+   *  - sink=0：原行为，超出 blockSize 取最后 B 个。 */
   function warmupKV(model, ids, kv) {
+    if (kv.sink > 0) {
+      let logits = null;
+      for (let i = 0; i < ids.length; i++) {
+        if (kv.n >= kv.cap) kvShift(model, kv);
+        logits = forwardStep(model, ids[i], i, kv).logits;
+      }
+      return logits;
+    }
     const B = model.cfg.blockSize;
     const toks = ids.length > B ? ids.slice(ids.length - B) : ids;
     let logits = null;
@@ -1516,7 +1565,8 @@
     const kv = o.useCache ? (o.kv || initKVCache(model)) : null;
     // 预热（缓存模式）：位置嵌入从 0 开始，与全序列 forward 保持一致
     let logits = kv ? warmupKV(model, ids, kv) : null;
-    let pos = kv ? Math.min(ids.length, B) : 0;
+    // 锚点模式：pos 取绝对长度（warmup 已按绝对位置写缓存）；否则沿用末位（与原行为一致）
+    let pos = kv ? (kv.sink > 0 ? ids.length : Math.min(ids.length, B)) : 0;
 
     for (let s = 0; s < total; s++) {
       if (!kv) {
@@ -1572,11 +1622,11 @@
       out.push(idx);
 
       // 推进 KV 缓存（pos 为绝对位置，可无限增长；槽位由 kv.n 管理）
-      // - 序列长度 < blockSize：纯增量，与全序列 forward 严格逐位等价
-      // - 超出后：滑动窗口丢弃最旧 token。RoPE 下注意力只依赖相对距离，
-      //   故窗口滑动后仍与全序列重算逐位一致；可学习位置嵌入下为有界近似。
+      // - 序列长度 < 缓存容量：纯增量，与全序列 forward 严格逐位等价
+      // - 超出后：缓存满则淘汰（Attention Sink 保锚点 / 否则滑动窗口丢弃最旧 token）。
+      //   RoPE 下注意力只依赖相对距离，故窗口滑动后仍与全序列重算逐位一致。
       if (kv) {
-        if (pos >= B) kvShift(model, kv);
+        if (kv.n >= (kv.cap || B)) kvShift(model, kv);
         logits = forwardStep(model, idx, pos, kv).logits;
         pos++;
       }

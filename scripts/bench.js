@@ -176,6 +176,28 @@ allPass = gradCheck(new F.GPTModel(Object.assign({}, gbase, { pos: 'rope' })), s
   rec('量化', 'KV cache 内存压缩', `Float64=${(bytesF / 1024).toFixed(0)}KB → INT8+scale=${(bytesQ / 1024).toFixed(0)}KB (${(bytesF / bytesQ).toFixed(2)}x)`, '> 3x', bytesF / bytesQ > 3);
 })();
 
+/* ---------- 5.6 Attention Sink / StreamingLLM（推理期无限上下文） ---------- */
+(function () {
+  const V = 65, B = 64, L = 3, H = 4, KVh = 2, dModel = 64, K = 4, R = 16;
+  const cfg = { vocabSize: V, blockSize: B, nLayer: L, nHead: H, nKvHead: KVh, dModel, norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', attentionSink: K, rollingWindow: R, seed: 5 };
+  function stream(N) {
+    const m = new F.GPTModel(cfg);
+    const kv = F.initKVCache(m);
+    const rng = F.mulberry32(11);
+    let lg = null, pos = 0;
+    for (let i = 0; i < N; i++) {
+      if (kv.n >= kv.cap) F.kvShift(m, kv); // 满容淘汰（锚点保护 + 滚动窗口）
+      const t = Math.floor(rng() * V);
+      lg = F.forwardStep(m, t, pos, kv).logits; pos++;
+    }
+    return { lg, n: kv.n, cap: kv.cap, finite: lg.every(Number.isFinite) };
+  }
+  const a = stream(500), b = stream(500); // 远超容量（cap=K+R=20），多次淘汰
+  let d = 0; for (let i = 0; i < a.lg.length; i++) d = Math.max(d, Math.abs(a.lg[i] - b.lg[i]));
+  const capOk = a.n === a.cap && a.cap === K + R;
+  rec('推理', 'StreamingLLM 无限上下文（500 token >> cap=20）', `kv.n=${a.n}=cap=${a.cap}· 末位有限=${a.finite}· 确定性 maxΔ=${d.toExponential(1)}`, 'n=cap 且 Δ=0', capOk && a.finite && d === 0);
+})();
+
 /* ---------- 6. KV cache 增量推理加速比 ---------- */
 function kvSpeed(model, N, runs) {
   const V = model.cfg.vocabSize, rng = F.mulberry32(3);

@@ -166,6 +166,12 @@
             <option value="8">开启（INT8，省显存）</option>
           </select>
         </div>
+        <div>
+          <label for="attentionSink">Attention Sink 锚点数（留空=关闭 / 0=关闭 / K=恒驻首 K 个 token，StreamingLLM 无限上下文）</label>
+          <input id="attentionSink" type="number" min="0" step="1" placeholder="留空=关闭">
+          <label for="rollingWindow">滚动窗口滚动大小 rollingWindow（sink&gt;0 时必填方向，留空默认 256；与 SWA window 二选一）</label>
+          <input id="rollingWindow" type="number" min="1" step="1" placeholder="留空=256">
+        </div>
       </div>
       <div class="row">
         <div>

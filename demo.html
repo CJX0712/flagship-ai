@@ -166,6 +166,12 @@
             <option value="8">开启（INT8，省显存）</option>
           </select>
         </div>
+        <div>
+          <label for="attentionSink">Attention Sink 锚点数（留空=关闭 / 0=关闭 / K=恒驻首 K 个 token，StreamingLLM 无限上下文）</label>
+          <input id="attentionSink" type="number" min="0" step="1" placeholder="留空=关闭">
+          <label for="rollingWindow">滚动窗口滚动大小 rollingWindow（sink&gt;0 时必填方向，留空默认 256；与 SWA window 二选一）</label>
+          <input id="rollingWindow" type="number" min="1" step="1" placeholder="留空=256">
+        </div>
       </div>
       <div class="row">
         <div>
@@ -788,6 +794,19 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
         if (!(kvq === 0 || kvq === 8)) { log('kvQuant 仅支持 0（关闭）或 8（INT8）', 'err'); return false; }
         cfg.kvQuant = kvq;
       }
+      // Attention Sink / StreamingLLM：推理期恒驻首 K 个锚点 token，支持无限上下文流式推理
+      const sinkRaw = $('attentionSink').value.trim();
+      if (sinkRaw !== '') {
+        const sink = +sinkRaw;
+        if (!(sink >= 0)) { log('attentionSink 需 ≥ 0（0=关闭）', 'err'); return false; }
+        cfg.attentionSink = sink;
+        if (sink > 0) {
+          const rwRaw = $('rollingWindow').value.trim();
+          const rw = rwRaw === '' ? 256 : +rwRaw;
+          if (!(rw >= 1)) { log('rollingWindow 需 ≥ 1', 'err'); return false; }
+          cfg.rollingWindow = rw;
+        }
+      }
       state.arch = arch;
       state.tokMode = tokMode;
       state.model = new F.GPTModel(cfg);
@@ -807,10 +826,11 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     const stabLabel = (state.model.qkNorm ? 'QK-norm' : '') + (state.model.logitCap > 0 ? `+cap${state.model.logitCap}` : '');
     const stabFull = stabLabel ? ` / ${stabLabel}` : '';
     const kvqFull = state.model.kvQuant === 8 ? ' / KV-INT8' : '';
-    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    const sinkFull = state.model.attentionSink > 0 ? ` / Sink(${state.model.attentionSink})` : '';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}${sinkFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}${sinkFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
     drawChart();
     return true;
   }
@@ -1035,7 +1055,7 @@ document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
     $('importFile').addEventListener('change', handleImport);
     // 语料与模型结构/分词器/架构变动都需重新构建
     $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant'].forEach((id) => {
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant', 'attentionSink', 'rollingWindow'].forEach((id) => {
       $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
     });
     // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式（gemma 预设自带 QK-norm/soft-cap，留空即跟随）

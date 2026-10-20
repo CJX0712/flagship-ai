@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v12.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-v13.0-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -116,6 +116,19 @@
 | **kvShift 同步** | — | 滑动窗口平移时 scale 与码字同步 `copyWithin`，解量化不错位 |
 
 > KV INT8 与 F32 缓存逐步末位 logits 差异有界（占动态范围 <0.02%）；贪心解码 INT8-KV 与 F32-KV 生成 token 逐字一致；端到端采样无 NaN/Inf、同种子可复现。详见 `scripts/probe-kvquant.js`（11 项全绿）。
+
+### v13.0 新增（Attention Sink / StreamingLLM，推理期无限上下文）
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **Attention Sink** | StreamingLLM（Xiao et al., 2023） | `attentionSink:K`（K>0）时 KV 缓存**恒驻首 K 个锚点 token**，其余为滚动窗口（容量 = K + 滚动窗口 R）；注意力永远包含锚点，故可丢弃中段、支持无限长度流式推理 |
+| **滚动窗口淘汰** | — | 缓存满（K+R）后每步淘汰最旧的非锚点 token（仅平移窗口区 `[K, n)`，`copyWithin` 原生 memmove，O(容量·D) 无重算），锚点 `[0, K)` 原地不动 |
+| **显存/长度解耦** | — | 缓存容量与序列长度脱钩：生成任意长文本，缓存恒为 K+R（如 4+16=20 token），显存恒定、延迟恒定 |
+| **零干预训练** | — | StreamingLLM 仅作用于推理增量路径（`forwardStep`/`kvShift`），`forward` 全序列训练不受影响，**反向传播/梯度检验零改动** |
+| **全组合兼容** | — | 与 KV INT8 量化、SWA 滑动窗口、INT8 权重量化、GQA、MoE、QK-norm、soft-cap 任意组合均经探针验证；`attentionSink=0`（默认）逐位等价于旧版滑动窗口 |
+| **kvShift scale 同步** | — | 锚点感知淘汰时 K/V 与（INT8 下）scale 同步平移，解量化不错位 |
+
+> 核心不变量：远超容量后 `slot[0..K)` 的 K/V 与初次写入**逐位一致**（锚点永不被淘汰）；StreamingLLM 末位 logits 与纯滑动窗口**明显不同**（证明锚点确实被 attend，maxΔ=2.5e-2）；greedy 300 token 同种子可复现、无 NaN/Inf；× KV INT8 末位 maxΔ<2e-4。详见 `scripts/probe-streaming.js`（10 项全绿）。
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -271,14 +284,14 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 |---|---|---|
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
-| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用）/ `kvQuant`（KV 缓存 INT8 量化，8=启用；0=关闭，默认） |
+| `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用）/ `kvQuant`（KV 缓存 INT8 量化，8=启用；0=关闭，默认）/ `attentionSink`（Attention Sink 锚点数，K>0=恒驻首 K 个 token 支持无限上下文流式推理；0=关闭，默认）/ `rollingWindow`（滚动窗口大小，sink>0 时与 SWA `window` 同为滚动边界，默认 256） |
 | `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64},qkNorm:true,logitCap:30}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
 | `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
-| `initKVCache` | `initKVCache(model)` → `{K, V, n}` | 每层 K/V 预分配 `blockSize×D` |
-| `forwardStep` | `forwardStep(model, tokenId, pos, kv)` → `{logits}` | 单 token 增量前向，O(T·D) |
-| `kvShift` | `kvShift(model, kv)` | 滑动窗口：丢弃最旧 token（`copyWithin` 原生 memmove） |
+| `initKVCache` | `initKVCache(model)` → `{K, V, Ks, Vs, n, cap, sink}` | 每层 K/V 预分配 `cap×D`（cap = `attentionSink>0 ? K+R : blockSize`；KV INT8 时附 per-(token,head) `Ks/Vs` scale） |
+| `forwardStep` | `forwardStep(model, tokenId, pos, kv)` → `{logits}` | 单 token 增量前向，O(T·D)；注意力含锚点 `[0,sink)` + 窗口 `[jLo,n)` |
+| `kvShift` | `kvShift(model, kv)` | 缓存淘汰：sink>0 时恒驻锚点、仅平移窗口区；否则整体平移丢弃最旧 token（`copyWithin` 原生 memmove，K/V 与 INT8 scale 同步） |
 | `saveModel` / `loadModel` / `loadTokenizer` | `saveModel(model, tok?)` → JSON | 参数与词表无损持久化（自动携带 tokenizer 类型与 BPE merges） |
 
 ## 项目结构
@@ -300,6 +313,7 @@ flagship-ai/
 ├── scripts/probe-gemma.js    # v10 验证：层交错梯度检验 / 逐层生效 / alt 展开 / 存档量化往返
 ├── scripts/probe-gemma2.js   # v11 验证：QK-norm 恒等式+梯度 / soft-cap 有界+梯度 / 零回归
 ├── scripts/probe-kvquant.js # v12 验证：KV INT8 量化保真 / 误差硬界 / kvShift 同步 / 全组合 / 端到端生成
+├── scripts/probe-streaming.js # v13 验证：Attention Sink / StreamingLLM 锚点不淘汰 / 滚动窗口 / ×KV-INT8 / ×SWA / 确定性
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）
 ├── docs/ARCHITECTURE.md     # 架构文档：公式 / 复杂度 / 反向传播推导
