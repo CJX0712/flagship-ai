@@ -272,6 +272,17 @@ if (FULL) {
   }
 }
 
+/* ---------- 8. 微指令注册中心（L10）覆盖率 ---------- */
+(() => {
+  require('../src/index.js');            // 生产加载路径：填充 globalThis.FlagshipAI
+  const L10 = globalThis.FlagshipAI.L10;
+  const s = L10.stats();
+  const per = L10.DOMAINS.map((d) => `${d} ${s[d].impl}/${s[d].capacity}`).join(' · ');
+  rec('微指令', 'L10 槽位总容量', String(s.total.capacity), '1024', s.total.capacity === 1024);
+  rec('微指令', 'L10 已实现指令数', String(s.total.impl), '≥ 480', s.total.impl >= 480);
+  rec('微指令', '逐域明细', per, 'A/B/C/D/E 各 96', ['A', 'B', 'C', 'D', 'E'].every((d) => s[d].impl === 96));
+})();
+
 /* ---------- 渲染 Markdown ---------- */
 function renderMarkdown() {
   const groups = [];

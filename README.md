@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.1-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.2-blue)](#)
 [![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 192 项已实现）· 浏览器与 Node 双端同码*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 480 项已实现）· 浏览器与 Node 双端同码*
 
 </div>
 
@@ -142,6 +142,27 @@
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
 
+### v15.2 新增（L10 微指令 D 域：注意力基元 96 项）
+
+补齐八域中的 **D 域（注意力基元）**，微指令实现数 **384 → 480**，覆盖注意力计算全链路的原子操作：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **打分与缩放** | D001–D012 | 点积交换/齐次/分配、Cauchy–Schwarz 上界、自点积=‖q‖²、缩放除乘一致、温度单调、YaRN mscale 公式 |
+| **掩码** | D013–D024 | 因果/滑动窗口/padding 构造正确、掩码幂等、窗口单调、与有限偏置可交换、安全 softmax 全掩回退均匀 |
+| **softmax·LSE** | D025–D032 | 行和为一、平移不变、正值、安全版=朴素版、保序、lse 平移公式、softmax=exp(s−lse) |
+| **RoPE** | D033–D044 | 逆频率公式、保范数、R(−p)∘R(p)=I、相对位置不变性、旋转复合、线性、逐对不交叉、det=1 |
+| **ALiBi** | D045–D056 | 斜率几何级数、单调、偏置=−slope·|i−j|、对角为零、非正、对称、非 2 幂头数取最近幂 |
+| **温度与信息量** | D057–D064 | 温度除乘一致、熵上界 log n、熵随温度单调、均匀分布取上界、CE=−log p[t]、CE≥0、KL≥0、JS 对称 |
+| **GQA/MQA** | D065–D078 | q→kv 头映射、组大小、MQA/MHA 退化、值域合法、映射单调、覆盖性、重复 KV 逐位一致、拼接维度守恒 |
+| **KV Cache** | D079–D096 | 追加递增、行读取一致、容量截断、滚动丢弃最旧非锚点、**sink 永不淘汰**、K/V 长度同步、清空、写不覆盖、行地址、INT8 往返硬界、长位置外推有限 |
+
+同时为 D 域新增两个输入域标签 `vecMask`（掩码 0/1 向量）与 `vecProb`（归一化为概率单纯形）、`factor1`（外推因子 ≥1，避免 mscale 开负根）。
+
+**不变量设计的两条纪律**（本批落地时被验证有效）：
+1. **交叉验证**：每条 `predicate` 都走与 `run` 不同的参考路径（如 run 正向累加、predicate 反向累加），不搞「自证」。
+2. **前置条件式放行**：涉及头数/长度合法性的项，inputs 不合法时显式放行并在 `invariant` 文本写明前置条件——不靠放宽容差制造假绿。
+
 ### v15.1 新增（十层分解架构实拆 + 浏览器双端同码）
 
 引擎从「单体」拆成十层可验证积木，并把「双端一致」从口号变成**逐位可测**的硬门禁：
@@ -155,9 +176,9 @@
 | **L7 张量与内存** | `src/L7-tensor/*`：tensor / shape / arena（指针碰撞分配）/ kv-cache |
 | **L8 数值内核** | `src/L8-kernel/*`：matmul / reduce / quantize —— 与 legacy **逐位一致**（Δ=0），R9 契约 |
 | **L9 数值基础** | `src/L9-numbase/*`：rng（mulberry32 与 v11 同款）/ fp-ops / special / assert |
-| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**192 项已实现**（A 96 + C 96），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
-| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 38 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
-| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · C 96/128 · 合计 192/1024），不拿桩充数 |
+| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**480 项已实现**（A 96 + B 96 + C 96 + D 96 + E 96），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
+| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 56 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
+| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · B 96/128 · C 96/128 · D 96/128 · E 96/128 · 合计 480/1024），不拿桩充数 |
 
 > **修复（历史事故）**：v12.0–v14.0 期间 `build-demo.js` 误把 6 行 Node shim（`module.exports = require(...)`）内联进 `demo.html`，浏览器 classic script 执行到 `require` 即 `ReferenceError` —— 连续三个版本 demo 全坏却无人察觉（Node 侧测试全绿掩盖了浏览器断裂）。v15.1 三处根治：① 构建期硬校验（shim 特征检测 + `GPTModel` 存在性断言，不符即 exit 1）；② 改为内联完整十层栈，浏览器与 Node 同码；③ 新增 `scripts/probe-demo.js` 无头门禁，把该类事故变成 CI 可检测失败。
 
@@ -165,10 +186,10 @@
 
 | 门禁 | 命令 | 项数 |
 |---|---|---|
-| 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 192 实现计数诚实 · 192 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
+| 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 480 实现计数诚实且与 `isa.js` 交叉一致 · 480 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
 | 浏览器装配门禁 | `npm run test:demo` | 9 项全绿（脚本块无异常 · 34 键一致 · L3–L10 挂载 · L10 容量双端一致 · 自检套件就位 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性） |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
-| 性质测试 | `npm run test:layers` | A/C 域每项 ≥120 例 fast-check 任意子谓词检验 |
+| 性质测试 | `npm run test:layers` | A/B/C/D/E 五域每项 ≥120 例 fast-check 任意子谓词检验 |
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -354,7 +375,7 @@ flagship-ai/
 │   ├── L7-tensor/           # 张量与内存：tensor / shape / arena / kv-cache
 │   ├── L8-kernel/           # 数值内核：matmul / reduce / quantize（与 legacy 逐位一致）
 │   ├── L9-numbase/          # 数值基础：rng / fp-ops / special / assert
-│   └── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（192 项已实现）
+│   └── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（480 项已实现）
 ├── tests/                   # node:test + fast-check 性质测试（L3–L10 各层）
 ├── scripts/build-demo.js    # 把十层栈+套件+应用内联进 demo.html（mini-require 双端同码）
 ├── scripts/isa.js           # 微指令覆盖率 CLI（逐域 impl/capacity 断言）
@@ -369,7 +390,7 @@ flagship-ai/
 ├── scripts/probe-kvquant.js # v12 验证：KV INT8 量化保真 / 误差硬界 / kvShift 同步 / 全组合 / 端到端生成
 ├── scripts/probe-streaming.js # v13 验证：Attention Sink / StreamingLLM 锚点不淘汰 / 滚动窗口 / ×KV-INT8 / ×SWA / 确定性
 ├── scripts/probe-yarn.js      # v14 验证：YaRN 频率插值 / mscale / 梯度检验 / 长上下文外推 / 零回归
-├── scripts/probe-microisa.js # v15 门禁：L10 1024 槽位 / 192 实现诚实计数 / 不变量抽查 / 引擎零影响
+├── scripts/probe-microisa.js # v15 门禁：L10 1024 槽位 / 480 实现诚实计数 / 不变量抽查 / 引擎零影响
 ├── scripts/probe-demo.js     # v15 门禁：demo.html 浏览器装配无头验证 + 前向双端逐位一致
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）

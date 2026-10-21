@@ -549,11 +549,11 @@ logits = LN_f(x)·Wteᵀ
 
 ---
 
-## 9. 十层分解架构与浏览器装配（v15.1）
+## 9. 十层分解架构与浏览器装配（v15.2）
 
 ### 9.1 分层现状
 
-| 层 | 目录 | 责任 | 状态（v15.1） |
+| 层 | 目录 | 责任 | 状态（v15.2） |
 |---|---|---|---|
 | L1 应用 | `src/app.js` | 语料编辑 / 训练 / 曲线 / 生成 UI | 仅浏览器 |
 | L2 | — | （规划中） | 未拆 |
@@ -564,7 +564,7 @@ logits = LN_f(x)·Wteᵀ
 | L7 张量与内存 | `src/L7-tensor/*` | tensor / shape / arena / kv-cache | 已拆 |
 | L8 数值内核 | `src/L8-kernel/*` | matmul / reduce / quantize | 已拆（与 legacy 逐位一致，Δ=0） |
 | L9 数值基础 | `src/L9-numbase/*` | rng / fp-ops / special / assert | 已拆 |
-| L10 微指令 | `src/L10-microisa/*` | 1024 槽位注册中心 + 七件套微指令（八域 × 128） | 192/1024 已实现（A 96 + C 96） |
+| L10 微指令 | `src/L10-microisa/*` | 1024 槽位注册中心 + 七件套微指令（八域 × 128） | 480/1024 已实现（A 96 + B 96 + C 96 + D 96 + E 96） |
 
 - **装配真源**：`src/namespace.js` 的 `__loadOrder`（自底向上 L10 → L9 → … → L3），Node 侧 `src/index.js` 与浏览器侧 `scripts/build-demo.js` 共读，杜绝两端顺序漂移。
 - **层红线（K5）**：`src/L*` 禁 `require( / module.exports / import / export / fetch( / new Worker / XMLHttpRequest / Math.random / Date.now`（`scripts/lint-layers.js` 硬门禁）——保证层文件可被浏览器 `file://` 内联且确定性可复现。
@@ -594,16 +594,37 @@ demo.html
 | 门禁 | 命令 | 覆盖 |
 |---|---|---|
 | 零回归 R1–R10 | `npm run regression` | v11 ↔ 当前 导出清单/logits/grads/train/generate/算子逐位一致 |
-| 微指令门禁 | `npm run test:L10`（`scripts/probe-microisa.js`） | 1024 容量 · 192 实现计数诚实 · 192×2 种子不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响（K15 34 键） |
-| 性质测试 | `npm run test:layers`（`node --test` + fast-check） | A/C 域每项 ≥120 例任意子谓词检验 |
+| 微指令门禁 | `npm run test:L10`（`scripts/probe-microisa.js`） | 1024 容量 · 480 实现计数诚实且与 `isa.js` 交叉一致 · 480×2 种子不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响（K15 34 键） |
+| 性质测试 | `npm run test:layers`（`node --test` + fast-check） | A/B/C/D/E 五域每项 ≥120 例任意子谓词检验 |
 | 浏览器装配 | `npm run test:demo`（`scripts/probe-demo.js`） | 脚本块无异常 · 34 键一致 · L3–L10 挂载 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性 |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
 
-### 9.4 事故记录：demo.html 浏览器损坏（v12.0–v14.0）
+### 9.4 D 域（注意力基元）分解
+
+D 域 96 项按注意力数据流切成八个子域，每个子域 12–18 项：
+
+| 子域 | 槽位 | 内容 |
+|---|---|---|
+| 打分与缩放 | D001–D012 | 点积、缩放点积、Cauchy–Schwarz、温度单调、YaRN mscale |
+| 掩码 | D013–D024 | 因果 / 滑动窗口 / padding、掩码幂等、单调、与偏置可交换、安全 softmax 回退 |
+| softmax·LSE | D025–D032 | 行和为一、平移不变、安全=朴素、保序、lse 平移、softmax=exp(s−lse) |
+| RoPE | D033–D044 | 逆频率、保范、可逆、相对不变、复合、线性、逐对、det=1 |
+| ALiBi | D045–D056 | 斜率级数、单调、偏置公式、对角零、非正、对称、非 2 幂 |
+| 温度与信息量 | D057–D064 | 温度一致、熵上界、熵单调、均匀取上界、CE、KL≥0、JS 对称 |
+| GQA/MQA | D065–D078 | 头映射、组大小、退化、值域、单调、覆盖、重复 KV、拼接守恒 |
+| KV Cache | D079–D096 | 追加、读取、截断、滚动淘汰、sink 保护、同步、清空、地址、INT8 界 |
+
+新增输入域标签（`src/L10-microisa/invariant.js` 的 `TAGS`）：
+
+- `vecMask`：`kind:'vector'`，元素 ∈ {0,1}，用于 padding / sink 掩码输入。
+- `vecProb`：`kind:'vector'` + `normalize:true`，采样后投影到概率单纯形（和为 1），供权重类不变量使用。
+- `factor1`：`kind:'scalar'`，`min=1`，用于 YaRN 外推因子——**必须 ≥1**，否则 `mscale(f)=√(1+0.1·ln f)` 会开负根得 NaN。
+
+### 9.5 事故记录：demo.html 浏览器损坏（v12.0–v14.0）
 
 - **现象**：`build-demo.js` 直接内联 `src/flagship-engine.js`（6 行 Node shim：`module.exports = require('./legacy/...')`），浏览器 classic script 执行到 `require` 即 `ReferenceError`，`demo.html` 整体不可用（连续三个版本无人察觉）。
 - **根因**：构建脚本缺少「产物是否真能在浏览器跑」的判据；Node 侧测试全部通过，掩盖了浏览器侧断裂。
-- **修复**（v15.1）：
+- **修复**（v15.1，v15.2 沿用）：
   1. 构建期硬校验：检测到 shim 特征即改内联 legacy 本体，并断言 `GPTModel` 存在，否则 exit 1；
   2. 改为内联**完整十层栈**（mini-require），浏览器与 Node 跑同一份装配代码；
   3. 新增 `scripts/probe-demo.js` 无头门禁（CI 硬门禁），把该类事故变成可检测失败；

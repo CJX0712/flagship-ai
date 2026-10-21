@@ -43,6 +43,11 @@ NS.__loadOrder = [
   './L10-microisa/E-shape-000.js',
   './L10-microisa/E-shape-001.js',
   './L10-microisa/E-shape-002.js',
+  // L10 · D 域（注意力基元，96 项）：打分/缩放、掩码、softmax·LSE、
+  //   RoPE、ALiBi、温度与信息量、GQA/MQA 头映射、KV Cache 基元。
+  './L10-microisa/D-attention-000.js',
+  './L10-microisa/D-attention-001.js',
+  './L10-microisa/D-attention-002.js',
   // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
   './L7-tensor/tensor.js',
   './L7-tensor/shape.js',

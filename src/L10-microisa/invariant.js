@@ -49,6 +49,12 @@
     vecNonNeg:   { kind: 'vector', min: 0, max: 10, defLen: 8 },
     vecPos:      { kind: 'vector', min: 1e-3, max: 10, defLen: 8, nonZero: true },
     vecUnit:     { kind: 'vector', min: 0, max: 1, defLen: 8 },
+    // 掩码（D 域 padding）：元素 ∈ {0,1}，整数采样后无需归一
+    vecMask:     { kind: 'vector', integer: true, min: 0, max: 1, defLen: 8 },
+    // 概率向量（D 域 attention 权重）：非负采样后归一化为和为 1 的单纯形点
+    vecProb:     { kind: 'vector', min: 0, max: 1, defLen: 8, normalize: true },
+    // 外推因子（D 域 YaRN/mscale）：必须 ≥1，否则 mscale 的 1+0.1·ln(f) 可能开负根
+    factor1:     { kind: 'scalar', min: 1, max: 64 },
     // 形状（E 域）：kind 'shape'，defLen = 维度个数，每个维度 ∈ [min,max] 的正整数
     shape2:      { kind: 'shape', defLen: 2, min: 1, max: 8 },
     shape3:      { kind: 'shape', defLen: 3, min: 1, max: 8 },
@@ -89,6 +95,13 @@
   function genVector(rng, n, tag) {
     const out = new Float64Array(n);
     for (let i = 0; i < n; i++) out[i] = genScalar(rng, tag);
+    const t = TAGS[tag] || TAGS.small;
+    if (t.normalize && n > 0) {                 // 投影到概率单纯形
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += Math.abs(out[i]);
+      if (sum > 0) for (let i = 0; i < n; i++) out[i] /= sum;
+      else out[0] = 1;                          // 退化：one-hot 首元素
+    }
     return out;
   }
 
