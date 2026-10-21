@@ -48,6 +48,11 @@ NS.__loadOrder = [
   './L10-microisa/D-attention-000.js',
   './L10-microisa/D-attention-001.js',
   './L10-microisa/D-attention-002.js',
+  // L10 · F 域（归一化基元，96 项）：均值/方差/L2 范数、LayerNorm/RMSNorm、
+  //   BatchNorm/GroupNorm/权重标准化/LRN、min-max/z-score/L1/L∞ 归一化。
+  './L10-microisa/F-norm-000.js',
+  './L10-microisa/F-norm-001.js',
+  './L10-microisa/F-norm-002.js',
   // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
   './L7-tensor/tensor.js',
   './L7-tensor/shape.js',
