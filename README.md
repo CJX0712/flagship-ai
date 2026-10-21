@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.3-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.5-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-864%2F1024-blue)](#十层分解架构落地状态)
@@ -163,26 +163,54 @@
 
 同时为 D 域新增两个输入域标签 `vecMask`（掩码 0/1 向量）与 `vecProb`（归一化为概率单纯形）、`factor1`（外推因子 ≥1，避免 mscale 开负根）。
 
-### v15.3 新增（L10 微指令 F/G/H 三域：归一化 / 激活与损失 / 采样与量化 384 项）
+### v15.5 新增（L10 微指令 H 域：采样与量化 128 项 + F/G 补满 128 + 三处 latent 修复）
 
-补齐八域中的 **F（归一化）、G（激活与损失）、H（采样与量化）** 三域，微指令实现数 **480 → 864**（八域 × 128 容量，A–E 各 96 已落地 + F/G/H 各 128 新落地）。三域覆盖训练与推理链路的归一化、激活、损失、采样、量化全原子操作：
+补齐八域最后一域 **H（采样与量化）** 并将 F/G 由 96 补满至 128，微指令实现数 **672 → 864**（A–E 各 96 + F/G/H 各 128）。F097–F128（logsumexp 高级/数值稳定、矩阵/批/高级归一化）、G097–G128（数值稳定交叉熵、温度缩放、Gumbel-softmax、加权 CE 等）与 H 全域由 T06 一次落地：
 
 | 子域 | 指令 | 代表不变量 |
 |---|---|---|
-| **F 向量统计·范数** | F001–F032 | 均值/方差无偏、L1/L2/L∞ 范数三角不等式、标准化零均值单位方差、Softmax 行和=1 平移不变 |
-| **F 中心化·标准化·归一** | F033–F064 | min/max/arg 单调、z-score 可逆、层归一化 β/γ 恒等、RMSNorm=γ·x/√(mean(x²)+ε) |
-| **F softmax·层归一化家族** | F065–F096 | LogSoftmax=Softmax−LSE、稳定 softmax 减最大值、Instance/Group/BatchNorm 均值方差守恒 |
-| **F logsumexp·高级归一** | F097–F128 | LSE 上界/平移公式、BatchNorm 训练=推理一致、动量更新、数值稳定交叉熵 |
-| **G 基础激活·导数** | G001–G032 | ReLU 分段、Sigmoid/Softplus 平滑、Tanh 有界、Swish/GELU、导数恒等式 |
-| **G 损失·性质** | G033–G064 | MSE=½‖·‖²、CE=−log p[t]、KL≥0、JS 对称、BCE 单调、Focal 减权易分样本 |
-| **G 相似度·注意力损失** | G065–G096 | 余弦相似度有界、Pearson 去均值、MAE/L1、Huber 分段、对比损失、Triplet  margin |
-| **G 数值稳定·高级** | G097–G128 | 稳定交叉熵=LogSoftmax−log p、温度缩放 Σ=1、Gumbel-softmax 单调收敛、加权 CE |
 | **H 确定性采样·top-k/p** | H001–H032 | argmax 唯一、categorical 采样分布一致、top-k 截断 Σ=1、nucleus 累积覆盖、Gumbel-max 重参数 |
 | **H 温度·舍入** | H033–H064 | 温度除 logits、温度后 softmax Σ=1、温度保序、低温锐化熵不增、各类舍入（四舍五入/向上/向下/截断/银行家） |
 | **H INT8 对称·仿射** | H065–H096 | 对称量化 round(x/s)、仿射量化逐通道 scale/zero、反量化误差界、饱和裁剪、per-channel 守恒 |
 | **H 量化性质·高级** | H097–H128 | 量化单调、zero-point 往返、动态/静态量化、端到端 KL 有界、混合精度 |
 
-三域 predicate 采用「缩放 logit 精确序 + 可解析性守卫」处理极端温度/幅值下的 softmax 数值饱和（双零 tie），避免严格输出序比较的假阳性，同时保留对真正乱序/常量输出回归的检测力。
+**三处 latent predicate 失败已修复**（G087 gumbel-softmax 单调 / G093 温度缩放概率单调 / H041 温度保序）：极端温度（如 T=0.0167）或大幅值 logits（如 9232）下，多个相异 logit 经 x/T 后都坠入 softmax 浮点下溢尾部（二者均≈0），严格输出序比较对数学上应为严格大于的一对失效（双零 tie）。修复为「缩放 logit 精确序 + 可解析性守卫」——softmax(z/T)_i > softmax(z/T)_j ⇔ (z_i−m)/T > (z_j−m)/T（T>0 恒精确），仅当 si−sj>1e-6 且 si>−740（未坠入下溢尾部）时才断言严格输出序：既消除假阳性，又保留对真正乱序/常量输出回归的检测力。2500 种子确定性扫描复验 0 失败。
+
+### v15.4 新增（L10 微指令 G 域：激活与损失 96 项）
+### v15.4 新增（L10 微指令 G 域：激活与损失 96 项）
+
+补齐八域中的 **G 域（激活与损失）**，微指令实现数 **576 → 672**，覆盖激活函数族与损失函数族的全链路原子操作：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **基础激活** | G001–G032 | sigmoid 单调·界·对合·logit、tanh 奇/界/双曲、ReLU 非负·正区恒等·稀疏、LeakyReLU 分情况、PReLU 仿射、ELU 连续·负区有界·阈值、Softplus 凸·正·非负·上界(ln2+max(0,x))、Softsign 奇·界·定点、HardTanh 三分段·饱和 |
+| **现代激活** | G033–G048 | GELU/Swish/Mish 正支单调增·非负·上界、SELU 缩放·不动点·与 ELU 关系、HardSigmoid 三定点·界、LogSumExp 平滑最大值·上界·坐标平移、Softmax 解析归一·行和为 1·坐标单调、LogSoftmax 与 log(softmax) 一致 |
+| **损失函数** | G049–G096 | MSE 对称·非负·常数差、MAE 分段梯度、Huber 连续·分界、SmoothL1 连续、BCE 0/1 极值·凸、BCE-logits 数值稳定·与 BCE 一致、CE 非负·one-hot 退化、CE-logits 平移不变·数值稳定、KL 非负·0 当且仅当同分布、Focal 减权易分·γ=0 退化 CE |
+
+**关键的数学纪律**（与 F 域一脉相承）：
+- **解析性质优先于浮点拟合**：softmax 行和=1、KL≥0、CE≥0、softplus 上界等为精确恒等式/不等式，predicate 走独立参考路径（硬编码定点 / 不同公式 / 解析推导），不靠放宽容差造假绿。
+- **真实数值 bug 已修复**：`ceLogits` 的 log-sum-exp 原误写为 `log(m + Σexp(zᵢ−m))`（漏外层 m），致 LSE 偏小、CE-logits 出现负值；修正为 `m + log(Σexp(zᵢ−m))` 后，CE-logits 严格≥0 且平移不变。独立校验脚本（4 种子 × 80 例 = 30720 次）全过。
+
+> 修复：独立校验在接入主链路前抓出 1 处真实数值 bug（CE-logits 的 logsumexp 漏外层 m）+ 多处性质/容差错误（softplus 上界、gelu/mish 非全局单调、softmax 坐标单调、bce/ce 的 0·log0 保护等）。
+
+### v15.3 新增（L10 微指令 F 域：归一化 96 项）
+
+补齐八域中的 **F 域（归一化）**，微指令实现数 **480 → 576**，覆盖归一化族的全链路原子操作：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **均值** | F001–F012 | 定义/反向累加一致、与顺序无关、线性、齐次、平移、矩阵按行·按列、极值界、与求和关系 |
+| **方差与标准差** | F013–F024 | 总体方差两遍法/简化公式一致、平移不变、齐次（a²）、样本方差 Bessel 校正、标准差非负、切比雪夫样本界 |
+| **L2 范数与单位化** | F025–F032 | 定义/反向累加一致、齐次（|a|）、三角不等式、非负、单位化长度=1、与缩放无关、保持方向 |
+| **LayerNorm** | F033–F048 | 无仿射零均值、方差解析 Var/(Var+ε)、平移不变、仿射 γ·β 作用、矩阵逐行独立、退化情形、符号保持 |
+| **RMSNorm** | F049–F064 | 定义/rms 部分/输出 rms、矩阵、与 LN 零均值相等、仿射 γ·β、符号保持、范数保持、与 LN 差异、平移改变输出 |
+| **BatchNorm** | F065–F080 | 按列均值/方差/前向/零均值/单位方差/仿射/平移不变/跨样本耦合/与 LN 区别/常数通道→β/全零→β/转置 LN 对偶 |
+| **GroupNorm/IN/WS** | F081–F089 | 定义/零均值/单位方差/仿射/G=1→InstanceNorm/G=D→β/与 BN 区别/权重标准化≡LN 按行 |
+| **LRN 与经典归一化** | F090–F096 | LRN 定义/单调/有限、min-max/z-score/L1/L∞ 归一化 |
+
+**关键的「非尺度齐次」纪律**：LayerNorm/RMSNorm/BatchNorm 的分母含数据相关方差，整体缩放后输出**不**满足简单齐次式。本批所有涉及缩放的不变量一律走「独立参考路径交叉验证」或「解析期望」（如 BatchNorm 单位方差=σ²/(σ²+ε)），绝不写伪齐性式——这是 F 域与 B/C 域最本质的数学差异。
+
+> 修复：独立校验脚本在接入主链路前抓出 2 处 bug——F031 域误用 `nonZero`（含负，单位化方向翻转）改 `smallPos`；F083 predicate 错误复用输出均值当作输入均值，改为独立计算输入组均值。两处修复后经 4 种子 × 80 例（30720 次）抽样全过。
 
 **不变量设计的两条纪律**（本批落地时被验证有效）：
 1. **交叉验证**：每条 `predicate` 都走与 `run` 不同的参考路径（如 run 正向累加、predicate 反向累加），不搞「自证」。
@@ -202,7 +230,7 @@
 | **L8 数值内核** | `src/L8-kernel/*`：matmul / reduce / quantize —— 与 legacy **逐位一致**（Δ=0），R9 契约 |
 | **L9 数值基础** | `src/L9-numbase/*`：rng（mulberry32 与 v11 同款）/ fp-ops / special / assert |
 | **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**864 项已实现**（A–E 各 96 + F 128 + G 128 + H 128），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
-| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 56 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
+| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 67 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
 | **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · B 96/128 · C 96/128 · D 96/128 · E 96/128 · F 128/128 · G 128/128 · H 128/128 · 合计 864/1024），不拿桩充数 |
 
 > **修复（历史事故）**：v12.0–v14.0 期间 `build-demo.js` 误把 6 行 Node shim（`module.exports = require(...)`）内联进 `demo.html`，浏览器 classic script 执行到 `require` 即 `ReferenceError` —— 连续三个版本 demo 全坏却无人察觉（Node 侧测试全绿掩盖了浏览器断裂）。v15.1 三处根治：① 构建期硬校验（shim 特征检测 + `GPTModel` 存在性断言，不符即 exit 1）；② 改为内联完整十层栈，浏览器与 Node 同码；③ 新增 `scripts/probe-demo.js` 无头门禁，把该类事故变成 CI 可检测失败。

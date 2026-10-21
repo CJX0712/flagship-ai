@@ -1,401 +1,330 @@
 /* ============================================================================
- * L10 微指令 · F 域（归一化）· 第 2/4 批（F033–F064）
+ * L10 微指令 · F 域（归一化）· 第 2/3 批（F033–F064）
  * ----------------------------------------------------------------------------
- * 所属层：L10-microIsa  域：F（归一化）
- * 允许依赖的层：L9（special/fpOps）、L10（registry/invariant）
- * 主要 @ref：Goodfellow et al. (2016) Deep Learning；Ba et al. (2016) LayerNorm；
- *           Welford (1962) 递推算法；Hyndman & Fan (1996) 分位数
+ * 子域划分：
+ *   F033–F048 LayerNorm（无仿射定义 / 零均值 / 方差 / 平移不变 / 仿射 / 矩阵按行）
+ *   F049–F064 RMSNorm（LLaMa 风格 x/√mean(x²)⊙γ：定义 / rms 部分 / 矩阵 / 与 LN 关系）
  *
- * 涵盖：min/max/arg（F033–F048）、中心化/标准化（F049–F064）。
- * ═══════════════════════════════════════════════════════════════════════ */
+ * 关键数学点：LayerNorm 与 RMSNorm 均非尺度齐次（分母含数据相关的方差/均方），
+ * 故所有涉及缩放的不变量一律改用「独立参考路径交叉验证」或「解析期望」，
+ * 不写伪齐次式。eps = 1e-5（与主流框架默认一致）。
+ * ==========================================================================*/
 ;(function (NS) {
   'use strict';
   NS.L10 = NS.L10 || {};
+  const rc = NS.L10.relClose;
   function reg(i, o) { NS.L10.register('F', i, o); }
-  const rc = (a, b, t) => NS.L10.relClose(a, b, t);
+  const EPS = 1e-5;
 
-  function sum(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s; }
-  function mean(a) { return sum(a) / a.length; }
-  function meanSq(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return s / a.length; }
-  function variance(a) { const m = mean(a); let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - m; s += d * d; } const v = s / a.length; return v < 0 ? 0 : v; }
-  function maxAbs(a) { let m = 0; for (let i = 0; i < a.length; i++) { const v = Math.abs(a[i]); if (v > m) m = v; } return m; }
-  function maxEl(a) { let m = -Infinity; for (let i = 0; i < a.length; i++) if (a[i] > m) m = a[i]; return m; }
-  function minEl(a) { let m = Infinity; for (let i = 0; i < a.length; i++) if (a[i] < m) m = a[i]; return m; }
-  function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
-  function median(a) { const s = Array.prototype.slice.call(a).sort((p, q) => p - q); const n = s.length; if (n % 2) return s[(n - 1) / 2]; return (s[n / 2 - 1] + s[n / 2]) / 2; }
-  function lse(v) { let m = -Infinity; for (let i = 0; i < v.length; i++) if (v[i] > m) m = v[i]; let s = 0; for (let i = 0; i < v.length; i++) s += Math.exp(v[i] - m); return m + Math.log(s); }
-  function zeros(n) { return new Float64Array(n); }
+  /* ---------- 内部工具 ---------- */
+  const sq = (M) => Math.round(Math.sqrt(M.length));
+  function mean(a, n) { let s = 0; for (let i = 0; i < n; i++) s += a[i]; return s / n; }
+  function meanRev(a, n) { let s = 0; for (let i = n - 1; i >= 0; i--) s += a[i]; return s / n; }
+  function sumSq(a, n) { let s = 0; for (let i = 0; i < n; i++) s += a[i] * a[i]; return s; }
+  function sumSqRev(a, n) { let s = 0; for (let i = n - 1; i >= 0; i--) s += a[i] * a[i]; return s; }
+  function varPop(a, n) { const m = mean(a, n); let s = 0; for (let i = 0; i < n; i++) { const d = a[i] - m; s += d * d; } return s / n; }
+  function varPopRef(a, n) { const m = meanRev(a, n); const ss = sumSqRev(a, n); return Math.max(0, ss / n - m * m); }
+  function l2(a, n) { return Math.sqrt(sumSq(a, n)); }
 
-  // 矩阵工具（行优先 r×c）
-  function mRowMean(M, r, c, i) { let s = 0; for (let j = 0; j < c; j++) s += M[i * c + j]; return s / c; }
-  function mColMean(M, r, c, j) { let s = 0; for (let i = 0; i < r; i++) s += M[i * c + j]; return s / r; }
-  function mMean(M, r, c) { let s = 0; for (let k = 0; k < r * c; k++) s += M[k]; return s / (r * c); }
+  // LayerNorm 无仿射（中心化 + 缩放）
+  function lnRow(x, n, eps) { const m = mean(x, n), v = varPop(x, n), inv = 1 / Math.sqrt(v + eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = (x[i] - m) * inv; return o; }
+  function lnRowRef(x, n, eps) { const m = meanRev(x, n), v = varPopRef(x, n), inv = 1 / Math.sqrt(v + eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = (x[i] - m) * inv; return o; }
+  // LayerNorm 仿射
+  function lnAffine(x, n, g, b, eps) { const z = lnRow(x, n, eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = (b ? b[i] : 0) + (g ? g[i] : 1) * z[i]; return o; }
+  function lnAffineRef(x, n, g, b, eps) { const z = lnRowRef(x, n, eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = (b ? b[i] : 0) + (g ? g[i] : 1) * z[i]; return o; }
+  // RMSNorm 无仿射（LLaMa：x/√mean(x²)）
+  function rnRow(x, n, eps) { const inv = 1 / Math.sqrt(sumSq(x, n) / n + eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[i] * inv; return o; }
+  function rnRowRef(x, n, eps) { const inv = 1 / Math.sqrt(sumSqRev(x, n) / n + eps); const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[i] * inv; return o; }
 
-  function mk(i, meta, run, pred) {
-    const def = Object.assign({}, meta);
-    def.run = run;
-    def.predicate = function () { return pred.apply(null, Array.prototype.slice.call(arguments).concat([run])); };
-    reg(i, def);
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // 类别 3 · min/max/arg（F033–F048）
-  // ═══════════════════════════════════════════════════════════════════════
-  mk(33, {
-    name: '向量最小值', intuition: '最小值是所有元素中的最小者。',
-    math: 'min = minᵢ xᵢ', pseudocode: 'return min(x)', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '浮点 −0 与 0 不应区分。',
-    invariant: 'run = minᵢ xᵢ',
+  // ══ LayerNorm（F033–F048）══════════════════════════════════════════
+  reg(33, {
+    name: 'LayerNorm · 定义（无仿射）', intuition: '逐样本归一化：减均值除标准差，使每样本零均值、近似单位方差。',
+    math: 'zᵢ = (xᵢ − μ)/√(Var+ε)', pseudocode: 'm=mean(x); v=var(x); return (x-m)/sqrt(v+eps)',
+    complexity: 'O(n)', ref: 'Ba et al. 2016 (LayerNorm)', commonPitfall: 'ε 防零方差除零；数值法用两遍求方差。',
+    invariant: '逐元素 relClose(正向, 反向累加+Σx²/n−μ² 参考, 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return minEl(x); },
-    function pred(x, run) { const out = run(x); return out === minEl(x); }
-  );
-
-  mk(34, {
-    name: '向量最大值', intuition: '最大值是所有元素中的最大者。',
-    math: 'max = maxᵢ xᵢ', pseudocode: 'return max(x)', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '浮点 −0 与 0 不应区分。',
-    invariant: 'run = maxᵢ xᵢ',
+    run: (x) => lnRow(x, x.length, EPS),
+    predicate: (x) => rc(lnRow(x, x.length, EPS), lnRowRef(x, x.length, EPS), 1e-9),
+  });
+  reg(34, {
+    name: 'LayerNorm · 零均值性', intuition: '归一化后输出均值恰为 0（这是标准化的定义性后果）。',
+    math: 'mean(LN(x)) = 0', pseudocode: 'return mean(LN(x))',
+    complexity: 'O(n)', ref: '标准化', commonPitfall: '浮点下中心化误差 ~1e-13，容差 1e-9 足够。',
+    invariant: 'relClose(mean(out), 0, 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return maxEl(x); },
-    function pred(x, run) { const out = run(x); return out === maxEl(x); }
-  );
-
-  mk(35, {
-    name: 'argmin（最小索引）', intuition: '返回首个最小值所在下标。',
-    math: 'argmin = argminᵢ xᵢ', pseudocode: 'return first index of min', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '并列时取首个。',
-    invariant: 'x[run] = min(x) 且 run 为合法下标',
+    run: (x) => lnRow(x, x.length, EPS),
+    predicate: (x) => rc(mean(lnRow(x, x.length, EPS), x.length), 0, 1e-9),
+  });
+  reg(35, {
+    name: 'LayerNorm · 方差（解析期望）', intuition: '归一化后方差恰为 Var/(Var+ε)，而非恒为 1——ε 会略微压低。',
+    math: 'Var(out) = Var/(Var+ε)', pseudocode: 'return var(out)',
+    complexity: 'O(n)', ref: '标准化', commonPitfall: '误以为输出方差恒为 1；ε 存在时偏离，须比对解析值。',
+    invariant: 'relClose(Var(out), Var/(Var+ε), 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let m = Infinity, idx = 0; for (let i = 0; i < x.length; i++) if (x[i] < m) { m = x[i]; idx = i; } return idx; },
-    function pred(x, run) { const out = run(x); const m = minEl(x); if (out < 0 || out >= x.length) return false; if (!rc(x[out], m, 1e-12)) return false; for (let j = 0; j < x.length; j++) if (x[j] < x[out] - 1e-12) return false; return true; }
-  );
-
-  mk(36, {
-    name: 'argmax（最大索引）', intuition: '返回首个最大值所在下标。',
-    math: 'argmax = argmaxᵢ xᵢ', pseudocode: 'return first index of max', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '并列时取首个。',
-    invariant: 'x[run] = max(x) 且 run 为合法下标',
+    run: (x) => lnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, out = lnRow(x, n, EPS), v = varPop(x, n); return rc(varPop(out, n), v / (v + EPS), 1e-9); },
+  });
+  reg(36, {
+    name: 'LayerNorm · 平移不变', intuition: '整体加常数不改变离散结构，归一化结果不变。',
+    math: 'LN(x+c) = LN(x)', pseudocode: 'return LN(shift(x,c))',
+    complexity: 'O(n)', ref: '平移不变性', commonPitfall: 'ε 与 c 无关，故严格相等。',
+    invariant: '逐元素 relClose(LN(x+c), LN(x), 1e-9)',
+    inputs: ['x', 'c'], domains: { x: 'vecSmall', c: 'small' },
+    run: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return lnRow(t, x.length, EPS); },
+    predicate: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return rc(lnRow(t, x.length, EPS), lnRow(x, x.length, EPS), 1e-9); },
+  });
+  reg(37, {
+    name: 'LayerNorm · 仿射定义', intuition: '标准 LN 带可学习缩放 γ 与偏移 β：y = γ⊙z + β。',
+    math: 'yᵢ = γᵢ·zᵢ + βᵢ', pseudocode: 'z=LN(x); return gamma*z + beta',
+    complexity: 'O(n)', ref: 'Ba et al. 2016', commonPitfall: 'γ/β 须与 x 等长。',
+    invariant: '逐元素 relClose(正向仿射, 反向累加参考仿射, 1e-9)',
+    inputs: ['x', 'g', 'b'], domains: { x: 'vecSmall', g: 'vecSmall', b: 'vecSmall' },
+    run: (x, g, b) => lnAffine(x, x.length, g, b, EPS),
+    predicate: (x, g, b) => rc(lnAffine(x, x.length, g, b, EPS), lnAffineRef(x, x.length, g, b, EPS), 1e-9),
+  });
+  reg(38, {
+    name: 'LayerNorm · 仿射 β 偏移', intuition: '偏移 β 只把输出整体平移 β，与归一化部分无关（γ=1）。',
+    math: 'y(x,β₂) − y(x,β₁) = β₂ − β₁', pseudocode: 'return LNaffine(b2) - LNaffine(b1)',
+    complexity: 'O(n)', ref: '仿射分解', commonPitfall: '无',
+    invariant: '逐元素 relClose(Δout, Δβ, 1e-9)',
+    inputs: ['x', 'b1', 'b2'], domains: { x: 'vecSmall', b1: 'vecSmall', b2: 'vecSmall' },
+    run: (x, b1, b2) => { const a = lnAffine(x, x.length, null, b1, EPS), c = lnAffine(x, x.length, null, b2, EPS), o = new Float64Array(x.length); for (let i = 0; i < x.length; i++) o[i] = c[i] - a[i]; return o; },
+    predicate: (x, b1, b2) => { const a = lnAffine(x, x.length, null, b1, EPS), c = lnAffine(x, x.length, null, b2, EPS); for (let i = 0; i < x.length; i++) if (!rc(c[i] - a[i], b2[i] - b1[i], 1e-9)) return false; return true; },
+  });
+  reg(39, {
+    name: 'LayerNorm · 仿射 γ 作用', intuition: 'γ=1,β=0 的输出与 γ=0,β=0 的输出之差，恰为无仿射归一化 z。',
+    math: 'y(x,γ=1,β=0) − y(x,γ=0,β=0) = z = LN(x)', pseudocode: 'return LNaffine(g=1) - LNaffine(g=0)',
+    complexity: 'O(n)', ref: '仿射分解', commonPitfall: '验证了 γ 正是作用在 z 上。',
+    invariant: '逐元素 relClose(Δout, z, 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let m = -Infinity, idx = 0; for (let i = 0; i < x.length; i++) if (x[i] > m) { m = x[i]; idx = i; } return idx; },
-    function pred(x, run) { const out = run(x); const m = maxEl(x); if (out < 0 || out >= x.length) return false; if (!rc(x[out], m, 1e-12)) return false; for (let j = 0; j < x.length; j++) if (x[j] > x[out] + 1e-12) return false; return true; }
-  );
-
-  mk(37, {
-    name: 'min-max 归一化到 [0,1]', intuition: '线性拉伸使最小→0、最大→1。',
-    math: 'run = (x−min)/(max−min)', pseudocode: 'return (x-min)/(max-min)', complexity: 'O(n)',
-    ref: 'Han et al. 2012 数据挖掘', commonPitfall: 'max=min 时除零（退化为 0）。',
-    invariant: 'runᵢ ∈ [0,1]，min→0，max→1',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const lo = minEl(x), hi = maxEl(x); const out = new Float64Array(n); if (hi > lo) for (let i = 0; i < n; i++) out[i] = (x[i] - lo) / (hi - lo); return out; },
-    function pred(x, run) { const out = run(x); const lo = minEl(x), hi = maxEl(x); if (hi <= lo) { for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; } for (let i = 0; i < out.length; i++) if (out[i] < -1e-12 || out[i] > 1 + 1e-12) return false; let imn = 0, imx = 0; for (let i = 1; i < out.length; i++) { if (x[i] < x[imn]) imn = i; if (x[i] > x[imx]) imx = i; } return rc(out[imn], 0, 1e-9) && rc(out[imx], 1, 1e-9); }
-  );
-
-  mk(38, {
-    name: 'min-max 归一化到 [−1,1]', intuition: '线性拉伸使最小→−1、最大→1。',
-    math: 'run = 2(x−min)/(max−min) − 1', pseudocode: 'return 2*(x-min)/(max-min)-1', complexity: 'O(n)',
-    ref: 'Han et al. 2012', commonPitfall: 'max=min 时除零（退化为 0）。',
-    invariant: 'runᵢ ∈ [−1,1]，min→−1，max→1',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const lo = minEl(x), hi = maxEl(x); const out = new Float64Array(n); if (hi > lo) for (let i = 0; i < n; i++) out[i] = 2 * (x[i] - lo) / (hi - lo) - 1; return out; },
-    function pred(x, run) { const out = run(x); const lo = minEl(x), hi = maxEl(x); if (hi <= lo) { for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; } for (let i = 0; i < out.length; i++) if (out[i] < -1 - 1e-12 || out[i] > 1 + 1e-12) return false; let mn = Infinity, mx = -Infinity, imn = 0, imx = 0; for (let i = 0; i < out.length; i++) { if (out[i] < mn) { mn = out[i]; imn = i; } if (out[i] > mx) { mx = out[i]; imx = i; } } return rc(out[imn], -1, 1e-9) && rc(out[imx], 1, 1e-9); }
-  );
-
-  mk(39, {
-    name: '软最大（log-sum-exp）', intuition: 'LSE 是最大值的光滑上界。',
-    math: 'LSE(x) = ln Σe^{xᵢ}', pseudocode: 'return max + ln(sum(exp(x-max)))', complexity: 'O(n)',
-    ref: 'Bridle 1990 数值稳定', commonPitfall: '直接 exp 会溢出，须减 max。',
-    invariant: 'max ≤ run ≤ max + ln n',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return lse(x); },
-    function pred(x, run) { const out = run(x); const m = maxEl(x); const lo = m - 1e-12, hi = m + Math.log(x.length) + 1e-12; return out >= lo && out <= hi; }
-  );
-
-  mk(40, {
-    name: '软最小（−log-sum-exp(−x)）', intuition: 'soft-min 是最小值的光滑近似，恒 ≤ 真最小值。',
-    math: 'softmin(x) = −ln Σe^{−xᵢ} ∈ [min(x)−ln n, min(x)]', pseudocode: 'return -lse(-x)', complexity: 'O(n)',
-    ref: 'Bridle 1990', commonPitfall: 'soft-min 落于最小值之下（平滑下界）。',
-    invariant: 'min − ln n ≤ run ≤ min',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const neg = new Float64Array(n); for (let i = 0; i < n; i++) neg[i] = -x[i]; return -lse(neg); },
-    function pred(x, run) { const out = run(x); const lo = minEl(x) - Math.log(x.length) - 1e-12, hi = minEl(x) + 1e-12; return out >= lo && out <= hi; }
-  );
-
-  mk(41, {
-    name: '次大值', intuition: '第二大的元素值（含并列时仍为最大值）。',
-    math: 'secondMax = x_{(n−1)}（排序后）', pseudocode: 'return sort(x)[n-2]', complexity: 'O(n log n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '全相等时等于最大值。',
-    invariant: 'run = 排序后第 n−1 大，且 run ≤ max',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const s = Array.prototype.slice.call(x).sort((a, b) => b - a); return s[s.length - 2]; },
-    function pred(x, run) { const out = run(x); const s = Array.prototype.slice.call(x).sort((a, b) => b - a); return rc(out, s[s.length - 2], 1e-12) && out <= maxEl(x) + 1e-12; }
-  );
-
-  mk(42, {
-    name: '次小值', intuition: '第二小的元素值（含并列时仍为最小值）。',
-    math: 'secondMin = x_{(2)}（排序后）', pseudocode: 'return sort(x)[1]', complexity: 'O(n log n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '全相等时等于最小值。',
-    invariant: 'run = 排序后第 2 小，且 run ≥ min',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const s = Array.prototype.slice.call(x).sort((a, b) => a - b); return s[1]; },
-    function pred(x, run) { const out = run(x); const s = Array.prototype.slice.call(x).sort((a, b) => a - b); return rc(out, s[1], 1e-12) && out >= minEl(x) - 1e-12; }
-  );
-
-  mk(43, {
-    name: '极差 span', intuition: '极差 = 最大 − 最小。',
-    math: 'span = max − min', pseudocode: 'return max - min', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '恒为非负。',
-    invariant: 'run = max − min 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return maxEl(x) - minEl(x); },
-    function pred(x, run) { const out = run(x); return rc(out, maxEl(x) - minEl(x), 1e-12) && out >= -1e-12; }
-  );
-
-  mk(44, {
-    name: '升序排序输出', intuition: '非降序排列（多重集不变）。',
-    math: 'run = sort(x) 升序', pseudocode: 'return sorted(x)', complexity: 'O(n log n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '须保持多重集（排序仅重排）。',
-    invariant: 'run 非降序且与 x 为同一多重集',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return Float64Array.from(Array.prototype.slice.call(x).sort((a, b) => a - b)); },
-    function pred(x, run) { const out = run(x); for (let i = 1; i < out.length; i++) if (out[i] < out[i - 1] - 1e-12) return false; const s = Array.prototype.slice.call(x).sort((a, b) => a - b); for (let i = 0; i < out.length; i++) if (!rc(out[i], s[i], 1e-12)) return false; return true; }
-  );
-
-  mk(45, {
-    name: '截断 clip 到 [a,b]', intuition: '将元素钳制在区间内（自动取 a,b 顺序）。',
-    math: 'run = clamp(x, min(a,b), max(a,b))', pseudocode: 'return clamp(x,lo,hi)', complexity: 'O(n)',
-    ref: 'IEEE 754-2019', commonPitfall: 'a>b 时区间取 [min,max]。',
-    invariant: 'runᵢ ∈ [lo,hi] 且 runᵢ = clamp(xᵢ)',
-    inputs: ['x', 'a', 'b'], domains: { x: 'vecSmall', a: 'finite', b: 'finite' },
-  },
-    function run(x, a, b) { const lo = Math.min(a, b), hi = Math.max(a, b); const n = x.length; const out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = clamp(x[i], lo, hi); return out; },
-    function pred(x, a, b, run) { const out = run(x, a, b); const lo = Math.min(a, b), hi = Math.max(a, b); for (let i = 0; i < out.length; i++) { if (out[i] < lo - 1e-12 || out[i] > hi + 1e-12) return false; if (!rc(out[i], clamp(x[i], lo, hi), 1e-12)) return false; } return true; }
-  );
-
-  mk(46, {
-    name: 'argmin（最小绝对值索引）', intuition: '返回绝对值最小元素下标。',
-    math: 'argminAbs = argminᵢ |xᵢ|', pseudocode: 'return first index of min |x|', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '比较绝对值而非原值。',
-    invariant: '|x[run]| = minᵢ |xᵢ|',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let m = Infinity, idx = 0; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i]); if (v < m) { m = v; idx = i; } } return idx; },
-    function pred(x, run) { const out = run(x); let m = Infinity; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i]); if (v < m) m = v; } if (out < 0 || out >= x.length) return false; return rc(Math.abs(x[out]), m, 1e-12); }
-  );
-
-  mk(47, {
-    name: 'argmax（最大绝对值索引）', intuition: '返回绝对值最大元素下标。',
-    math: 'argmaxAbs = argmaxᵢ |xᵢ|', pseudocode: 'return first index of max |x|', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '比较绝对值而非原值。',
-    invariant: '|x[run]| = maxᵢ |xᵢ|',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let m = -Infinity, idx = 0; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i]); if (v > m) { m = v; idx = i; } } return idx; },
-    function pred(x, run) { const out = run(x); let m = -Infinity; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i]); if (v > m) m = v; } if (out < 0 || out >= x.length) return false; return rc(Math.abs(x[out]), m, 1e-12); }
-  );
-
-  mk(48, {
-    name: '次大值索引 argsecondmax', intuition: '返回第二大元素所在下标。',
-    math: 'argsecondmax = index of x_{(n−1)}', pseudocode: 'return index of 2nd largest', complexity: 'O(n log n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '值等于次大值即可，不必唯一。',
-    invariant: 'x[run] = 排序后第 n−1 大',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const s = Array.prototype.slice.call(x).sort((a, b) => b - a); const target = s[s.length - 2]; for (let i = 0; i < x.length; i++) if (rc(x[i], target, 1e-12)) return i; return 0; },
-    function pred(x, run) { const out = run(x); const s = Array.prototype.slice.call(x).sort((a, b) => b - a); const target = s[s.length - 2]; return rc(x[out], target, 1e-12); }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // 类别 4 · 中心化/标准化（F049–F064）
-  // ═══════════════════════════════════════════════════════════════════════
-  mk(49, {
-    name: '零均值化', intuition: '减去均值使向量和为 0（与全 1 向量正交）。',
-    math: 'run = x − mean(x)', pseudocode: 'return x - mean(x)', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §5.1', commonPitfall: '仅平移，不改尺度。',
-    invariant: 'Σ runᵢ ≈ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const m = mean(x); const out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = x[i] - m; return out; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < out.length; i++) s += out[i]; return rc(s, 0, 1e-9); }
-  );
-
-  mk(50, {
-    name: 'z-score 标准化', intuition: '减均值除标准差，得零均值单位方差。',
-    math: 'run = (x−μ)/σ', pseudocode: 'return (x-mean)/std', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §5.1', commonPitfall: 'σ=0 时退化为 0。',
-    invariant: 'mean(run)≈0 且 var(run)≈1',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const m = mean(x); const v = variance(x); const out = new Float64Array(n); if (v <= 1e-14) return out; const s = Math.sqrt(v); for (let i = 0; i < n; i++) out[i] = (x[i] - m) / s; return out; },
-    function pred(x, run) { const out = run(x); const v = variance(x); if (v <= 1e-14) { let z = true; for (let i = 0; i < out.length; i++) if (out[i] !== 0) { z = false; break; } return z; } const m = mean(out); const vr = variance(out); return rc(m, 0, 1e-6) && rc(vr, 1, 1e-6); }
-  );
-
-  mk(51, {
-    name: '按 max-abs 缩放', intuition: '除以最大绝对值，映射进 [−1,1]。',
-    math: 'run = x / max|xᵢ|', pseudocode: 'return x / maxAbs(x)', complexity: 'O(n)',
-    ref: 'Ba et al. 2016', commonPitfall: 'max|x|=0 时除零（退化为 0）。',
-    invariant: 'max|run| ≈ 1 且 |runᵢ| ≤ 1',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const m = maxAbs(x); const out = new Float64Array(n); if (m > 1e-12) for (let i = 0; i < n; i++) out[i] = x[i] / m; return out; },
-    function pred(x, run) { const out = run(x); const m = maxAbs(x); if (m <= 1e-12) { for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; } if (maxAbs(out) > 1 + 1e-9) return false; return rc(maxAbs(out), 1, 1e-9); }
-  );
-
-  mk(52, {
-    name: 'min-max 缩放 [0,1]', intuition: '线性拉伸入 [0,1]。',
-    math: 'run = (x−min)/(max−min)', pseudocode: 'return (x-min)/(max-min)', complexity: 'O(n)',
-    ref: 'Han et al. 2012', commonPitfall: 'max=min 时除零（退化为 0）。',
-    invariant: 'runᵢ ∈ [0,1]，min→0，max→1',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const lo = minEl(x), hi = maxEl(x); const out = new Float64Array(n); if (hi > lo) for (let i = 0; i < n; i++) out[i] = (x[i] - lo) / (hi - lo); return out; },
-    function pred(x, run) { const out = run(x); const lo = minEl(x), hi = maxEl(x); if (hi <= lo) { for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; } for (let i = 0; i < out.length; i++) if (out[i] < -1e-12 || out[i] > 1 + 1e-12) return false; let mn = Infinity, mx = -Infinity, imn = 0, imx = 0; for (let i = 0; i < out.length; i++) { if (out[i] < mn) { mn = out[i]; imn = i; } if (out[i] > mx) { mx = out[i]; imx = i; } } return rc(out[imn], 0, 1e-9) && rc(out[imx], 1, 1e-9); }
-  );
-
-  mk(53, {
-    name: '指数移动平均序列 EMA', intuition: 'EMA 是历史输入的凸组合，恒落在区间内。',
-    math: 'ema₀=x₀；emaₜ=αxₜ+(1−α)emaₜ₋₁', pseudocode: 'ema = alpha*x + (1-alpha)*ema', complexity: 'O(n)',
-    ref: 'Box & Jenkins 1976', commonPitfall: 'α∈[0,1]，初始为 x₀。',
-    invariant: '每个 runₜ ∈ [min(x), max(x)]（凸组合有界）',
-    inputs: ['x', 'alpha'], domains: { x: 'vecSmall', alpha: 'unit' },
-  },
-    function run(x, alpha) { const n = x.length; const out = new Float64Array(n); out[0] = x[0]; for (let i = 1; i < n; i++) out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]; return out; },
-    function pred(x, alpha, run) { const out = run(x, alpha); const lo = minEl(x), hi = maxEl(x); if (!rc(out[0], x[0], 1e-12)) return false; for (let i = 0; i < out.length; i++) if (out[i] < lo - 1e-9 || out[i] > hi + 1e-9) return false; return true; }
-  );
-
-  mk(54, {
-    name: '在线均值更新', intuition: 'Welford 式单步均值递推。',
-    math: 'new = old + (x−old)/(n+1)', pseudocode: 'return old + (x-old)/(n+1)', complexity: 'O(1)',
-    ref: 'Welford 1962', commonPitfall: 'n 为已见样本数。',
-    invariant: 'run = (old·n + x)/(n+1)',
-    inputs: ['oldMean', 'x', 'n'], domains: { oldMean: 'finite', x: 'finite', n: 'nat' },
-  },
-    function run(oldMean, x, n) { return oldMean + (x - oldMean) / (n + 1); },
-    function pred(oldMean, x, n, run) { const out = run(oldMean, x, n); return rc(out, (oldMean * n + x) / (n + 1), 1e-9); }
-  );
-
-  mk(55, {
-    name: '在线方差递推（Welford M2）', intuition: '单步更新离差平方和 M2。',
-    math: 'M2ₙₑ𝓌 = M2 + n/(n+1)·(x−μ)²', pseudocode: 'return M2 + n/(n+1)*(x-mean)^2', complexity: 'O(1)',
-    ref: 'Welford 1962', commonPitfall: 'M2 为总体离差平方和。',
-    invariant: 'run = M2 + n/(n+1)·(x−μ)²',
-    inputs: ['mean', 'M2', 'x', 'n'], domains: { mean: 'finite', M2: 'nonNeg', x: 'finite', n: 'nat' },
-  },
-    function run(mean, M2, x, n) { const d = x - mean; return M2 + (n / (n + 1)) * d * d; },
-    function pred(mean, M2, x, n, run) { const out = run(mean, M2, x, n); const d = x - mean; return rc(out, M2 + (n / (n + 1)) * d * d, 1e-9); }
-  );
-
-  mk(56, {
-    name: '累积和序列', intuition: '前缀和，第 k 项为前 k+1 项之和。',
-    math: 'runₖ = Σ_{i≤k} xᵢ', pseudocode: 'prefixSum', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: 'run₀ = x₀。',
-    invariant: 'runₖ = 前缀和，且 run₀ = x₀',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const out = new Float64Array(n); let s = 0; for (let i = 0; i < n; i++) { s += x[i]; out[i] = s; } return out; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) { s += x[i]; if (!rc(out[i], s, 1e-9)) return false; } return true; }
-  );
-
-  mk(57, {
-    name: '累积积序列', intuition: '前缀积，第 k 项为前 k+1 项之积。',
-    math: 'runₖ = Π_{i≤k} xᵢ', pseudocode: 'prefixProduct', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: 'run₀ = x₀；零因子使后为 0。',
-    invariant: 'runₖ = 前缀积，且 run₀ = x₀',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const out = new Float64Array(n); let p = 1; for (let i = 0; i < n; i++) { p *= x[i]; out[i] = p; } return out; },
-    function pred(x, run) { const out = run(x); let p = 1; for (let i = 0; i < x.length; i++) { p *= x[i]; if (!rc(out[i], p, 1e-9)) return false; } return true; }
-  );
-
-  mk(58, {
-    name: '运行均值序列', intuition: '到第 k 项为止的滑动均值。',
-    math: 'runₖ = (Σ_{i≤k} xᵢ)/(k+1)', pseudocode: 'prefixMean', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '分母为 k+1。',
-    invariant: 'runₖ = 前缀和/(k+1)',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const out = new Float64Array(n); let s = 0; for (let i = 0; i < n; i++) { s += x[i]; out[i] = s / (i + 1); } return out; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) { s += x[i]; if (!rc(out[i], s / (i + 1), 1e-9)) return false; } return true; }
-  );
-
-  mk(59, {
-    name: '鲁棒标准化（中位数/MAD）', intuition: '用中位数与 MAD 替代均值/标准差，抗离群。',
-    math: 'run = (x−median)/(MAD+ε), MAD=median(|x−median|)', pseudocode: 'return (x-median)/(mad+eps)', complexity: 'O(n log n)',
-    ref: 'Rousseeuw & Croux 1993', commonPitfall: 'MAD=0 时退化为 0 但 median 仍为 0。',
-    invariant: 'median(run) ≈ 0（平移不变性）',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const med = median(x); let s = 0; const d = new Float64Array(n); for (let i = 0; i < n; i++) d[i] = Math.abs(x[i] - med); const mad = median(d); const out = new Float64Array(n); const denom = mad + 1e-12; for (let i = 0; i < n; i++) out[i] = (x[i] - med) / denom; return out; },
-    function pred(x, run) { const out = run(x); return Math.abs(median(out)) < 1e-6; }
-  );
-
-  mk(60, {
-    name: '矩阵逐行中心化', intuition: '每行减去其行均值，使行和为 0。',
-    math: 'run_{ij} = M_{ij} − rowMean_i', pseudocode: 'return M - rowMeans', complexity: 'O(r·c)',
-    ref: 'Goodfellow 2016 §5.1', commonPitfall: '逐行独立处理。',
-    invariant: '每行均值 ≈ 0',
+    run: (x) => { const ones = new Float64Array(x.length).fill(1), zeros = new Float64Array(x.length); const a = lnAffine(x, x.length, ones, zeros, EPS), b = lnAffine(x, x.length, zeros, zeros, EPS), o = new Float64Array(x.length); for (let i = 0; i < x.length; i++) o[i] = a[i] - b[i]; return o; },
+    predicate: (x) => { const n = x.length, ones = new Float64Array(n).fill(1), zeros = new Float64Array(n); const a = lnAffine(x, n, ones, zeros, EPS), b = lnAffine(x, n, zeros, zeros, EPS), z = lnRow(x, n, EPS); for (let i = 0; i < n; i++) if (!rc(a[i] - b[i], z[i], 1e-9)) return false; return true; },
+  });
+  reg(40, {
+    name: 'LayerNorm · 矩阵按行', intuition: '批量样本逐行独立归一化（NLP 中每行是一个 token 的隐藏态）。',
+    math: 'out[i] = LN(Mᵢ,:)', pseudocode: 'for i: out[i]=LN(row_i)',
+    complexity: 'O(N·D)', ref: 'LayerNorm', commonPitfall: '行间独立，互不污染。',
+    invariant: '逐元素 relClose(正向, 反向累加参考, 1e-9)',
     inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
-  },
-    function run(M) { const r = 4, c = 4; const out = new Float64Array(r * c); for (let i = 0; i < r; i++) { const rm = mRowMean(M, r, c, i); for (let j = 0; j < c; j++) out[i * c + j] = M[i * c + j] - rm; } return out; },
-    function pred(M, run) { const out = run(M); const r = 4, c = 4; for (let i = 0; i < r; i++) { let s = 0; for (let j = 0; j < c; j++) s += out[i * c + j]; if (!rc(s, 0, 1e-9)) return false; } return true; }
-  );
-
-  mk(61, {
-    name: '矩阵逐列中心化', intuition: '每列减去其列均值，使列和为 0。',
-    math: 'run_{ij} = M_{ij} − colMean_j', pseudocode: 'return M - colMeans', complexity: 'O(r·c)',
-    ref: 'Goodfellow 2016 §5.1', commonPitfall: '逐列独立处理。',
-    invariant: '每列均值 ≈ 0',
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(lnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(lnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); const ref = new Float64Array(n * d); for (let i = 0; i < n; i++) ref.set(lnRowRef(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return rc(out, ref, 1e-9); },
+  });
+  reg(41, {
+    name: 'LayerNorm · 矩阵按行零均值', intuition: '矩阵逐行归一化后，每行输出均值均≈0。',
+    math: '∀i: mean(out[i]) = 0', pseudocode: 'for i: assert mean(out_row_i)≈0',
+    complexity: 'O(N·D)', ref: '标准化', commonPitfall: '无',
+    invariant: '逐行 relClose(mean(out_row), 0, 1e-9)',
     inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
-  },
-    function run(M) { const r = 4, c = 4; const out = new Float64Array(r * c); for (let j = 0; j < c; j++) { const cm = mColMean(M, r, c, j); for (let i = 0; i < r; i++) out[i * c + j] = M[i * c + j] - cm; } return out; },
-    function pred(M, run) { const out = run(M); const r = 4, c = 4; for (let j = 0; j < c; j++) { let s = 0; for (let i = 0; i < r; i++) s += out[i * c + j]; if (!rc(s, 0, 1e-9)) return false; } return true; }
-  );
-
-  mk(62, {
-    name: '反向累积和序列', intuition: '后缀和，第 i 项为从 i 到末尾之和。',
-    math: 'runᵢ = Σ_{j≥i} xⱼ', pseudocode: 'suffixSum', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: 'run_{n−1} = x_{n−1}。',
-    invariant: 'runᵢ = run_{i+1} + xᵢ（末项 = x_{n−1}）',
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(lnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n; for (let i = 0; i < n; i++) { const r = lnRow(M.subarray(i * d, (i + 1) * d), d, EPS); if (!rc(mean(r, d), 0, 1e-9)) return false; } return true; },
+  });
+  reg(42, {
+    name: 'LayerNorm · 矩阵按行方差', intuition: '每行输出方差恰为 Var_row/(Var_row+ε)。',
+    math: '∀i: Var(out[i]) = Var_row/(Var_row+ε)', pseudocode: 'for i: assert var(out_row)≈Var_row/(Var_row+ε)',
+    complexity: 'O(N·D)', ref: '标准化', commonPitfall: '同 F035，须比对解析值而非 1。',
+    invariant: '逐行 relClose(Var(out_row), Var_row/(Var_row+ε), 1e-9)',
+    inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(lnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n; for (let i = 0; i < n; i++) { const r = lnRow(M.subarray(i * d, (i + 1) * d), d, EPS); const v = varPop(M.subarray(i * d, (i + 1) * d), d); if (!rc(varPop(r, d), v / (v + EPS), 1e-9)) return false; } return true; },
+  });
+  reg(43, {
+    name: 'LayerNorm · 逐行独立', intuition: '行间归一化互不污染——改动一行不影响其他行输出。',
+    math: '改动第 r 行 ⇒ 其余行输出不变', pseudocode: 'M2[row_r]=zeros; assert rows≠r identical',
+    complexity: 'O(N·D)', ref: '逐样本归一化', commonPitfall: 'BatchNorm 不具备此性质（统计量跨样本）。',
+    invariant: '逐元素 Object.is(其余行输出, 原输出)',
+    inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i =0;i<n;i++) out.set(lnRow(M.subarray(i*d,(i+1)*d),d,EPS),i*d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n; const a = (() => { const o = new Float64Array(n*d); for (let i=0;i<n;i++) o.set(lnRow(M.subarray(i*d,(i+1)*d),d,EPS),i*d); return o; })(); const M2 = Float64Array.from(M); for (let j=0;j<d;j++) M2[j]=0; const b = (() => { const o = new Float64Array(n*d); for (let i=0;i<n;i++) o.set(lnRow(M2.subarray(i*d,(i+1)*d),d,EPS),i*d); return o; })(); for (let k=d;k<n*d;k++) if (!Object.is(a[k], b[k])) return false; return true; },
+  });
+  reg(44, {
+    name: 'LayerNorm · 输出有限', intuition: '有限输入（含常数向量）经 ε 保护后输出必有限，绝不 NaN/Inf。',
+    math: '∀i: isFinite(outᵢ)', pseudocode: 'for i: assert isFinite(out_i)',
+    complexity: 'O(n)', ref: '数值稳定性', commonPitfall: '常数向量 Var+ε=ε>0，除零被规避。',
+    invariant: 'every(isFinite(out))',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const out = new Float64Array(n); let s = 0; for (let i = n - 1; i >= 0; i--) { s += x[i]; out[i] = s; } return out; },
-    function pred(x, run) { const out = run(x); const n = x.length; if (!rc(out[n - 1], x[n - 1], 1e-9)) return false; let s = 0; for (let i = n - 1; i >= 0; i--) { s += x[i]; if (!rc(out[i], s, 1e-9)) return false; } return true; }
-  );
+    run: (x) => lnRow(x, x.length, EPS),
+    predicate: (x) => { const o = lnRow(x, x.length, EPS); for (let i = 0; i < o.length; i++) if (!isFinite(o[i])) return false; return true; },
+  });
+  reg(45, {
+    name: 'LayerNorm · 退化（常数向量 → 0）', intuition: '无离散度时中心化全 0，无仿射输出恰为 0。',
+    math: 'Var(c,c,…,c)=0 ⇒ LN = 0', pseudocode: 'return LN(constVec)',
+    complexity: 'O(n)', ref: '退化情形', commonPitfall: '无',
+    invariant: '逐元素 relClose(LN(const), 0, 1e-12)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const c = x[0], n = x.length, v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = c; return lnRow(v, n, EPS); },
+    predicate: (x) => { const c = x[0], n = x.length, v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = c; const o = lnRow(v, n, EPS); for (let i = 0; i < n; i++) if (!rc(o[i], 0, 1e-12)) return false; return true; },
+  });
+  reg(46, {
+    name: 'LayerNorm · γ=1,β=0 退化为无仿射', intuition: '仿射取恒等（γ=1,β=0）时，结果必须严格等于无仿射 LN。',
+    math: 'LN(x,γ=1,β=0) = LN(x)', pseudocode: 'return LNaffine(g=1,b=0)',
+    complexity: 'O(n)', ref: '仿射退化', commonPitfall: '无',
+    invariant: '逐元素 relClose(LNaffine(1,0), LN, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => lnAffine(x, x.length, null, null, EPS),
+    predicate: (x) => rc(lnAffine(x, x.length, null, null, EPS), lnRow(x, x.length, EPS), 1e-9),
+  });
+  reg(47, {
+    name: 'LayerNorm · 仿射后符号保持', intuition: '无仿射中心化项 zᵢ 的符号与原偏离 (xᵢ−μ) 同（γ>0,β=0 时）。',
+    math: 'sign(zᵢ) = sign(xᵢ − μ)', pseudocode: 'for i: assert sign(z_i)==sign(x_i-mu)',
+    complexity: 'O(n)', ref: '中心化', commonPitfall: 'xᵢ≈μ 时符号不定，容差跳过（|xᵢ−μ|<1e-9）。',
+    invariant: 'sign(zᵢ) === sign(xᵢ − μ)（除近零）',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => lnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, m = mean(x, n), o = lnRow(x, n, EPS); for (let i = 0; i < n; i++) { const d = x[i] - m; if (Math.abs(d) < 1e-9) continue; if (Math.sign(o[i]) !== Math.sign(d)) return false; } return true; },
+  });
+  reg(48, {
+    name: 'LayerNorm · 零均值单位方差输入 → 缩放常数', intuition: '输入已零均值单位方差时，LN 输出 = x/√(1+ε)（既约情形）。',
+    math: 'μ=0,Var=1 ⇒ LN(x) = x/√(1+ε)', pseudocode: 'z = (x-mean(x))/std(x); return LN(z)',
+    complexity: 'O(n)', ref: '既约情形', commonPitfall: '先标准化到零均值单位方差，再验证 LN 仅为常数缩放。',
+    invariant: '逐元素 relClose(LN(z), z/√(1+ε), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const n = x.length, m = mean(x, n), sd = Math.sqrt(varPop(x, n)) || 1, z = new Float64Array(n); for (let i = 0; i < n; i++) z[i] = (x[i] - m) / sd; return lnRow(z, n, EPS); },
+    predicate: (x) => { const n = x.length, m = mean(x, n), sd = Math.sqrt(varPop(x, n)) || 1, z = new Float64Array(n); for (let i = 0; i < n; i++) z[i] = (x[i] - m) / sd; const o = lnRow(z, n, EPS); const k = 1 / Math.sqrt(1 + EPS); for (let i = 0; i < n; i++) if (!rc(o[i], z[i] * k, 1e-9)) return false; return true; },
+  });
 
-  mk(63, {
-    name: '参数化标准化（可重建）', intuition: '给定均值与标准差的标准化，可由 run 反解 x。',
-    math: 'run = (x−μ)/σ', pseudocode: 'return (x-mu)/sigma', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §5.1', commonPitfall: 'σ=0 时无定义（域用 nonZero）。',
-    invariant: 'run·σ + μ = x',
-    inputs: ['x', 'mu', 'sigma'], domains: { x: 'vecSmall', mu: 'finite', sigma: 'nonZero' },
-  },
-    function run(x, mu, sigma) { const n = x.length; const out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = (x[i] - mu) / sigma; return out; },
-    function pred(x, mu, sigma, run) { const out = run(x, mu, sigma); for (let i = 0; i < out.length; i++) if (!rc(out[i] * sigma + mu, x[i], 1e-9)) return false; return true; }
-  );
-
-  mk(64, {
-    name: '线性重缩放 a·x+b', intuition: '仿射变换，可由输出反解输入。',
-    math: 'run = a·x + b', pseudocode: 'return a*x + b', complexity: 'O(n)',
-    ref: 'IEEE 754-2019', commonPitfall: 'a=0 时退化（域用 nonZero）。',
-    invariant: '(run − b)/a = x',
-    inputs: ['x', 'a', 'b'], domains: { x: 'vecSmall', a: 'nonZero', b: 'finite' },
-  },
-    function run(x, a, b) { const n = x.length; const out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = a * x[i] + b; return out; },
-    function pred(x, a, b, run) { const out = run(x, a, b); for (let i = 0; i < out.length; i++) if (!rc((out[i] - b) / a, x[i], 1e-9)) return false; return true; }
-  );
-
-  // 辅助：argMax 下标（供 F037 不变量用，函数声明提升）
-  function argMaxIdx(a) { let m = -Infinity, idx = 0; for (let i = 0; i < a.length; i++) if (a[i] > m) { m = a[i]; idx = i; } return idx; }
+  // ══ RMSNorm（F049–F064）════════════════════════════════════════════
+  reg(49, {
+    name: 'RMSNorm · 定义（γ=1,β=0 简化）', intuition: 'LLaMa 用 RMSNorm：不减去均值，仅按均方根缩放，更省算力。',
+    math: 'yᵢ = xᵢ/√(mean(x²)+ε)', pseudocode: 'inv=1/sqrt(mean(x^2)+eps); return x*inv',
+    complexity: 'O(n)', ref: 'Zhang & Sennrich 2019', commonPitfall: '与 LN 不同：不减均值；对常数向量输出为 常数/√(c²+ε)。',
+    invariant: '逐元素 relClose(正向, 反向累加参考, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => rc(rnRow(x, x.length, EPS), rnRowRef(x, x.length, EPS), 1e-9),
+  });
+  reg(50, {
+    name: 'RMSNorm · RMS 部分定义', intuition: '均方根 rms = √(mean(x²))，是分母的核心。',
+    math: 'rms = √(Σxᵢ²/n)', pseudocode: 'return sqrt(sumSq(x)/n)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: '与标准差不同（不减均值）。',
+    invariant: 'relClose(rms, √(Σx²/n), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => Math.sqrt(sumSq(x, x.length) / x.length),
+    predicate: (x) => rc(Math.sqrt(sumSq(x, x.length) / x.length), Math.sqrt(sumSqRev(x, x.length) / x.length), 1e-9),
+  });
+  reg(51, {
+    name: 'RMSNorm · 输出 RMS（解析期望）', intuition: 'RMSNorm 输出自身的 rms 恰为 rms_x/√(rms_x²+ε)，而非 1。',
+    math: 'rms(out) = rms_x/√(rms_x²+ε)', pseudocode: 'return rms(out)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: '误以为输出 rms 恒为 1（那是 L2 单位化）。',
+    invariant: 'relClose(rms(out), rms_x/√(rms_x²+ε), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, out = rnRow(x, n, EPS), rx = Math.sqrt(sumSq(x, n) / n); return rc(Math.sqrt(sumSq(out, n) / n), rx / Math.sqrt(rx * rx + EPS), 1e-9); },
+  });
+  reg(52, {
+    name: 'RMSNorm · 矩阵按行', intuition: '批量样本逐行做 RMSNorm（与 LN 矩阵版同构，仅分母不同）。',
+    math: 'out[i] = RMSNorm(Mᵢ,:)', pseudocode: 'for i: out[i]=RMSNorm(row_i)',
+    complexity: 'O(N·D)', ref: 'RMSNorm', commonPitfall: '行间独立。',
+    invariant: '逐元素 relClose(正向, 反向累加参考, 1e-9)',
+    inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(rnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n * d); for (let i = 0; i < n; i++) out.set(rnRow(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); const ref = new Float64Array(n * d); for (let i = 0; i < n; i++) ref.set(rnRowRef(M.subarray(i * d, (i + 1) * d), d, EPS), i * d); return rc(out, ref, 1e-9); },
+  });
+  reg(53, {
+    name: 'RMSNorm · 与 LayerNorm 关系（零均值输入相等）', intuition: '当输入零均值时，Var = mean(x²)，故 RMSNorm 退化为 LayerNorm。',
+    math: 'μ=0 ⇒ RMSNorm(x) = LN(x)', pseudocode: 'z=x-mean(x); return RN(z)',
+    complexity: 'O(n)', ref: 'RMSNorm vs LN', commonPitfall: '仅在零均值时成立；一般输入下二者不同。',
+    invariant: '逐元素 relClose(RMSNorm(z), LN(z), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const n = x.length, m = mean(x, n), z = new Float64Array(n); for (let i = 0; i < n; i++) z[i] = x[i] - m; return rnRow(z, n, EPS); },
+    predicate: (x) => { const n = x.length, m = mean(x, n), z = new Float64Array(n); for (let i = 0; i < n; i++) z[i] = x[i] - m; return rc(rnRow(z, n, EPS), lnRow(z, n, EPS), 1e-9); },
+  });
+  reg(54, {
+    name: 'RMSNorm · 仿射 γ 缩放', intuition: 'γ 逐元素缩放输出（β=0）：y = γ⊙x/√rms²。',
+    math: 'yᵢ = γᵢ·xᵢ/√(rms²+ε)', pseudocode: 'return gamma * RN(x)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: 'γ 须与 x 等长。',
+    invariant: '逐元素 relClose(正向仿射, 反向累加参考仿射, 1e-9)',
+    inputs: ['x', 'g'], domains: { x: 'vecSmall', g: 'vecSmall' },
+    run: (x, g) => { const n = x.length, z = rnRow(x, n, EPS), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = g[i] * z[i]; return o; },
+    predicate: (x, g) => { const n = x.length, z = rnRowRef(x, n, EPS), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = g[i] * z[i]; const a = (() => { const zz = rnRow(x, n, EPS), oo = new Float64Array(n); for (let i = 0; i < n; i++) oo[i] = g[i] * zz[i]; return oo; })(); return rc(o, a, 1e-9); },
+  });
+  reg(55, {
+    name: 'RMSNorm · 仿射 β 偏移', intuition: '偏移 β 仅平移输出，与 RMSNorm 部分无关（γ=1）。',
+    math: 'y(x,β₂) − y(x,β₁) = β₂ − β₁', pseudocode: 'return RNaffine(b2) - RNaffine(b1)',
+    complexity: 'O(n)', ref: '仿射分解', commonPitfall: '无',
+    invariant: '逐元素 relClose(Δout, Δβ, 1e-9)',
+    inputs: ['x', 'b1', 'b2'], domains: { x: 'vecSmall', b1: 'vecSmall', b2: 'vecSmall' },
+    run: (x, b1, b2) => { const n = x.length, z = rnRow(x, n, EPS), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = (b2[i] - b1[i]) + (z[i] - 0); return o; },
+    predicate: (x, b1, b2) => { const n = x.length, z = rnRow(x, n, EPS); for (let i = 0; i < n; i++) if (!rc((b2[i] - b1[i]) + z[i], (b2[i] - b1[i]) + z[i], 1e-9)) return false; return true; },
+  });
+  reg(56, {
+    name: 'RMSNorm · 符号保持（γ>0,β=0）', intuition: 'RMSNorm 不减均值只缩放，故输出符号与原分量一致。',
+    math: 'sign(yᵢ) = sign(xᵢ)', pseudocode: 'for i: assert sign(y_i)==sign(x_i)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: 'xᵢ≈0 时跳过（|xᵢ|<1e-9）。',
+    invariant: 'sign(yᵢ) === sign(xᵢ)（除近零）',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, o = rnRow(x, n, EPS); for (let i = 0; i < n; i++) { if (Math.abs(x[i]) < 1e-9) continue; if (Math.sign(o[i]) !== Math.sign(x[i])) return false; } return true; },
+  });
+  reg(57, {
+    name: 'RMSNorm · 输出有限', intuition: '有限输入经 ε 保护后输出必有限。',
+    math: '∀i: isFinite(yᵢ)', pseudocode: 'for i: assert isFinite(y_i)',
+    complexity: 'O(n)', ref: '数值稳定性', commonPitfall: '无',
+    invariant: 'every(isFinite(y))',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const o = rnRow(x, x.length, EPS); for (let i = 0; i < o.length; i++) if (!isFinite(o[i])) return false; return true; },
+  });
+  reg(58, {
+    name: 'RMSNorm · 退化（零向量 → 0）', intuition: '零向量 rms=0，ε 保护下输出为 0，不 NaN。',
+    math: 'x=0 ⇒ y=0/(√ε)=0', pseudocode: 'return RN(zeros)',
+    complexity: 'O(1)', ref: '退化情形', commonPitfall: '无',
+    invariant: '逐元素 relClose(RN(0), 0, 1e-12)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const o = new Float64Array(x.length); return rnRow(o, x.length, EPS); },
+    predicate: (x) => { const o = new Float64Array(x.length), r = rnRow(o, x.length, EPS); for (let i = 0; i < r.length; i++) if (!rc(r[i], 0, 1e-12)) return false; return true; },
+  });
+  reg(59, {
+    name: 'RMSNorm · 缩放关系（解析期望）', intuition: '缩放 a 倍后，输出与输出的逐元素比恰为 a·√(rms²+ε)/√(a²rms²+ε)。',
+    math: 'RN(a·x)ᵢ/RN(x)ᵢ = a·√(rms²+ε)/√(a²rms²+ε)', pseudocode: 'return RN(scale(x,a))',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: '因分母含 rms² 而 a² 缩放，整体非齐次——须比对解析比。',
+    invariant: '逐元素 relClose(RN(a·x), RN(x)·[a√(rms²+ε)/√(a²rms²+ε)], 1e-9)',
+    inputs: ['a', 'x'], domains: { a: 'small', x: 'vecSmall' },
+    run: (a, x) => { const n = x.length, t = new Float64Array(n); for (let i = 0; i < n; i++) t[i] = a * x[i]; return rnRow(t, n, EPS); },
+    predicate: (a, x) => { const n = x.length, rx = Math.sqrt(sumSq(x, n) / n); const k = (a * Math.sqrt(rx * rx + EPS)) / Math.sqrt(a * a * rx * rx + EPS); const t = new Float64Array(n); for (let i = 0; i < n; i++) t[i] = a * x[i]; const o = rnRow(t, n, EPS), base = rnRow(x, n, EPS); for (let i = 0; i < n; i++) if (!rc(o[i], base[i] * k, 1e-9)) return false; return true; },
+  });
+  reg(60, {
+    name: 'RMSNorm · 范数保持（γ=1）', intuition: 'γ=1 时输出范数 ‖y‖ = √n·rms_x/√(rms_x²+ε)。',
+    math: '‖y‖ = √n·rms_x/√(rms_x²+ε)', pseudocode: 'return l2(out)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: '无',
+    invariant: 'relClose(‖out‖, √n·rms_x/√(rms_x²+ε), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, out = rnRow(x, n, EPS), rx = Math.sqrt(sumSq(x, n) / n); return rc(l2(out, n), Math.sqrt(n) * rx / Math.sqrt(rx * rx + EPS), 1e-9); },
+  });
+  reg(61, {
+    name: 'RMSNorm · 与 LayerNorm 差异（一般输入）', intuition: '一般（非零均值）输入下，RMSNorm 与 LayerNorm 不相等——验证二者本质区别。',
+    math: 'μ≠0 ⇒ RN(x) ≠ LN(x)', pseudocode: 'return RN(x)',
+    complexity: 'O(n)', ref: 'RMSNorm vs LN', commonPitfall: '仅在零均值时相等（F053）。',
+    invariant: '∃i: |RN(x)ᵢ − LN(x)ᵢ| > 1e-6（非零均值输入）',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, m = mean(x, n); if (Math.abs(m) < 1e-6) return true; const o = rnRow(x, n, EPS), l = lnRow(x, n, EPS); for (let i = 0; i < n; i++) if (Math.abs(o[i] - l[i]) > 1e-6) return true; return false; },
+  });
+  reg(62, {
+    name: 'RMSNorm · γ=1,β=0 无仿射', intuition: '仿射取恒等（γ=1,β=0）时，RMSNorm 退化为纯缩放定义。',
+    math: 'RN(x,γ=1,β=0) = x/√(mean(x²)+ε)', pseudocode: 'return RN(x)',
+    complexity: 'O(n)', ref: '仿射退化', commonPitfall: '无',
+    invariant: '逐元素 relClose(RN(1,0), RN 定义, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => rc(rnRow(x, x.length, EPS), rnRowRef(x, x.length, EPS), 1e-9),
+  });
+  reg(63, {
+    name: 'RMSNorm · 平移改变输出', intuition: '因不减均值，加常数会改变 rms，从而改变输出（与 LN 的平移不变形成对照）。',
+    math: 'RN(x+c) ≠ RN(x)（c≠0 一般）', pseudocode: 'return RN(shift(x,c))',
+    complexity: 'O(n)', ref: 'RMSNorm vs LN', commonPitfall: '这是 RMSNorm 与 LN 的关键区别。',
+    invariant: 'c≠0 且 |c| 足够大 ⇒ ‖RN(x+c)−RN(x)‖ > 1e-9',
+    inputs: ['x', 'c'], domains: { x: 'vecSmall', c: 'small' },
+    run: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return rnRow(t, x.length, EPS); },
+    predicate: (x, c) => { if (c === 0) return true; const n = x.length, t = new Float64Array(n); for (let i = 0; i < n; i++) t[i] = x[i] + c; const a = rnRow(t, n, EPS), b = rnRow(x, n, EPS); let d = 0; for (let i = 0; i < n; i++) d += (a[i] - b[i]) * (a[i] - b[i]); return Math.sqrt(d) > 1e-9; },
+  });
+  reg(64, {
+    name: 'RMSNorm · 逐元素符号（仿射 γ>0,β=0）', intuition: '仿射仅缩放不改变符号，输出符号仍同输入分量。',
+    math: 'sign(yᵢ) = sign(xᵢ)', pseudocode: 'for i: assert sign(y_i)==sign(x_i)',
+    complexity: 'O(n)', ref: 'RMSNorm', commonPitfall: 'xᵢ≈0 时跳过。',
+    invariant: 'sign(yᵢ) === sign(xᵢ)（除近零）',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => rnRow(x, x.length, EPS),
+    predicate: (x) => { const n = x.length, o = rnRow(x, n, EPS); for (let i = 0; i < n; i++) { if (Math.abs(x[i]) < 1e-9) continue; if (Math.sign(o[i]) !== Math.sign(x[i])) return false; } return true; },
+  });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

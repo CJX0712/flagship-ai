@@ -1,402 +1,335 @@
 /* ============================================================================
- * L10 微指令 · F 域（归一化）· 第 1/4 批（F001–F032）
+ * L10 微指令 · F 域（归一化）· 第 1/3 批（F001–F032）
  * ----------------------------------------------------------------------------
  * 所属层：L10-microIsa  域：F（归一化）
- * 允许依赖的层：L9（special/fpOps）、L10（registry/invariant）
- * 主要 @ref：Goodfellow et al. (2016) Deep Learning §3.4, §5.1；
- *           Ba et al. (2016) Layer Normalization；IEEE 754-2019
+ * 允许依赖的层：L9（rng/assert/special）、L10（registry/invariant）
+ * 主要 @ref：Goodfellow et al. 2016（BatchNorm / LayerNorm）；Zhang & Sennrich 2019
+ *           （RMSNorm）；Wu & He 2018（GroupNorm / 权重标准化）；Krizhevsky 2012（LRN）
  *
- * 涵盖：向量统计（F001–F016）、范数（F017–F032）。
- * 每个 op 含七件套 + run + predicate；predicate 内部调用 run(...) 并验证
- * 一个对声明域恒真的非平凡数学不变量。标量不变量用 Object.is/relClose 判等，
- * 向量/矩阵不变量用 NS.L10.relClose。
+ * 子域划分：
+ *   F001–F012 均值（定义 / 线性 / 平移 / 矩阵按行·列 / 边界）
+ *   F013–F024 方差与标准差（总体 / 样本 / 与均方关系 / 切比雪夫界）
+ *   F025–F032 L2 范数与向量单位化
+ *
+ * 不变量判据：数值类用 relClose（tol 1e-9，方差类 1e-12）。每条 predicate 走与
+ * run 不同的参考路径（反向累加 / Σx²/n−m² / 三角不等式 / 解析界），避免「自证」。
+ * 输入域由 L10.TAGS 约束（tests/L10 据此构造 fast-check 任意子）。
+ * 约定：向量默认长度 8（vecSmall/vecPos），矩阵默认 4×4（matSmall）。
  * ==========================================================================*/
 ;(function (NS) {
   'use strict';
   NS.L10 = NS.L10 || {};
+  const rc = NS.L10.relClose;
   function reg(i, o) { NS.L10.register('F', i, o); }
-  const rc = (a, b, t) => NS.L10.relClose(a, b, t);
 
-  // ── 通用小工具（纯函数，run/predicate 复用）────────────────────────────────
-  function sum(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s; }
-  function mean(a) { return sum(a) / a.length; }
-  function meanSq(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return s / a.length; }
-  function variance(a) { const m = mean(a); let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - m; s += d * d; } const v = s / a.length; return v < 0 ? 0 : v; }
-  function stddev(a) { return Math.sqrt(variance(a)); }
-  function rms(a) { return Math.sqrt(meanSq(a)); }
-  function maxAbs(a) { let m = 0; for (let i = 0; i < a.length; i++) { const v = Math.abs(a[i]); if (v > m) m = v; } return m; }
-  function maxEl(a) { let m = -Infinity; for (let i = 0; i < a.length; i++) if (a[i] > m) m = a[i]; return m; }
-  function minEl(a) { let m = Infinity; for (let i = 0; i < a.length; i++) if (a[i] < m) m = a[i]; return m; }
-  function dot(a, b) { let s = 0; const n = a.length < b.length ? a.length : b.length; for (let i = 0; i < n; i++) s += a[i] * b[i]; return s; }
-  function median(a) { const s = Array.prototype.slice.call(a).sort((p, q) => p - q); const n = s.length; if (n % 2) return s[(n - 1) / 2]; return (s[n / 2 - 1] + s[n / 2]) / 2; }
-  function zeros(n) { return new Float64Array(n); }
+  /* ---------- 内部工具（本文件自包含，不跨层 require） ---------- */
+  const sq = (M) => Math.round(Math.sqrt(M.length));
+  function add(a, b) { const o = new Float64Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] + b[i]; return o; }
+  function scale(a, c) { const o = new Float64Array(a.length); for (let i = 0; i < a.length; i++) o[i] = c * a[i]; return o; }
+  function dot(a, b, n) { let s = 0; for (let i = 0; i < n; i++) s += a[i] * b[i]; return s; }
 
-  // mk：把 reg 包成 (index, meta, run, pred)，pred 末尾注入 run，满足"predicate 内部调用 run"。
-  function mk(i, meta, run, pred) {
-    const def = Object.assign({}, meta);
-    def.run = run;
-    def.predicate = function () { return pred.apply(null, Array.prototype.slice.call(arguments).concat([run])); };
-    reg(i, def);
-  }
+  function mean(a, n) { let s = 0; for (let i = 0; i < n; i++) s += a[i]; return s / n; }
+  function meanRev(a, n) { let s = 0; for (let i = n - 1; i >= 0; i--) s += a[i]; return s / n; }
+  function sumSq(a, n) { let s = 0; for (let i = 0; i < n; i++) s += a[i] * a[i]; return s; }
+  function sumSqRev(a, n) { let s = 0; for (let i = n - 1; i >= 0; i--) s += a[i] * a[i]; return s; }
+  // 总体方差：直接两遍；参考路径：Σx²/n − m²（反向均值）
+  function varPop(a, n) { const m = mean(a, n); let s = 0; for (let i = 0; i < n; i++) { const d = a[i] - m; s += d * d; } return s / n; }
+  function varPopRef(a, n) { const m = meanRev(a, n); const ss = sumSqRev(a, n); return Math.max(0, ss / n - m * m); }
+  function stdPop(a, n) { return Math.sqrt(varPop(a, n)); }
+  function l2(a, n) { return Math.sqrt(sumSq(a, n)); }
+  function l2Rev(a, n) { return Math.sqrt(sumSqRev(a, n)); }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // 类别 1 · 向量统计（F001–F016）
-  // ═══════════════════════════════════════════════════════════════════════
-  mk(1, {
-    name: '向量算术均值', intuition: '均值是各元素之和除以个数。',
-    math: 'mean = Σxᵢ / n', pseudocode: 'return Σxᵢ / n', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.1', commonPitfall: '整数域下应浮点除法，否则丢精度。',
-    invariant: 'n·run = Σxᵢ',
+  // ══ 均值（F001–F012）════════════════════════════════════════════════
+  reg(1, {
+    name: '均值 · 定义', intuition: '均值是累加均分，最朴素的集中趋势。',
+    math: 'mean(x) = Σxᵢ/n', pseudocode: 's=0; for i: s+=x[i]; return s/n',
+    complexity: 'O(n)', ref: '描述统计', commonPitfall: '浮点累加不可结合，两遍求均与单遍 Kahan 结果差 ~1e-15。',
+    invariant: 'relClose(正向累加, 反向累加, 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return mean(x); },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += x[i]; return rc(x.length * out, s, 1e-9); }
-  );
-
-  mk(2, {
-    name: '总体方差', intuition: '总体方差 = 平方均值 − 均值平方（平移不变）。',
-    math: 'var = mean(x²) − mean(x)²', pseudocode: 'return mean(x*x) - mean(x)^2', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '与样本方差混淆；分母为 n 而非 n−1。',
-    invariant: 'run = mean(x²) − mean(x)² 且 run ≥ 0',
+    run: (x) => mean(x, x.length),
+    predicate: (x) => rc(mean(x, x.length), meanRev(x, x.length), 1e-9),
+  });
+  reg(2, {
+    name: '均值 · 与顺序无关', intuition: '求和是交换的，重排向量不改变均值。',
+    math: 'mean(perm(x)) = mean(x)', pseudocode: 'return mean(reverse(x))',
+    complexity: 'O(n)', ref: '交换律', commonPitfall: '浮点下不同顺序舍入不同，逐位断言会挂——用 1e-9。',
+    invariant: 'relClose(mean(x), mean(reversed), 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return meanSq(x) - mean(x) * mean(x); },
-    function pred(x, run) { const out = run(x); const v = meanSq(x) - mean(x) * mean(x); return rc(out, v, 1e-9) && out >= -1e-12; }
-  );
-
-  mk(3, {
-    name: '样本方差', intuition: '样本方差用 n/(n−1) 无偏修正。',
-    math: 's² = n/(n−1)·(mean(x²) − mean(x)²)', pseudocode: 'return n/(n-1)*(mean(x*x)-mean(x)^2)', complexity: 'O(n)',
-    ref: 'Casella & Berger 2002', commonPitfall: '分母 n−1，长度需 >1。',
-    invariant: 'run = n/(n−1)·总体方差',
+    run: (x) => mean(x, x.length),
+    predicate: (x) => { const r = new Float64Array(x.length); for (let i = 0; i < x.length; i++) r[i] = x[x.length - 1 - i]; return rc(mean(x, x.length), mean(r, r.length), 1e-9); },
+  });
+  reg(3, {
+    name: '均值 · 对加法线性', intuition: '两向量逐位相加再求均，等于分别求均再相加。',
+    math: 'mean(a+b) = mean(a)+mean(b)', pseudocode: 'return mean(add(a,b))',
+    complexity: 'O(n)', ref: '线性', commonPitfall: '浮点路径不同须容差。',
+    invariant: 'relClose(mean(a+b), mean(a)+mean(b), 1e-9)',
+    inputs: ['a', 'b'], domains: { a: 'vecSmall', b: 'vecSmall' },
+    run: (a, b) => mean(add(a, b), a.length),
+    predicate: (a, b) => rc(mean(add(a, b), a.length), mean(a, a.length) + mean(b, b.length), 1e-9),
+  });
+  reg(4, {
+    name: '均值 · 齐次性', intuition: '整体缩放 a 倍，均值也缩放 a 倍。',
+    math: 'mean(c·x) = c·mean(x)', pseudocode: 'return mean(scale(x,c))',
+    complexity: 'O(n)', ref: '齐次', commonPitfall: 'c 为负时符号翻转，用容差规避。',
+    invariant: 'relClose(mean(c·x), c·mean(x), 1e-9)',
+    inputs: ['c', 'x'], domains: { c: 'small', x: 'vecSmall' },
+    run: (c, x) => mean(scale(x, c), x.length),
+    predicate: (c, x) => rc(mean(scale(x, c), x.length), c * mean(x, x.length), 1e-9),
+  });
+  reg(5, {
+    name: '均值 · 平移', intuition: '整体加常数 c，均值也加 c。',
+    math: 'mean(x+c) = mean(x)+c', pseudocode: 'return mean(shift(x,c))',
+    complexity: 'O(n)', ref: '平移', commonPitfall: '无',
+    invariant: 'relClose(mean(x+c), mean(x)+c, 1e-9)',
+    inputs: ['x', 'c'], domains: { x: 'vecSmall', c: 'small' },
+    run: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return mean(t, x.length); },
+    predicate: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return rc(mean(t, x.length), mean(x, x.length) + c, 1e-9); },
+  });
+  reg(6, {
+    name: '均值 · 常数向量', intuition: '分量全相等的向量，其均值恰为该常数。',
+    math: 'mean(c,c,…,c) = c', pseudocode: 'return mean(constVec)',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '无',
+    invariant: 'relClose(mean(const), c, 1e-9)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const v = meanSq(x) - mean(x) * mean(x); return (n / (n - 1)) * v; },
-    function pred(x, run) { const out = run(x); const n = x.length; const v = meanSq(x) - mean(x) * mean(x); return rc(out, (n / (n - 1)) * v, 1e-9); }
-  );
-
-  mk(4, {
-    name: '标准差', intuition: '标准差是方差的平方根。',
-    math: 'std = √var', pseudocode: 'return sqrt(var)', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '应取非负根。',
-    invariant: 'run = √总体方差 且 run ≥ 0',
+    run: (x) => { const c = x[0], n = x.length; let s = 0; for (let i = 0; i < n; i++) s += c; return s / n; },
+    predicate: (x) => rc((() => { const c = x[0], n = x.length; let s = 0; for (let i = 0; i < n; i++) s += c; return s / n; })(), x[0], 1e-9),
+  });
+  reg(7, {
+    name: '均值 · 矩阵按行', intuition: '批量数据中每行是一条样本，逐行求均得各样本均值。',
+    math: 'rᵢ = mean(Mᵢ,:)', pseudocode: 'for i: rowMean[i] = mean(M[i*D:(i+1)*D])',
+    complexity: 'O(N·D)', ref: '描述统计', commonPitfall: '行优先索引别写反。',
+    invariant: '逐元素 relClose(行均, 反向累加参考, 1e-9)',
+    inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = mean(M.subarray(i * d, (i + 1) * d), d); return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = mean(M.subarray(i * d, (i + 1) * d), d); const ref = new Float64Array(n); for (let i = 0; i < n; i++) ref[i] = meanRev(M.subarray(i * d, (i + 1) * d), d); return rc(out, ref, 1e-9); },
+  });
+  reg(8, {
+    name: '均值 · 矩阵按列', intuition: '特征维上逐列求均，得各通道的批量均值（BatchNorm 的 μ）。',
+    math: 'cⱼ = mean(M:,ⱼ)', pseudocode: 'for j: colMean[j] = mean(M[:,j])',
+    complexity: 'O(N·D)', ref: '描述统计', commonPitfall: 'BatchNorm 的 μ 正是按列（通道）均值。',
+    invariant: '逐元素 relClose(列均, 反向累加参考, 1e-9)',
+    inputs: ['M'], domains: { M: 'matSmall' }, matrixDims: { M: [4, 4] },
+    run: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(d); for (let j = 0; j < d; j++) { let s = 0; for (let i = 0; i < n; i++) s += M[i * d + j]; out[j] = s / n; } return out; },
+    predicate: (M) => { const n = sq(M), d = M.length / n, out = new Float64Array(d); for (let j = 0; j < d; j++) { let s = 0; for (let i = 0; i < n; i++) s += M[i * d + j]; out[j] = s / n; } const ref = new Float64Array(d); for (let j = 0; j < d; j++) { let s = 0; for (let i = n - 1; i >= 0; i--) s += M[i * d + j]; ref[j] = s / n; } return rc(out, ref, 1e-9); },
+  });
+  reg(9, {
+    name: '均值 · 零向量', intuition: '全零向量的均值恰为 0。',
+    math: 'mean(0,…,0) = 0', pseudocode: 'return mean(zeros)',
+    complexity: 'O(1)', ref: '定义', commonPitfall: '−0 与 0 在 Object.is 下不同，用容差。',
+    invariant: 'relClose(mean(0), 0, 1e-12)',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return Math.sqrt(variance(x)); },
-    function pred(x, run) { const out = run(x); return rc(out, Math.sqrt(variance(x)), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(5, {
-    name: '均方根 RMS', intuition: 'RMS 是平方均值的平方根。',
-    math: 'rms = √(mean(x²))', pseudocode: 'return sqrt(mean(x*x))', complexity: 'O(n)',
-    ref: 'IEEE 754-2019', commonPitfall: '与标准差混淆（未减均值）。',
-    invariant: 'run = √(mean(x²)) 且 run ≥ 0',
+    run: (x) => { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += 0; return s / n; },
+    predicate: (x) => rc((() => { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += 0; return s / n; })(), 0, 1e-12),
+  });
+  reg(10, {
+    name: '均值 · 落于极值之间', intuition: '均值恒在最小值与最大值之间，是最稳健的界。',
+    math: 'min(x) ≤ mean(x) ≤ max(x)', pseudocode: 'return mean(x)',
+    complexity: 'O(n)', ref: '均值不等式', commonPitfall: '浮点误差下取 ≤ 并留 1e-12 裕度。',
+    invariant: 'min(x)−tol ≤ mean(x) ≤ max(x)+tol',
     inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return rms(x); },
-    function pred(x, run) { const out = run(x); return rc(out, Math.sqrt(meanSq(x)), 1e-9) && out >= -1e-12; }
-  );
+    run: (x) => mean(x, x.length),
+    predicate: (x) => { const n = x.length, m = mean(x, n); let lo = Infinity, hi = -Infinity; for (let i = 0; i < n; i++) { if (x[i] < lo) lo = x[i]; if (x[i] > hi) hi = x[i]; } return lo - 1e-12 <= m && m <= hi + 1e-12; },
+  });
+  reg(11, {
+    name: '均值 · 正向平移单调', intuition: '每项叠加正数，均值不降。',
+    math: 'c>0 ⇒ mean(x+c) ≥ mean(x)', pseudocode: 'return mean(shift(x,c))',
+    complexity: 'O(n)', ref: '单调性', commonPitfall: 'c 须为正；用容差。',
+    invariant: 'c>0 ⇒ mean(x+c) ≥ mean(x) − 1e-12',
+    inputs: ['x', 'c'], domains: { x: 'vecSmall', c: 'smallPos' },
+    run: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return mean(t, x.length); },
+    predicate: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return mean(t, x.length) >= mean(x, x.length) - 1e-12; },
+  });
+  reg(12, {
+    name: '均值 · 与求和关系', intuition: '均值乘以长度即总和，二者等价。',
+    math: 'mean(x)·n = Σxᵢ', pseudocode: 'return mean(x)*n',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '大数下乘 n 放大误差，容差 1e-9。',
+    invariant: 'relClose(mean(x)·n, Σxᵢ, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => mean(x, x.length) * x.length,
+    predicate: (x) => { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += x[i]; return rc(mean(x, n) * n, s, 1e-9); },
+  });
 
-  mk(6, {
-    name: '变异系数', intuition: '变异系数 = 标准差/|均值|，衡量相对离散度（需均值非零）。',
-    math: 'cv = std / |mean|', pseudocode: 'return std(x)/abs(mean(x))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '均值接近 0 时爆炸；故域用 vecPos。',
-    invariant: 'run = std/|mean| 且 run ≥ 0',
+  // ══ 方差与标准差（F013–F024）════════════════════════════════════════
+  reg(13, {
+    name: '总体方差 · 定义', intuition: '方差是离均差平方的平均，度量离散程度。',
+    math: 'Var = Σ(xᵢ−μ)²/n', pseudocode: 'm=mean(x); s=0; for i: s+=(x[i]-m)^2; return s/n',
+    complexity: 'O(n)', ref: '描述统计', commonPitfall: '两遍法（先求均再求差平方）数值最稳。',
+    invariant: 'relClose(两遍法, Σx²/n−μ² 参考路径, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => varPop(x, x.length),
+    predicate: (x) => rc(varPop(x, x.length), varPopRef(x, x.length), 1e-9),
+  });
+  reg(14, {
+    name: '总体方差 · 非负', intuition: '离均差平方和必非负。',
+    math: 'Var ≥ 0', pseudocode: 'return varPop(x)',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '浮点可能给出 −1e-16，留 1e-12 裕度。',
+    invariant: 'Var ≥ −1e-12',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => varPop(x, x.length),
+    predicate: (x) => varPop(x, x.length) >= -1e-12,
+  });
+  reg(15, {
+    name: '总体方差 · 常数向量为 0', intuition: '无离散度的数据方差为 0。',
+    math: 'Var(c,c,…,c) = 0', pseudocode: 'return varPop(constVec)',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '无',
+    invariant: 'relClose(Var(const), 0, 1e-12)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const c = x[0], n = x.length; const v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = c; return varPop(v, n); },
+    predicate: (x) => { const c = x[0], n = x.length; const v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = c; return rc(varPop(v, n), 0, 1e-12); },
+  });
+  reg(16, {
+    name: '总体方差 · 平移不变', intuition: '整体加常数不改变离散程度（位置变了，形状没变）。',
+    math: 'Var(x+c) = Var(x)', pseudocode: 'return varPop(shift(x,c))',
+    complexity: 'O(n)', ref: '平移不变性', commonPitfall: '无',
+    invariant: 'relClose(Var(x+c), Var(x), 1e-9)',
+    inputs: ['x', 'c'], domains: { x: 'vecSmall', c: 'small' },
+    run: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return varPop(t, x.length); },
+    predicate: (x, c) => { const t = new Float64Array(x.length); for (let i = 0; i < x.length; i++) t[i] = x[i] + c; return rc(varPop(t, x.length), varPop(x, x.length), 1e-9); },
+  });
+  reg(17, {
+    name: '总体方差 · 齐次（缩放平方）', intuition: '整体缩放 a 倍，方差缩放 a² 倍。',
+    math: 'Var(a·x) = a²·Var(x)', pseudocode: 'return varPop(scale(x,a))',
+    complexity: 'O(n)', ref: '齐次', commonPitfall: '注意是 a² 而非 a；a 负时 a² 仍正。',
+    invariant: 'relClose(Var(a·x), a²·Var(x), 1e-9)',
+    inputs: ['a', 'x'], domains: { a: 'small', x: 'vecSmall' },
+    run: (a, x) => varPop(scale(x, a), x.length),
+    predicate: (a, x) => rc(varPop(scale(x, a), x.length), a * a * varPop(x, x.length), 1e-9),
+  });
+  reg(18, {
+    name: '总体方差 · 与均方关系', intuition: '方差等于「平方的均值」减「均值的平方」（简化公式）。',
+    math: 'Var = E[x²] − E[x]²', pseudocode: 'return sumSq(x)/n - mean(x)^2',
+    complexity: 'O(n)', ref: '方差恒等式', commonPitfall: '简化公式相减易抵消精度，容差 1e-9。',
+    invariant: 'relClose(Var, Σx²/n − μ², 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => varPop(x, x.length),
+    predicate: (x) => { const n = x.length; return rc(varPop(x, n), sumSq(x, n) / n - Math.pow(mean(x, n), 2), 1e-9); },
+  });
+  reg(19, {
+    name: '样本方差 · 定义（无偏）', intuition: '用 n−1 而非 n 做分母，消除对总体方差的低估。',
+    math: 's² = Σ(xᵢ−μ)²/(n−1)', pseudocode: 'm=mean(x); s=0; for i: s+=(x[i]-m)^2; return s/(n-1)',
+    complexity: 'O(n)', ref: '统计推断', commonPitfall: 'n=1 时分母为 0——故域长度固定 ≥2（vecSmall defLen=8）。',
+    invariant: 'relClose(两遍法, (Σx²−nμ²)/(n−1) 参考, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const n = x.length, m = mean(x, n); let s = 0; for (let i = 0; i < n; i++) { const d = x[i] - m; s += d * d; } return s / (n - 1); },
+    predicate: (x) => { const n = x.length, m = meanRev(x, n); const ss = sumSqRev(x, n); const ref = Math.max(0, ss - n * m * m) / (n - 1); const v = (() => { let s = 0; const mm = mean(x, n); for (let i = 0; i < n; i++) { const d = x[i] - mm; s += d * d; } return s / (n - 1); })(); return rc(v, ref, 1e-9); },
+  });
+  reg(20, {
+    name: '样本方差 · 与总体关系', intuition: '样本方差恰为总体方差的 n/(n−1) 倍（Bessel 校正）。',
+    math: 's² = n/(n−1)·Var', pseudocode: 'return varSample(x)',
+    complexity: 'O(n)', ref: 'Bessel 校正', commonPitfall: '无',
+    invariant: 'relClose(s², n/(n−1)·Var, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { const n = x.length, m = mean(x, n); let s = 0; for (let i = 0; i < n; i++) { const d = x[i] - m; s += d * d; } return s / (n - 1); },
+    predicate: (x) => { const n = x.length; const samp = (() => { let s = 0; const mm = mean(x, n); for (let i = 0; i < n; i++) { const d = x[i] - mm; s += d * d; } return s / (n - 1); })(); return rc(samp, (n / (n - 1)) * varPop(x, n), 1e-9); },
+  });
+  reg(21, {
+    name: '标准差 · 定义', intuition: '标准差是方差的平方根，与原始量纲一致。',
+    math: 'σ = √Var', pseudocode: 'return sqrt(varPop(x))',
+    complexity: 'O(n)', ref: '描述统计', commonPitfall: '方差非负，开方安全。',
+    invariant: 'relClose(σ, √Var, 1e-12)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => stdPop(x, x.length),
+    predicate: (x) => rc(stdPop(x, x.length), Math.sqrt(varPop(x, x.length)), 1e-12),
+  });
+  reg(22, {
+    name: '标准差 · 齐次（缩放绝对值）', intuition: '缩放 a 倍，标准差缩放 |a| 倍。',
+    math: 'σ(a·x) = |a|·σ(x)', pseudocode: 'return sqrt(varPop(scale(x,a)))',
+    complexity: 'O(n)', ref: '齐次', commonPitfall: '取绝对值，a 负时同号。',
+    invariant: 'relClose(σ(a·x), |a|·σ(x), 1e-9)',
+    inputs: ['a', 'x'], domains: { a: 'small', x: 'vecSmall' },
+    run: (a, x) => stdPop(scale(x, a), x.length),
+    predicate: (a, x) => rc(stdPop(scale(x, a), x.length), Math.abs(a) * stdPop(x, x.length), 1e-9),
+  });
+  reg(23, {
+    name: '标准差 · 非负', intuition: '标准差为非负实数。',
+    math: 'σ ≥ 0', pseudocode: 'return stdPop(x)',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '无',
+    invariant: 'σ ≥ −1e-12',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => stdPop(x, x.length),
+    predicate: (x) => stdPop(x, x.length) >= -1e-12,
+  });
+  reg(24, {
+    name: '切比雪夫界（样本版）', intuition: '距均值超过 kσ 的元素占比，绝不超过 1/k²——最宽松也最稳的分布界。',
+    math: '|{i: |xᵢ−μ|≥kσ}|/n ≤ 1/k²', pseudocode: 'count beyond kσ; return count/n',
+    complexity: 'O(n)', ref: 'Chebyshev 不等式（样本确定性版）', commonPitfall: '这是样本上的确定性事实（Σ(x−μ)² ≥ k²σ²·#beyond），非概率近似。',
+    invariant: 'frac(kσ-outliers) ≤ 1/k² + 1e-12',
+    inputs: ['x', 'k'], domains: { x: 'vecSmall', k: 'smallPos' },
+    run: (x, k) => { const n = x.length, m = mean(x, n), sd = stdPop(x, n); let c = 0; for (let i = 0; i < n; i++) if (Math.abs(x[i] - m) >= k * sd) c++; return c / n; },
+    predicate: (x, k) => { const n = x.length, m = mean(x, n), sd = stdPop(x, n); let c = 0; for (let i = 0; i < n; i++) if (Math.abs(x[i] - m) >= k * sd) c++; return (c / n) <= 1 / (k * k) + 1e-12; },
+  });
+
+  // ══ L2 范数与向量单位化（F025–F032）════════════════════════════════
+  reg(25, {
+    name: 'L2 范数 · 定义', intuition: '欧氏长度是分量平方和的平方根。',
+    math: '‖x‖₂ = √Σxᵢ²', pseudocode: 's=0; for i: s+=x[i]^2; return sqrt(s)',
+    complexity: 'O(n)', ref: '线性代数', commonPitfall: '大分量下平方和易溢出，域限 small 规避。',
+    invariant: 'relClose(正向累加, 反向累加, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => l2(x, x.length),
+    predicate: (x) => rc(l2(x, x.length), l2Rev(x, x.length), 1e-9),
+  });
+  reg(26, {
+    name: 'L2 范数 · 齐次', intuition: '缩放 a 倍，范数缩放 |a| 倍（齐次函数）。',
+    math: '‖a·x‖ = |a|·‖x‖', pseudocode: 'return l2(scale(x,a))',
+    complexity: 'O(n)', ref: '齐次', commonPitfall: '取绝对值。',
+    invariant: 'relClose(‖a·x‖, |a|·‖x‖, 1e-9)',
+    inputs: ['a', 'x'], domains: { a: 'small', x: 'vecSmall' },
+    run: (a, x) => l2(scale(x, a), x.length),
+    predicate: (a, x) => rc(l2(scale(x, a), x.length), Math.abs(a) * l2(x, x.length), 1e-9),
+  });
+  reg(27, {
+    name: 'L2 范数 · 三角不等式', intuition: '两边之和不小于第三边，范数的核心公理。',
+    math: '‖x+y‖ ≤ ‖x‖ + ‖y‖', pseudocode: 'return l2(add(x,y))',
+    complexity: 'O(n)', ref: 'Minkowski 不等式', commonPitfall: '浮点误差下取 ≤ 并留 1e-9 裕度。',
+    invariant: '‖x+y‖ ≤ ‖x‖ + ‖y‖ + 1e-9',
+    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
+    run: (x, y) => l2(add(x, y), x.length),
+    predicate: (x, y) => l2(add(x, y), x.length) <= l2(x, x.length) + l2(y, y.length) + 1e-9,
+  });
+  reg(28, {
+    name: 'L2 范数 · 非负', intuition: '长度非负。',
+    math: '‖x‖ ≥ 0', pseudocode: 'return l2(x)',
+    complexity: 'O(n)', ref: '定义', commonPitfall: '无',
+    invariant: '‖x‖ ≥ −1e-12',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => l2(x, x.length),
+    predicate: (x) => l2(x, x.length) >= -1e-12,
+  });
+  reg(29, {
+    name: 'L2 范数 · 零向量为 0', intuition: '零向量长度恰为 0。',
+    math: '‖0‖ = 0', pseudocode: 'return l2(zeros)',
+    complexity: 'O(1)', ref: '定义', commonPitfall: '−0 用容差。',
+    invariant: 'relClose(‖0‖, 0, 1e-12)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => { let s = 0; for (let i = 0; i < x.length; i++) s += 0; return Math.sqrt(s); },
+    predicate: (x) => rc((() => { let s = 0; for (let i = 0; i < x.length; i++) s += 0; return Math.sqrt(s); })(), 0, 1e-12),
+  });
+  reg(30, {
+    name: '单位化 · 定义（方向保留长度为 1）', intuition: '除以自身长度，得到同方向的单位向量（L2 归一化）。',
+    math: 'u = x/‖x‖₂，‖u‖ = 1', pseudocode: 'return x / l2(x)',
+    complexity: 'O(n)', ref: '向量归一化', commonPitfall: '零向量除零——域用 vecPos 保证 ‖x‖>0。',
+    invariant: 'relClose(‖unit(x)‖, 1, 1e-9)',
     inputs: ['x'], domains: { x: 'vecPos' },
-  },
-    function run(x) { const m = mean(x); return stddev(x) / Math.abs(m); },
-    function pred(x, run) { const out = run(x); const cv = stddev(x) / Math.abs(mean(x)); return rc(out, cv, 1e-9) && out >= -1e-12; }
-  );
-
-  mk(7, {
-    name: '中位数', intuition: '中位数把一半元素置于其下、一半置于其上。',
-    math: 'median = x_{(⌊n/2⌋)}（排序后）', pseudocode: 'return sort(x)[mid]', complexity: 'O(n log n)',
-    ref: 'Knuth TAOCP §5.3.3', commonPitfall: '偶数长度应取中间两值平均。',
-    invariant: '至少有 ⌈n/2⌉ 个元素 ≤ run，且至少 ⌈n/2⌉ 个元素 ≥ run',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return median(x); },
-    function pred(x, run) { const out = run(x); const n = x.length; const need = Math.ceil(n / 2); let le = 0, ge = 0; for (let i = 0; i < n; i++) { if (x[i] <= out + 1e-12) le++; if (x[i] >= out - 1e-12) ge++; } return le >= need - 1e-9 && ge >= need - 1e-9; }
-  );
-
-  mk(8, {
-    name: '几何均值', intuition: '正数几何均值 = 各元素乘积的 n 次根。',
-    math: 'g = (∏xᵢ)^{1/n} = exp(mean(ln x))', pseudocode: 'return exp(mean(log(x)))', complexity: 'O(n)',
-    ref: 'Fleming & Wallace 1986', commonPitfall: '负数/零无实定义；域用 vecPos。',
-    invariant: 'runⁿ = ∏xᵢ（对数恒等式）',
+    run: (x) => { const n = x.length, L = l2(x, n), out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = x[i] / L; return out; },
+    predicate: (x) => { const n = x.length, L = l2(x, n), out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = x[i] / L; return rc(l2(out, n), 1, 1e-9); },
+  });
+  reg(31, {
+    name: '单位化 · 与缩放无关', intuition: '同向（正）缩放不改变方向，单位化结果不变（c>0）。',
+    math: 'unit(c·x) = unit(x) (c>0)', pseudocode: 'return unit(scale(x,c))',
+    complexity: 'O(n)', ref: '齐次', commonPitfall: 'c 须为正，否则方向翻转（unit(−x)=−unit(x)）；域用 smallPos。',
+    invariant: '逐元素 relClose(unit(c·x), unit(x), 1e-9)',
+    inputs: ['c', 'x'], domains: { c: 'smallPos', x: 'vecPos' },
+    run: (c, x) => { const n = x.length, t = scale(x, c), L = l2(t, n), out = new Float64Array(n); for (let i = 0; i < n; i++) out[i] = t[i] / L; return out; },
+    predicate: (c, x) => { const n = x.length; const u1 = (() => { const t = scale(x, c), L = l2(t, n), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = t[i] / L; return o; })(); const u2 = (() => { const L = l2(x, n), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[i] / L; return o; })(); return rc(u1, u2, 1e-9); },
+  });
+  reg(32, {
+    name: '单位化 · 保持方向', intuition: '单位向量与原向量的内积，恰等于原向量长度。',
+    math: '⟨unit(x), x⟩ = ‖x‖', pseudocode: 'return dot(unit(x), x)',
+    complexity: 'O(n)', ref: '投影', commonPitfall: '等价于「单位向量在 x 上投影为 1」。',
+    invariant: 'relClose(dot(unit(x), x), ‖x‖, 1e-9)',
     inputs: ['x'], domains: { x: 'vecPos' },
-  },
-    function run(x) { let s = 0; for (let i = 0; i < x.length; i++) s += Math.log(x[i]); return Math.exp(s / x.length); },
-    function pred(x, run) { const out = run(x); let prod = 1; for (let i = 0; i < x.length; i++) prod *= x[i]; return rc(Math.pow(out, x.length), prod, 1e-9); }
-  );
-
-  mk(9, {
-    name: '调和均值', intuition: '调和均值 = 倒数均值的倒数（正数域）。',
-    math: 'h = n / Σ(1/xᵢ)', pseudocode: 'return n / sum(1/x)', complexity: 'O(n)',
-    ref: 'Fleming & Wallace 1986', commonPitfall: '含 0 时未定义；域用 vecPos。',
-    invariant: 'run = n / Σ(1/xᵢ) 且 run > 0',
-    inputs: ['x'], domains: { x: 'vecPos' },
-  },
-    function run(x) { let s = 0; for (let i = 0; i < x.length; i++) s += 1 / x[i]; return x.length / s; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += 1 / x[i]; return rc(out, x.length / s, 1e-9) && out > 0; }
-  );
-
-  mk(10, {
-    name: '截尾均值', intuition: '去掉一个最小与一个最大后取均值，抗离群。',
-    math: 'trimmed = mean(x 去 min、max)', pseudocode: 'sort; drop ends; return mean', complexity: 'O(n log n)',
-    ref: 'Wilcox 2011 稳健统计', commonPitfall: '偶数个极值去重要么同值取其一。',
-    invariant: 'run ∈ [min, max]（子集平均必在区间内）',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const s = Array.prototype.slice.call(x).sort((a, b) => a - b); const n = s.length; let sum = 0; for (let i = 1; i < n - 1; i++) sum += s[i]; return sum / (n - 2); },
-    function pred(x, run) { const out = run(x); return out >= minEl(x) - 1e-12 && out <= maxEl(x) + 1e-12; }
-  );
-
-  mk(11, {
-    name: '偏度', intuition: '偏度是标准化三阶中心矩，衡量分布不对称。',
-    math: 'skew = mean((x−μ)³) / σ³', pseudocode: 'return mean((x-m)^3)/std^3', complexity: 'O(n)',
-    ref: 'Joanes & Gill 1998', commonPitfall: '标准差为 0 时未定义（退化为 0）。',
-    invariant: 'run = mean((x−μ)³)/σ³（σ>0 时）',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const m = mean(x); const v = variance(x); if (v <= 1e-14) return 0; const s = Math.sqrt(v); let s3 = 0; for (let i = 0; i < x.length; i++) { const d = (x[i] - m) / s; s3 += d * d * d; } return s3 / x.length; },
-    function pred(x, run) { const out = run(x); const m = mean(x); const v = variance(x); if (v <= 1e-14) return out === 0; const s = Math.sqrt(v); let s3 = 0; for (let i = 0; i < x.length; i++) { const d = (x[i] - m) / s; s3 += d * d * d; } return rc(out, s3 / x.length, 1e-9); }
-  );
-
-  mk(12, {
-    name: '峰态（超额）', intuition: '超额峰态 = 标准化四阶中心矩 − 3。',
-    math: 'kurt = mean((x−μ)⁴)/σ⁴ − 3', pseudocode: 'return mean((x-m)^4)/std^4 - 3', complexity: 'O(n)',
-    ref: 'Joanes & Gill 1998', commonPitfall: '方差 0 时未定义（退化为 0）。',
-    invariant: 'run = 标准化四阶矩 − 3（σ>0 时）',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const m = mean(x); const v = variance(x); if (v <= 1e-14) return 0; const s = Math.sqrt(v); let s4 = 0; for (let i = 0; i < x.length; i++) { const d = (x[i] - m) / s; const d2 = d * d; s4 += d2 * d2; } return s4 / x.length - 3; },
-    function pred(x, run) { const out = run(x); const m = mean(x); const v = variance(x); if (v <= 1e-14) return out === 0; const s = Math.sqrt(v); let s4 = 0; for (let i = 0; i < x.length; i++) { const d = (x[i] - m) / s; const d2 = d * d; s4 += d2 * d2; } return rc(out, s4 / x.length - 3, 1e-9); }
-  );
-
-  mk(13, {
-    name: '均值绝对偏差', intuition: 'MAD = 各元素到均值绝对偏差的平均。',
-    math: 'mad = mean(|xᵢ − μ|)', pseudocode: 'return mean(abs(x-mean))', complexity: 'O(n)',
-    ref: 'Pham-Gia & Hung 2001', commonPitfall: '与标准差混淆。',
-    invariant: 'run = mean(|x−μ|) 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const m = mean(x); let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i] - m); return s / x.length; },
-    function pred(x, run) { const out = run(x); const m = mean(x); let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i] - m); return rc(out, s / x.length, 1e-9) && out >= -1e-12; }
-  );
-
-  mk(14, {
-    name: '截尾方差', intuition: '去极值后的总体方差，稳健估计离散度。',
-    math: 'trimmedVar = var(x 去 min、max)', pseudocode: 'sort; drop ends; return var', complexity: 'O(n log n)',
-    ref: 'Wilcox 2011', commonPitfall: '剩余长度需 ≥2。',
-    invariant: 'run = 去极值子集的总体方差',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const s = Array.prototype.slice.call(x).sort((a, b) => a - b); const n = s.length; const sub = s.slice(1, n - 1); return variance(sub); },
-    function pred(x, run) { const out = run(x); const s = Array.prototype.slice.call(x).sort((a, b) => a - b); const n = s.length; const sub = s.slice(1, n - 1); return rc(out, variance(sub), 1e-9); }
-  );
-
-  mk(15, {
-    name: '加权均值', intuition: '加权均值是加权和除以总权重。',
-    math: 'wm = Σ(wᵢxᵢ) / Σwᵢ', pseudocode: 'return dot(w,x)/sum(w)', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.1', commonPitfall: '总权重为 0 时退化为 0。',
-    invariant: 'run = Σ(wᵢxᵢ)/Σwᵢ',
-    inputs: ['x', 'w'], domains: { x: 'vecSmall', w: 'vecSmall' },
-  },
-    function run(x, w) { let sw = 0, swx = 0; for (let i = 0; i < x.length; i++) { sw += w[i]; swx += w[i] * x[i]; } return sw === 0 ? 0 : swx / sw; },
-    function pred(x, w, run) { const out = run(x, w); let sw = 0, swx = 0; for (let i = 0; i < x.length; i++) { sw += w[i]; swx += w[i] * x[i]; } return sw === 0 ? out === 0 : rc(out, swx / sw, 1e-9); }
-  );
-
-  mk(16, {
-    name: '累积均值序列', intuition: '第 k 个累积均值 = 前 k+1 个元素的平均。',
-    math: 'runₖ = (Σ_{i≤k} xᵢ)/(k+1)', pseudocode: 'prefixSum / (k+1)', complexity: 'O(n)',
-    ref: 'Knuth TAOCP §5.3', commonPitfall: '分母为 k+1 而非 k。',
-    invariant: 'runₖ = 前缀和/(k+1)，且 run₀ = x₀',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const out = new Float64Array(n); let s = 0; for (let i = 0; i < n; i++) { s += x[i]; out[i] = s / (i + 1); } return out; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) { s += x[i]; if (!rc(out[i], s / (i + 1), 1e-9)) return false; } return true; }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // 类别 2 · 范数（F017–F032）
-  // ═══════════════════════════════════════════════════════════════════════
-  mk(17, {
-    name: 'L0 范数（非零计数）', intuition: 'L0 范数统计非零元素个数。',
-    math: '‖x‖₀ = #{i : xᵢ ≠ 0}', pseudocode: 'count(x!=0)', complexity: 'O(n)',
-    ref: 'Donoho 2006 压缩感知', commonPitfall: '0 在浮点中需精确判等。',
-    invariant: 'run = 非零元素个数',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let c = 0; for (let i = 0; i < x.length; i++) if (x[i] !== 0) c++; return c; },
-    function pred(x, run) { const out = run(x); let c = 0; for (let i = 0; i < x.length; i++) if (x[i] !== 0) c++; return out === c; }
-  );
-
-  mk(18, {
-    name: 'L1 范数', intuition: 'L1 范数是绝对值之和（曼哈顿距离）。',
-    math: '‖x‖₁ = Σ|xᵢ|', pseudocode: 'return sum(abs(x))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿漏绝对值。',
-    invariant: 'run = Σ|xᵢ| 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return sumAbs(x); },
-    function pred(x, run) { const out = run(x); return rc(out, sumAbs(x), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(19, {
-    name: 'L2 范数', intuition: 'L2 范数是欧几里得长度。',
-    math: '‖x‖₂ = √(Σxᵢ²)', pseudocode: 'return sqrt(sum(x*x))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿遗漏开根。',
-    invariant: 'run = √(Σxᵢ²) 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i]; return Math.sqrt(s); },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i]; return rc(out, Math.sqrt(s), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(20, {
-    name: 'L∞ 范数（最大绝对值）', intuition: 'L∞ 范数是元素绝对值的最大值。',
-    math: '‖x‖∞ = max|xᵢ|', pseudocode: 'return max(abs(x))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿与 L2 混淆。',
-    invariant: 'run = max|xᵢ| 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { return maxAbs(x); },
-    function pred(x, run) { const out = run(x); return rc(out, maxAbs(x), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(21, {
-    name: 'Lp 范数 (p=3)', intuition: 'p 范数在 p=3 时为三次绝对矩的根。',
-    math: '‖x‖₃ = (Σ|xᵢ|³)^{1/3}', pseudocode: 'return cbrt(sum(|x|^3))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '先取绝对值再求幂。',
-    invariant: 'run = (Σ|xᵢ|³)^{1/3} 且 run ≥ 0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let s = 0; for (let i = 0; i < x.length; i++) s += Math.pow(Math.abs(x[i]), 3); return Math.cbrt(s); },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += Math.pow(Math.abs(x[i]), 3); return rc(out, Math.cbrt(s), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(22, {
-    name: '向量长度平方', intuition: 'L2 范数的平方 = 元素平方和。',
-    math: '‖x‖₂² = Σxᵢ²', pseudocode: 'return sum(x*x)', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿开根。',
-    invariant: 'run = Σxᵢ²',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i]; return s; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i]; return rc(out, s, 1e-9); }
-  );
-
-  mk(23, {
-    name: 'L2 归一化', intuition: '除以 L2 范数得到单位向量（零向量退化为 0）。',
-    math: 'run = x / ‖x‖₂', pseudocode: 'return x / norm(x)', complexity: 'O(n)',
-    ref: 'Ba et al. 2016 LayerNorm', commonPitfall: '零向量需特判避免除零。',
-    invariant: '‖run‖₂ ≈ 1（x≠0）；x=0 时 run=0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += x[i] * x[i]; const nrm = Math.sqrt(s); const out = new Float64Array(n); if (nrm > 1e-12) for (let i = 0; i < n; i++) out[i] = x[i] / nrm; return out; },
-    function pred(x, run) { const out = run(x); let nx = 0; for (let i = 0; i < x.length; i++) nx += x[i] * x[i]; nx = Math.sqrt(nx); let nr = 0; for (let i = 0; i < out.length; i++) nr += out[i] * out[i]; nr = Math.sqrt(nr); if (nx > 1e-12) return rc(nr, 1, 1e-9); for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; }
-  );
-
-  mk(24, {
-    name: 'L1 归一化', intuition: '除以 L1 范数得到 L1 单位向量。',
-    math: 'run = x / ‖x‖₁', pseudocode: 'return x / sumAbs(x)', complexity: 'O(n)',
-    ref: 'Ba et al. 2016', commonPitfall: '零向量需特判。',
-    invariant: '‖run‖₁ ≈ 1（x≠0）；x=0 时 run=0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += Math.abs(x[i]); const out = new Float64Array(n); if (s > 1e-12) for (let i = 0; i < n; i++) out[i] = x[i] / s; return out; },
-    function pred(x, run) { const out = run(x); let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i]); if (s > 1e-12) { let sr = 0; for (let i = 0; i < out.length; i++) sr += Math.abs(out[i]); return rc(sr, 1, 1e-9); } for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; }
-  );
-
-  mk(25, {
-    name: '最大绝对值归一化', intuition: '除以最大绝对值，使最大分量幅度为 1。',
-    math: 'run = x / max|xᵢ|', pseudocode: 'return x / maxAbs(x)', complexity: 'O(n)',
-    ref: 'Ba et al. 2016', commonPitfall: '零向量需特判。',
-    invariant: 'max|run| ≈ 1 且 |runᵢ| ≤ 1（x≠0）',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; const m = maxAbs(x); const out = new Float64Array(n); if (m > 1e-12) for (let i = 0; i < n; i++) out[i] = x[i] / m; return out; },
-    function pred(x, run) { const out = run(x); const m = maxAbs(x); if (m > 1e-12) { if (maxAbs(out) > 1 + 1e-9) return false; return rc(maxAbs(out), 1, 1e-9); } for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; }
-  );
-
-  mk(26, {
-    name: '余弦相似度', intuition: '余弦相似度 = 点积除以两向量范数之积。',
-    math: 'cos = x·y / (‖x‖₂‖y‖₂)', pseudocode: 'return dot(x,y)/(norm(x)*norm(y))', complexity: 'O(n)',
-    ref: 'Manning et al. 2008 IR', commonPitfall: '零向量需特判；结果应在 [-1,1]。',
-    invariant: 'run = x·y/(‖x‖‖y‖) 且 |run| ≤ 1',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { const nx = Math.sqrt(dot(x, x)), ny = Math.sqrt(dot(y, y)); if (nx < 1e-12 || ny < 1e-12) return 0; return dot(x, y) / (nx * ny); },
-    function pred(x, y, run) { const out = run(x, y); const nx = Math.sqrt(dot(x, x)), ny = Math.sqrt(dot(y, y)); if (nx < 1e-12 || ny < 1e-12) return out === 0; const c = dot(x, y) / (nx * ny); return rc(out, c, 1e-9) && Math.abs(out) <= 1 + 1e-9; }
-  );
-
-  mk(27, {
-    name: '向量夹角', intuition: '夹角 = 余弦相似度的反余弦，范围 [0,π]。',
-    math: 'θ = arccos(x·y/(‖x‖‖y‖))', pseudocode: 'return acos(cos)', complexity: 'O(n)',
-    ref: 'Manning et al. 2008 IR', commonPitfall: '结果需裁剪到 [0,π]。',
-    invariant: 'run = arccos(cos) 且 run ∈ [0,π]',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { const nx = Math.sqrt(dot(x, x)), ny = Math.sqrt(dot(y, y)); if (nx < 1e-12 || ny < 1e-12) return 0; let c = dot(x, y) / (nx * ny); if (c > 1) c = 1; if (c < -1) c = -1; return Math.acos(c); },
-    function pred(x, y, run) { const out = run(x, y); const nx = Math.sqrt(dot(x, x)), ny = Math.sqrt(dot(y, y)); if (nx < 1e-12 || ny < 1e-12) return out === 0; let c = dot(x, y) / (nx * ny); if (c > 1) c = 1; if (c < -1) c = -1; return rc(out, Math.acos(c), 1e-9) && out >= -1e-12 && out <= Math.PI + 1e-12; }
-  );
-
-  mk(28, {
-    name: '投影标量（到 y 方向）', intuition: 'x 在 y 方向上的投影长度 = x·y/‖y‖。',
-    math: 'proj = x·y / ‖y‖₂', pseudocode: 'return dot(x,y)/norm(y)', complexity: 'O(n)',
-    ref: 'Strang 2016 线性代数', commonPitfall: '|投影| ≤ ‖x‖。',
-    invariant: 'run = x·y/‖y‖ 且 |run| ≤ ‖x‖',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { const ny = Math.sqrt(dot(y, y)); if (ny < 1e-12) return 0; return dot(x, y) / ny; },
-    function pred(x, y, run) { const out = run(x, y); const ny = Math.sqrt(dot(y, y)); if (ny < 1e-12) return out === 0; const p = dot(x, y) / ny; return rc(out, p, 1e-9) && Math.abs(out) <= Math.sqrt(dot(x, x)) + 1e-9; }
-  );
-
-  mk(29, {
-    name: '曼哈顿距离', intuition: '两向量绝对差之和。',
-    math: 'd₁ = Σ|xᵢ − yᵢ|', pseudocode: 'return sum(abs(x-y))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿漏绝对值。',
-    invariant: 'run = Σ|xᵢ−yᵢ| 且 run ≥ 0',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i] - y[i]); return s; },
-    function pred(x, y, run) { const out = run(x, y); let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i] - y[i]); return rc(out, s, 1e-9) && out >= -1e-12; }
-  );
-
-  mk(30, {
-    name: '欧几里得距离', intuition: '两向量差向量的 L2 范数。',
-    math: 'd₂ = √(Σ(xᵢ−yᵢ)²)', pseudocode: 'return sqrt(sum((x-y)^2))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿漏开根。',
-    invariant: 'run = √(Σ(xᵢ−yᵢ)²) 且 run ≥ 0',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { let s = 0; for (let i = 0; i < x.length; i++) { const d = x[i] - y[i]; s += d * d; } return Math.sqrt(s); },
-    function pred(x, y, run) { const out = run(x, y); let s = 0; for (let i = 0; i < x.length; i++) { const d = x[i] - y[i]; s += d * d; } return rc(out, Math.sqrt(s), 1e-9) && out >= -1e-12; }
-  );
-
-  mk(31, {
-    name: '切比雪夫距离', intuition: '两向量最大绝对差。',
-    math: 'd∞ = max|xᵢ − yᵢ|', pseudocode: 'return max(abs(x-y))', complexity: 'O(n)',
-    ref: 'Goodfellow 2016 §3.4', commonPitfall: '勿与 L2 混淆。',
-    invariant: 'run = max|xᵢ−yᵢ| 且 run ≥ 0',
-    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
-  },
-    function run(x, y) { let m = 0; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i] - y[i]); if (v > m) m = v; } return m; },
-    function pred(x, y, run) { const out = run(x, y); let m = 0; for (let i = 0; i < x.length; i++) { const v = Math.abs(x[i] - y[i]); if (v > m) m = v; } return rc(out, m, 1e-9) && out >= -1e-12; }
-  );
-
-  mk(32, {
-    name: 'Lp 归一化 (p=4)', intuition: '除以 L4 范数得到 L4 单位向量。',
-    math: 'run = x / ‖x‖₄, ‖x‖₄=(Σ|x|⁴)^{1/4}', pseudocode: 'return x / lp4norm(x)', complexity: 'O(n)',
-    ref: 'Ba et al. 2016', commonPitfall: '零向量需特判。',
-    invariant: '‖run‖₄ ≈ 1（x≠0）；x=0 时 run=0',
-    inputs: ['x'], domains: { x: 'vecSmall' },
-  },
-    function run(x) { const n = x.length; let s = 0; for (let i = 0; i < n; i++) s += Math.pow(Math.abs(x[i]), 4); const nrm = Math.pow(s, 0.25); const out = new Float64Array(n); if (nrm > 1e-12) for (let i = 0; i < n; i++) out[i] = x[i] / nrm; return out; },
-    function pred(x, run) { const out = run(x); let sx = 0; for (let i = 0; i < x.length; i++) sx += Math.pow(Math.abs(x[i]), 4); const nx = Math.pow(sx, 0.25); if (nx > 1e-12) { let sr = 0; for (let i = 0; i < out.length; i++) sr += Math.pow(Math.abs(out[i]), 4); return rc(Math.pow(sr, 0.25), 1, 1e-9); } for (let i = 0; i < out.length; i++) if (out[i] !== 0) return false; return true; }
-  );
-
-  // 辅助：L1 绝对值求和（函数声明提升，run(18) 可用）。
-  function sumAbs(a) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i]); return s; }
+    run: (x) => { const n = x.length, L = l2(x, n), u = new Float64Array(n); for (let i = 0; i < n; i++) u[i] = x[i] / L; return dot(u, x, n); },
+    predicate: (x) => { const n = x.length, L = l2(x, n), u = new Float64Array(n); for (let i = 0; i < n; i++) u[i] = x[i] / L; return rc(dot(u, x, n), L, 1e-9); },
+  });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

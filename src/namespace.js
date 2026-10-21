@@ -48,16 +48,24 @@ NS.__loadOrder = [
   './L10-microisa/D-attention-000.js',
   './L10-microisa/D-attention-001.js',
   './L10-microisa/D-attention-002.js',
-  // L10 · F/G/H 域（归一化 / 激活与损失 / 采样与量化）：各 128 项，与 A–E 同模式
-  //   （依赖上方 L8/L9，故置于其后）。T06 新增，将 ISA 由 480 推至 864/1024。
+  // L10 · F 域（归一化，128 项）：均值/方差/L2 范数、LayerNorm/RMSNorm/
+  //   BatchNorm/GroupNorm/权重标准化/LRN、min-max/z-score/L1/L∞ 归一化、
+  //   logsumexp 高级/数值稳定、矩阵/批归一化（F001–F096 远端 v15.3 三批 +
+  //   F097–F128 T06 第四批）。
   './L10-microisa/F-norm-000.js',
   './L10-microisa/F-norm-001.js',
   './L10-microisa/F-norm-002.js',
   './L10-microisa/F-norm-003.js',
-  './L10-microisa/G-actloss-000.js',
-  './L10-microisa/G-actloss-001.js',
-  './L10-microisa/G-actloss-002.js',
+  // L10 · G 域（激活与损失，128 项）：sigmoid/tanh/ReLU 家族/GELU/Swish/
+  //   Mish/SELU 等、softmax/log_softmax、MSE/MAE/Huber/BCE/CE/KL/Focal、
+  //   数值稳定交叉熵/温度缩放/gumbel-softmax（G001–G096 远端 v15.4 三批 +
+  //   G097–G128 T06 第四批）。
+  './L10-microisa/G-act-000.js',
+  './L10-microisa/G-act-001.js',
+  './L10-microisa/G-act-002.js',
   './L10-microisa/G-actloss-003.js',
+  // L10 · H 域（采样与量化，128 项）：确定性采样/top-k/top-p、温度缩放、
+  //   舍入、INT8 对称/仿射/逐通道量化、量化性质/端到端（T06 全量）。
   './L10-microisa/H-samplequant-000.js',
   './L10-microisa/H-samplequant-001.js',
   './L10-microisa/H-samplequant-002.js',
