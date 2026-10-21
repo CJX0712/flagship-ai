@@ -48,6 +48,20 @@ NS.__loadOrder = [
   './L10-microisa/D-attention-000.js',
   './L10-microisa/D-attention-001.js',
   './L10-microisa/D-attention-002.js',
+  // L10 · F/G/H 域（归一化 / 激活与损失 / 采样与量化）：各 128 项，与 A–E 同模式
+  //   （依赖上方 L8/L9，故置于其后）。T06 新增，将 ISA 由 480 推至 864/1024。
+  './L10-microisa/F-norm-000.js',
+  './L10-microisa/F-norm-001.js',
+  './L10-microisa/F-norm-002.js',
+  './L10-microisa/F-norm-003.js',
+  './L10-microisa/G-actloss-000.js',
+  './L10-microisa/G-actloss-001.js',
+  './L10-microisa/G-actloss-002.js',
+  './L10-microisa/G-actloss-003.js',
+  './L10-microisa/H-samplequant-000.js',
+  './L10-microisa/H-samplequant-001.js',
+  './L10-microisa/H-samplequant-002.js',
+  './L10-microisa/H-samplequant-003.js',
   // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
   './L7-tensor/tensor.js',
   './L7-tensor/shape.js',

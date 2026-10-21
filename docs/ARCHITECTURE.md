@@ -564,7 +564,7 @@ logits = LN_f(x)·Wteᵀ
 | L7 张量与内存 | `src/L7-tensor/*` | tensor / shape / arena / kv-cache | 已拆 |
 | L8 数值内核 | `src/L8-kernel/*` | matmul / reduce / quantize | 已拆（与 legacy 逐位一致，Δ=0） |
 | L9 数值基础 | `src/L9-numbase/*` | rng / fp-ops / special / assert | 已拆 |
-| L10 微指令 | `src/L10-microisa/*` | 1024 槽位注册中心 + 七件套微指令（八域 × 128） | 480/1024 已实现（A 96 + B 96 + C 96 + D 96 + E 96） |
+| L10 微指令 | `src/L10-microisa/*` | 1024 槽位注册中心 + 七件套微指令（八域 × 128） | 864/1024 已实现（A–E 各 96 + F 128 + G 128 + H 128） |
 
 - **装配真源**：`src/namespace.js` 的 `__loadOrder`（自底向上 L10 → L9 → … → L3），Node 侧 `src/index.js` 与浏览器侧 `scripts/build-demo.js` 共读，杜绝两端顺序漂移。
 - **层红线（K5）**：`src/L*` 禁 `require( / module.exports / import / export / fetch( / new Worker / XMLHttpRequest / Math.random / Date.now`（`scripts/lint-layers.js` 硬门禁）——保证层文件可被浏览器 `file://` 内联且确定性可复现。
@@ -594,8 +594,8 @@ demo.html
 | 门禁 | 命令 | 覆盖 |
 |---|---|---|
 | 零回归 R1–R10 | `npm run regression` | v11 ↔ 当前 导出清单/logits/grads/train/generate/算子逐位一致 |
-| 微指令门禁 | `npm run test:L10`（`scripts/probe-microisa.js`） | 1024 容量 · 480 实现计数诚实且与 `isa.js` 交叉一致 · 480×2 种子不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响（K15 34 键） |
-| 性质测试 | `npm run test:layers`（`node --test` + fast-check） | A/B/C/D/E 五域每项 ≥120 例任意子谓词检验 |
+| 微指令门禁 | `npm run test:L10`（`scripts/probe-microisa.js`） | 1024 容量 · 864 实现计数诚实且与 `isa.js` 交叉一致 · 864×2 种子不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响（K15 34 键） |
+| 性质测试 | `npm run test:layers`（`node --test` + fast-check） | A/B/C/D/E/F/G/H 八域每项 ≥120 例任意子谓词检验 |
 | 浏览器装配 | `npm run test:demo`（`scripts/probe-demo.js`） | 脚本块无异常 · 34 键一致 · L3–L10 挂载 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性 |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
 

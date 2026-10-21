@@ -4,17 +4,17 @@
  * 经生产加载路径 src/index.js 加载十层，再读取 globalThis.FlagshipAI.L10.stats()。
  *
  * 验收标准 ④：输出形如
- *   A 96/128 · B 96/128 · C 96/128 · D 96/128 · E 96/128 · 合计 480/1024
- * 断言策略（T05 收官）：
- *   - A/B/C/D/E 五域为固定契约，各须恰为 96，不符 exit 1（防误删 / 漏实现）；
- *   - 合计固定 480，槽位总容量恒 1024；
+ *   A 96 · B 96 · C 96 · D 96 · E 96 · F 128 · G 128 · H 128 · 合计 864/1024
+ * 断言策略（T05 收官 + T06 扩展）：
+ *   - A–E 各恰为 96、F/G/H 各恰为 128，均为固定契约，不符 exit 1（防误删 / 漏实现）；
+ *   - 合计固定 864，槽位总容量恒 1024；
  *   - 落地期间曾对 E 域用「浮动总量」以容忍并行进度，E 完工后已收紧为定值。
  *
  * 用法：node scripts/isa.js            # 打印覆盖率
  *       node scripts/isa.js --stats    # 同上（兼容文档写法）
  */
-const EXPECT = { A: 96, B: 96, C: 96, D: 96, E: 96, total: 480, capacity: 1024 };
-const FIXED_DOMAINS = ['A', 'B', 'C', 'D', 'E'];
+const EXPECT = { A: 96, B: 96, C: 96, D: 96, E: 96, F: 128, G: 128, H: 128, total: 864, capacity: 1024 };
+const FIXED_DOMAINS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
 require('../src/index.js'); // 生产加载路径：填充 globalThis.FlagshipAI
 const NS = globalThis.FlagshipAI;
@@ -38,7 +38,7 @@ if (s.total.impl !== EXPECT.total) { ok = false; console.error(`❌ 合计 ${s.t
 if (s.total.capacity !== EXPECT.capacity) { ok = false; console.error(`❌ 槽位总容量 ${s.total.capacity}，期望 ${EXPECT.capacity}`); }
 
 if (ok) {
-  console.log(`✅ isa 覆盖率符合 T02（A/C 域）+ T04（B/E 域）+ T05（D 域）验收预期：${EXPECT.total}/1024`);
+  console.log(`✅ isa 覆盖率符合 T02（A/C）+ T04（B/E）+ T05（D）+ T06（F/G/H）验收预期：${EXPECT.total}/1024`);
   process.exitCode = 0;
 } else {
   process.exitCode = 1;
