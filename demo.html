@@ -10815,6 +10815,9 @@
   var NS = globalThis.FlagshipAI;
   var api = NS.L0.assemble(NS);
   for (var k in api) NS[k] = api[k];
+  // 同时暴露纯命名空间句柄（L0–L10 层），供自检/调试与浏览器探针断言；
+  // 公开 API 已并入 FlagshipAI，此处 FlagshipNS 指向同一命名空间对象。
+  globalThis.FlagshipNS = NS;
 })();
 
 </script>

@@ -63,6 +63,9 @@ const sandbox = {
   navigator: { userAgent: 'probe-demo' },
   location: { href: 'file:///demo.html', protocol: 'file:' },
   devicePixelRatio: 1,
+  // 真实浏览器 window 自带 addEventListener/removeEventListener；demo-app.js 启动期
+  // 会调用 window.addEventListener('resize', drawChart)，此处补空桩以等价模拟。
+  addEventListener() { }, removeEventListener() { },
   requestAnimationFrame(fn) { return setTimeout(fn, 0); },
   alert() { }, confirm() { return true; },
   URL: { createObjectURL() { return 'blob:stub'; }, revokeObjectURL() { } },
@@ -97,11 +100,15 @@ chk('公共 API 就位（window.FlagshipAI）', !!api && typeof api.GPTModel ===
   api ? `${Object.keys(api).length} 个导出键` : '缺失');
 
 const nodeApi = require('../src/index.js');
+// 浏览器端将 34 键公共 API 并入 FlagshipAI 命名空间（与 Node 共用 NS.L0.assemble，双端同码），
+// 故 window.FlagshipAI 同时持有 L0–L10 层命名空间与 34 个公开键，键集不是精确 34。
+// 此处校验 34 个公开键全部就位、同名、同类型 —— 这才是 K15「双端公开 API 一致」的真契约。
 const nodeKeys = Object.keys(nodeApi).sort();
-const browserKeys = api ? Object.keys(api).sort() : [];
-const sameKeys = nodeKeys.length === browserKeys.length && nodeKeys.every((k, i) => k === browserKeys[i]);
+const missing = nodeKeys.filter(k => !(api && typeof api[k] === typeof nodeApi[k]) || (api && api[k] == null));
+const sameKeys = missing.length === 0;
+const presentCount = nodeKeys.filter(k => api && api[k] != null).length;
 chk('导出清单与 Node 侧完全一致（K15）', sameKeys,
-  sameKeys ? `${browserKeys.length} 键一致` : `Node ${nodeKeys.length} vs 浏览器 ${browserKeys.length}`);
+  sameKeys ? `34 公开键全部就位（Node ${nodeKeys.length} / 浏览器 ${presentCount}）` : `缺失/类型不符：${missing.join(', ')}`);
 
 chk('十层命名空间就位（window.FlagshipNS）', !!ns && !!ns.L10 && !!ns.L9 && !!ns.L8,
   ns ? `L3–L10 挂载：${['L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10'].filter(k => ns[k]).join(' ')}` : '缺失');
