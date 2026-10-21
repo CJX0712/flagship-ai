@@ -5,7 +5,11 @@
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
 [![Version](https://img.shields.io/badge/version-v15.2-blue)](#)
-[![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen)](#-自检套件-12-项全绿)
+[![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
+[![Layer Tests](https://img.shields.io/badge/tests-188%2F188%20passing-brightgreen)](#十层分解架构落地状态)
+[![ISA](https://img.shields.io/badge/ISA-480%2F1024-blue)](#十层分解架构落地状态)
+[![Architecture](https://img.shields.io/badge/architecture-L1%E2%86%92L10%20ten--layer-blueviolet)](#十层分解架构落地状态)
+[![Regression](https://img.shields.io/badge/regression-R1%E2%80%93R10%20%CE%94%3D0-brightgreen)](#十层分解架构落地状态)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#)
 [![Node](https://img.shields.io/badge/node-%E2%89%A514-blue)](https://nodejs.org)
@@ -259,7 +263,7 @@ node src/verify.js   # 10 项自检，约 10 秒
 10 行训练 + 生成：
 
 ```js
-const F = require('./src/flagship-engine.js');
+const F = require('./src/index.js');
 const { CORPUS } = require('./src/corpus.js');
 
 // 字符级分词（经典、中文友好，词表 ≈291）
@@ -361,21 +365,22 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 ```
 flagship-ai/
 ├── src/
-│   ├── flagship-engine.js   # v11 引擎转发 shim（Node 入口；浏览器由构建脚本改内联 legacy 本体）
-│   ├── index.js             # 十层装配入口：按 __loadOrder 加载 L10→L3 并组装 34 键公共 API
+│   ├── index.js             # 十层装配入口：按 __loadOrder 加载 L10→L1→L0 并组装 34 键公共 API（L0-boot/assemble 为唯一映射真源）
 │   ├── namespace.js         # 装配真源：__loadOrder + 域定义（Node 与浏览器共读）
 │   ├── verify.js            # 12 项自检套件（Node + 浏览器双端）
 │   ├── corpus.js            # 默认中文语料（可随意替换）
-│   ├── app.js               # demo 应用逻辑（字符级 / BPE / 架构选择）
 │   ├── legacy/              # v11 引擎本体（零回归 oracle，R1–R10 逐位对照）
-│   ├── L3-arch/             # 架构组装：forward/backward 重组装
-│   ├── L4-ops/              # 神经算子：norm/activation/positional/softmax/linear/attention/moe/loss
-│   ├── L5-autograd/         # 自动微分：VJP 注册中心 / tape 契约 / 梯度检验工厂
-│   ├── L6-backend/          # 后端运行时：kernel 注册派发 / CPU(JS) exact 通道
-│   ├── L7-tensor/           # 张量与内存：tensor / shape / arena / kv-cache
-│   ├── L8-kernel/           # 数值内核：matmul / reduce / quantize（与 legacy 逐位一致）
+│   ├── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（480 项已实现）
 │   ├── L9-numbase/          # 数值基础：rng / fp-ops / special / assert
-│   └── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（480 项已实现）
+│   ├── L8-kernel/           # 数值内核：matmul / reduce / quantize（与 legacy 逐位一致）
+│   ├── L7-tensor/           # 张量与内存：tensor / shape / arena / kv-cache
+│   ├── L6-backend/          # 后端运行时：kernel 注册派发 / CPU(JS) exact 通道
+│   ├── L5-autograd/         # 自动微分：VJP 注册中心 / tape 契约 / 梯度检验工厂
+│   ├── L4-ops/              # 神经算子：norm/activation/positional/softmax/linear/attention/moe/loss
+│   ├── L3-arch/             # 架构组装：forward/backward 重组装
+│   ├── L2-pipeline/         # 编排管线：tokenizer/train/generate/sampler/evaluate/persistence/config
+│   ├── L1-app/              # 应用层：demo-app（已接入 __loadOrder）
+│   └── L0-boot/             # 引导装配：assemble（34 键映射 + K15 逐名门禁 + 注册中心自举，已接入）
 ├── tests/                   # node:test + fast-check 性质测试（L3–L10 各层）
 ├── scripts/build-demo.js    # 把十层栈+套件+应用内联进 demo.html（mini-require 双端同码）
 ├── scripts/isa.js           # 微指令覆盖率 CLI（逐域 impl/capacity 断言）

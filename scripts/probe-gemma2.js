@@ -15,7 +15,7 @@
  * 运行：node scripts/probe-gemma2.js   （全通过 exit 0）
  * 作者：晨星  ·  License: MIT
  * ========================================================================*/
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 
 const POEM = '朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。';
 

@@ -18,7 +18,7 @@
  * ========================================================================*/
 const fs = require('fs');
 const path = require('path');
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 const { CORPUS } = require('../src/corpus.js');
 
 const FULL = process.argv.includes('--full');

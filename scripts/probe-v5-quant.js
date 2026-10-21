@@ -1,6 +1,6 @@
 'use strict';
 // v5.0 量化验证：INT8 weight-only PTQ 的数值保真度 / 生成可用性 / 存档往返 / 体积压缩
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 const { CORPUS } = require('../src/corpus.js');
 
 let pass = 0, fail = 0;

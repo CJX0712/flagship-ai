@@ -10,7 +10,7 @@
  * 运行：node scripts/probe-v4-gqa.js   （全通过 exit 0）
  * 作者：晨星  ·  License: MIT
  * ========================================================================*/
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 
 function gradCheckGQA() {
   const V = 11, T = 6, H = 4, KV = 2;

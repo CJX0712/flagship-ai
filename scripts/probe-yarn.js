@@ -13,7 +13,7 @@
  *   9. 特征生效：factor=4 与 baseline 输出确有差异（非 no-op）
  * 作者：晨星 · License: MIT
  * ========================================================================*/
-const F = require('./../src/legacy/flagship-engine.v11.js');
+const F = require('../src/index.js');
 
 function maxDelta(a, b) {
   let m = 0;

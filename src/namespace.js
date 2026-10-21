@@ -3,7 +3,7 @@
  *   - 所有层文件为 IIFE 注入 globalThis.FlagshipAI 命名空间
  *   - Node 与浏览器共用同一份 __loadOrder（src/index.js 与 scripts/build-demo.js 共读）
  *   - 加载顺序自底向上：L10 → L9 → … → L1
- * Phase 0：__loadOrder 为空（尚未拆层），buildPublicAPI 暂未启用。
+ * Phase 4（T05）：十层已落地，装配层经 NS.L0.assemble(NS) 产出 34 键公共 API（K15 契约）。
  */
 'use strict';
 const NS = (globalThis.FlagshipAI = globalThis.FlagshipAI || {});
@@ -83,12 +83,19 @@ NS.__loadOrder = [
   './L2-pipeline/evaluate.js',
   './L2-pipeline/persistence.js',
   './L2-pipeline/config.js',
+  // L1 · 应用层（T05）：浏览器演示应用的 UI 编排。仅在求值期定义 NS.L1.app，
+  //   不触碰 DOM（DOM 操作都在 L1.app.start() 调用期），故 Node 侧加载亦安全。
+  './L1-app/demo-app.js',
+  // L0 · 装配层（T05）：最上层，需在所有层加载完毕后把十层装配为 34 键公共 API。
+  //   Node（src/index.js）与浏览器（scripts/build-demo.js 内联）共用本文件，
+  //   是 34 键映射 + K15 逐名硬门禁 + 注册中心自举的唯一真源；装配动作由调用方
+  //   显式触发（NS.L0.assemble(ns)），不在模块求值期读取未加载的层。
+  //   注：L1 也列入本清单（见上一节）—— 实测 demo-app.js 在纯 Node 下求值安全
+  //   （DOM 访问全部位于 start() 之后调用的函数内），列入后浏览器端与 Node 端
+  //   共用同一份加载顺序真源，无需在 build-demo.js 里另写一份内联清单。
+  './L0-boot/assemble.js',
 ];
 
-// 公共 API 构建（Phase 0 暂未启用；后续接管后由 src/index.js 调用）。
-// 必须导出与 v11 完全一致的导出清单（CI 断言 Object.keys 一致）。
-NS.buildPublicAPI = function buildPublicAPI() {
-  return NS;
-};
-
+// 命名空间真源导出：供 src/index.js 与 scripts/build-demo.js 读取 __loadOrder
+// 并在全部层加载后调用 NS.L0.assemble(NS) 装配出 34 键公共 API（K15 契约）。
 module.exports = NS;

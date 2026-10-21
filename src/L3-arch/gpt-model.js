@@ -228,6 +228,14 @@
 
     /** 反向传播：委托 L3.blocks 重组装（T03，Δ=0） */
     backward(cache, dlogits) { return NS.L3.blocks.backward(this, cache, dlogits); }
+
+    /** 评估模式：返回 { loss, acc }。
+     *  方法体已随 L2 编排管线落地为 NS.L2.evaluate.evaluate(model, tokens)，
+     *  此处保留 legacy GPTModel.prototype.evaluate 的**对象表面契约** —— 若只搬走方法体
+     *  而不在模型上保留该成员，调用方（如 scripts/probe-v3.js 的 `m.evaluate(tokens)`）
+     *  会直接拿到 `m.evaluate is not a function`。惰性引用 L2（L2 晚于 L3 加载，
+     *  但本方法只在调用期求值，安全）。 */
+    evaluate(tokens) { return NS.L2.evaluate.evaluate(this, tokens); }
   }
 
   NS.L3.gpt_model.GPTModel = GPTModel;

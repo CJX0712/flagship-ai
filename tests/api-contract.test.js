@@ -79,3 +79,15 @@ test('T04 切换生效：train/generate/persistence/tokenizer 均来自十层', 
   assert.notStrictEqual(V12.Tokenizer, V11.Tokenizer, 'V12.Tokenizer 仍是 legacy 本体');
   assert.notStrictEqual(V12.BPETokenizer, V11.BPETokenizer, 'V12.BPETokenizer 仍是 legacy 本体');
 });
+
+test('K15 盲区防护：GPTModel.prototype 方法集 ⊇ legacy', () => {
+  // 背景：K15 只锁 34 个导出键，但 GPTModel 实例方法（如 evaluate）不在其中，
+  //   若十层模型漏实现某个 legacy 原型方法，键集门禁不会红（T04 曾漏 evaluate）。
+  //   本断言堵住该盲区：L3 模型必须提供 legacy 公开的全部实例方法。
+  const l11 = Object.getOwnPropertyNames(V11.GPTModel.prototype)
+    .filter((n) => n !== 'constructor').sort();
+  const l12 = Object.getOwnPropertyNames(V12.GPTModel.prototype)
+    .filter((n) => n !== 'constructor').sort();
+  const missing = l11.filter((m) => !l12.includes(m));
+  assert.deepStrictEqual(missing, [], `V12.GPTModel 缺失 legacy 原型方法：${missing.join(', ')}`);
+});

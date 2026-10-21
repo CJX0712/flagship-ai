@@ -1,12 +1,37 @@
-/* ============================================================================
- * 演示应用逻辑（app.js）— 仅浏览器环境运行
- * 训练分块执行（setTimeout 让出主线程），自检逐项执行，UI 不卡死。
- * 作者：晨星  ·  License: MIT
+/* L1 应用层 · 浏览器演示应用（demo-app）
+ * ============================================================================
+ * 所属层：L1（应用层）
+ * 允许依赖：L0（装配产物 NS.L0.API）—— 依赖在 **调用期** 经 engine() 惰性取得，
+ *   不在模块求值期捕获，因此本文件可在任意时刻被 Node 的 __loadOrder 循环求值而
+ *   不产生副作用（K5：无 CommonJS 加载语法、无 Node 专属全局、无网络/宿主 API）。
+ * 主要 @ref：nanoGPT 上手范式（train loop / loss 曲线 / 采样面板）
+ * 迁移方式：从 src/app.js【整文件搬】（UI 逻辑零改写，Δ=0 同义）：
+ *   - 依赖来源改写：`const F = window.FlagshipAI` → `engine()` 读 NS.L0.API；
+ *     `const VF = window.FlagshipVerify` → 调用期读 globalThis.FlagshipVerify；
+ *     目的：浏览器 demo 由 legacy 单体（原 src/flagship-engine.js 转发）切到真十层装配产物。
+ *   - 启动方式改写：原 IIFE 立即执行 → 现注册为 NS.L1.app.start(ns)，由
+ *     scripts/build-demo.js 在 __FLAGSHIP_APP__ 槽位内联追加启动调用。
+ *   - 事件绑定 / 训练分块 / 曲线绘制 / 自检逐项执行的全部逻辑逐行保留。
+ * 模板侧契约不变：仍通过 id 直接操作 DOM（corpus/log/chart/prompt/output/...），
+ *   demo.template.html 无需任何改动。
  * ========================================================================*/
-(function () {
-  'use strict';
-  const F = window.FlagshipAI;
-  const VF = window.FlagshipVerify;
+;(function (NS) {
+  NS.L1 = NS.L1 || {};
+
+  /** 取 L0 装配产物（34 键公共 API）。惰性求值以避开「层加载顺序 → API 尚未装配」的取值陷阱，
+   *  并对两种 L0 形态都做兜底：优先 NS.L0.API（assemble 产物），其次直接调 NS.L0.assemble(ns)，
+   *  最后兼容「构建脚本已把 34 键并入命名空间」的写法。结果回写缓存，保证全进程同一份。
+   *  @returns {Object} 34 键公共 API
+   */
+  function engine() {
+    if (NS.L0 && NS.L0.API) return NS.L0.API;
+    if (NS.L0 && NS.L0.assemble) {
+      NS.L0.API = NS.L0.assemble(NS);
+      return NS.L0.API;
+    }
+    if (NS.GPTModel) return NS; // 构建脚本已把 34 键并入命名空间对象本体
+    throw new Error('L0 尚未装配：请先调用 NS.L0.assemble(NS)');
+  }
 
   const $ = (id) => document.getElementById(id);
   const state = {
@@ -29,6 +54,7 @@
 
   /* ---------- 模型构建 ---------- */
   function buildModel() {
+    const F = engine();
     const corpus = $('corpus').value;
     if (corpus.replace(/\s/g, '').length < 10) {
       log('语料太短（至少 10 个非空白字符），拒绝构建', 'err');
@@ -177,6 +203,7 @@
 
   function trainChunk() {
     if (state.stopFlag || state.stepsDone >= state.totalSteps) { finishTraining(); return; }
+    const F = engine();
     const chunk = Math.min(8, state.totalSteps - state.stepsDone);
     const ids = state.tok.encode($('corpus').value);
     let lastLoss = 0;
@@ -262,6 +289,7 @@
   /* ---------- 生成 ---------- */
   function doGenerate() {
     if (!state.model) { log('请先构建并训练模型', 'warn'); return; }
+    const F = engine();
     const useQuant = $('quant') && $('quant').checked;
     const model = useQuant ? state.model.quantize() : state.model;
     const t0 = performance.now();
@@ -280,6 +308,7 @@
   /* ---------- 模型持久化 ---------- */
   function doExport() {
     if (!state.model) return;
+    const F = engine();
     const json = F.saveModel(state.model, state.tok);
     const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
     const a = document.createElement('a');
@@ -291,6 +320,7 @@
   }
 
   function handleImport(ev) {
+    const F = engine();
     const file = ev.target.files && ev.target.files[0];
     if (!file) return;
     const reader = new FileReader();
@@ -323,6 +353,7 @@
 
   /* ---------- 一键自检（逐项执行） ---------- */
   function runSelfCheck() {
+    const VF = globalThis.FlagshipVerify;
     $('checkBtn').disabled = true;
     const tbody = $('checkBody');
     tbody.innerHTML = '';
@@ -370,7 +401,8 @@
       if (msg) $('modelInfo').textContent = msg;
     }
   }
-  document.addEventListener('DOMContentLoaded', () => {
+
+  function bind() {
     $('buildBtn').addEventListener('click', buildModel);
     $('trainBtn').addEventListener('click', startTraining);
     $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
@@ -393,5 +425,34 @@
     window.addEventListener('resize', drawChart);
     log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');
     log('默认语料已载入，点击「构建模型」开始');
-  });
-})();
+  }
+
+  /** 启动演示应用：绑定 DOM 事件。
+   *  @param {Object} ns 命名空间（约定由 build-demo.js 传入 globalThis.FlagshipAI）
+   */
+  function start(ns) {
+    if (!document.getElementById('log')) {
+      throw new Error('L1.app.start：模板 DOM 尚未就绪（缺少 #log）');
+    }
+    if (ns.L0 && ns.L0.assemble) ns.L0.assemble(ns); // 装配幂等守卫：未装配则补一次
+    engine();                                        // 立即解析一次装配产物，早失败早暴露
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', bind);
+    } else {
+      bind();
+    }
+  }
+
+
+  NS.L1.app = {
+    start: start,
+    bind: bind,
+    buildModel: buildModel,
+    startTraining: startTraining,
+    doGenerate: doGenerate,
+    doExport: doExport,
+    runSelfCheck: runSelfCheck,
+    drawChart: drawChart,
+    state: state,
+  };
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

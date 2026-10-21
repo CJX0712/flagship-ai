@@ -302,1980 +302,6 @@
 </div>
 
 <script>
-
-/* ===== 浏览器 mini-require（仅内联装配用，零依赖） ===== */
-(function () {
-  'use strict';
-  var __defs = {}, __cache = {};
-
-  // 内置 path 桩：只需 join/dirname/basename/resolve（index.js 用 path.join(__dirname, rel)）
-  function __normPath(p) {
-    var out = [];
-    p.split('/').forEach(function (seg) {
-      if (!seg || seg === '.') return;
-      if (seg === '..') { out.pop(); return; }
-      out.push(seg);
-    });
-    return '/' + out.join('/');
-  }
-  var __path = {
-    join: function () {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        var s = String(arguments[i]);
-        if (s.charAt(0) === '/') parts = [];
-        parts.push(s);
-      }
-      return __normPath(parts.join('/'));
-    },
-    dirname: function (p) { var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); },
-    basename: function (p) { return p.slice(p.lastIndexOf('/') + 1); },
-    resolve: function (p) { return __normPath(p.charAt(0) === '/' ? p : '/' + p); },
-    sep: '/',
-  };
-
-  function __resolve(from, req) {
-    if (req.charAt(0) !== '.') return req;          // 内置模块（path）
-    return __path.join(__path.dirname(from), req);
-  }
-
-  function __require(from, req) {
-    if (req === 'path') return __path;
-    var id = __resolve(from, req);
-    if (__cache[id]) return __cache[id].exports;
-    var def = __defs[id];
-    if (!def) throw new Error('模块未内联: ' + id);
-    var module = { exports: {} };
-    __cache[id] = module;
-    def(module, module.exports, function (r) { return __require(id, r); }, __path.dirname(id));
-    return module.exports;
-  }
-
-  function __define(id, fn) { __defs[id] = fn; }
-  window.__FLAGSHIP_MODULES__ = { define: __define, require: __require };
-})();
-
-/* [module /src/legacy/flagship-engine.v11.js] */
-__FLAGSHIP_MODULES__.define("/src/legacy/flagship-engine.v11.js", function (module, exports, require, __dirname) {
-/* ============================================================================
- * 旗舰 AI 引擎（flagship-engine.js）
- * ----------------------------------------------------------------------------
- * 零依赖纯 JavaScript 手写 GPT 引擎：字符级分词 + Decoder-only Transformer
- * （因果多头自注意力 + 前馈网络 + pre-LayerNorm + 残差连接 + 权重共享输出头）
- * + 手写反向传播 + AdamW 优化器 + 温度/top-k 采样生成。
- *
- * 架构不是发明创造，而是站在世界顶级成果之上直接复用：
- *   - 模型结构：GPT-2 (Radford et al., 2019) / nanoGPT (Karpathy, 2022)
- *   - 极简参照：picoGPT (Larroy, 2023) —— 单文件讲清 Transformer 全部计算
- *   - 优化器：AdamW (Loshchilov & Hutter, 2019)
- *   - LayerNorm (Ba et al., 2016) / GELU (Hendrycks & Gimpel, 2016)
- *   - 初始化与残差缩放：GPT-2 论文标准做法
- *
- * 运行环境：Node >= 14 与浏览器（无任何外部依赖，无构建步骤）。
- * 作者：晨星  ·  License: MIT
- * ==========================================================================*/
-(function (root, factory) {
-  if (typeof module !== 'undefined' && module.exports) module.exports = factory();
-  else root.FlagshipAI = factory();
-})(typeof self !== 'undefined' ? self : globalThis, function () {
-  'use strict';
-
-  /* ==========================================================================
-   * 一、基础数学：RNG / 矩阵算子 / 激活 / 归一化
-   * 全部使用 Float64Array 行优先存储，M(r×c) 元素 (i,j) 位于 i*c+j。
-   * ======================================================================== */
-
-  // 确定性伪随机数发生器（mulberry32）：同种子 => 完全可复现
-  function mulberry32(seed) {
-    let a = seed >>> 0;
-    return function () {
-      a |= 0; a = (a + 0x6D2B79F5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-  }
-
-  // Box-Muller 标准正态采样
-  function randn(rng) {
-    let u = 0, v = 0;
-    while (u === 0) u = rng();
-    while (v === 0) v = rng();
-    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-  }
-
-  /* 矩阵乘法内核。实测：V8 已把朴素循环优化到标量极限（~900M MAC/s），
-   * 手写 4 路展开反而更慢（32.7µs vs 30.2µs @ 1×96×288），故保持朴素实现。 */
-  // A(r×k) @ B(k×c) -> C(r×c)
-  function matmul(A, B, r, k, c) {
-    const C = new Float64Array(r * c);
-    for (let i = 0; i < r; i++) {
-      const ci = i * c;
-      for (let p = 0; p < k; p++) {
-        const a = A[i * k + p];
-        if (a === 0) continue;
-        const bp = p * c;
-        for (let j = 0; j < c; j++) C[ci + j] += a * B[bp + j];
-      }
-    }
-    return C;
-  }
-
-  // A(r×k) @ B(m×k)^T -> C(r×m)（用于 tied embedding 输出头）
-  function matmulAtB(A, B, r, k, m) {
-    const C = new Float64Array(r * m);
-    for (let i = 0; i < r; i++) {
-      const ai = i * k, ci = i * m;
-      for (let j = 0; j < m; j++) {
-        const bj = j * k;
-        let s = 0;
-        for (let p = 0; p < k; p++) s += A[ai + p] * B[bj + p];
-        C[ci + j] = s;
-      }
-    }
-    return C;
-  }
-
-  // A(k×r)^T @ B(r×c) -> C(k×c)（用于计算权重梯度 dW = X^T @ dY）
-  function matmulTA(A, B, r, k, c) {
-    const C = new Float64Array(k * c);
-    for (let i = 0; i < r; i++) {
-      const ai = i * k, bi = i * c;
-      for (let l = 0; l < k; l++) {
-        const a = A[ai + l];
-        if (a === 0) continue;
-        const cl = l * c;
-        for (let j = 0; j < c; j++) C[cl + j] += a * B[bi + j];
-      }
-    }
-    return C;
-  }
-
-  // ── INT8 权重量化（weight-only PTQ，LLM.int8 / AWQ 谱系）──────────────
-  // 对称逐张量量化：q = round(w / scale), clamp[-127,127], scale = max|w|/127。
-  // 推理时 w = q·scale 在矩阵乘内联解量化，权重常驻 Int8 → 内存/体积 ≈ 1/4。
-  function matmulQ(A, q, scale, r, k, c) {
-    const C = new Float64Array(r * c);
-    for (let i = 0; i < r; i++) {
-      const ai = i * k, ci = i * c;
-      for (let j = 0; j < c; j++) {
-        let s = 0;
-        for (let p = 0; p < k; p++) s += A[ai + p] * q[p * c + j];
-        C[ci + j] = s * scale;
-      }
-    }
-    return C;
-  }
-  // A(r×k) @ (scale·q)(m×k)^T -> C(r×m)，q 按 [m][k] 行主序展开
-  function matmulAtBQ(A, q, scale, r, k, m) {
-    const C = new Float64Array(r * m);
-    for (let i = 0; i < r; i++) {
-      const ai = i * k, ci = i * m;
-      for (let j = 0; j < m; j++) {
-        let s = 0;
-        const qj = j * k;
-        for (let p = 0; p < k; p++) s += A[ai + p] * q[qj + p];
-        C[ci + j] = s * scale;
-      }
-    }
-    return C;
-  }
-  // 权重分发：param 含 .q 即走解量化路径，否则走原始 Float64 路径（零回归）
-  function mm(A, W, r, k, c) {
-    return W.q ? matmulQ(A, W.q, W.scale, r, k, c) : matmul(A, W.d, r, k, c);
-  }
-  function mmAtB(A, W, r, k, m) {
-    return W.q ? matmulAtBQ(A, W.q, W.scale, r, k, m) : matmulAtB(A, W.d, r, k, m);
-  }
-  const QUANT_LINEAR_RE = /^(l\d+\.(wqkv|wproj|w1|w2|wg)|l\d+\.e\d+\.(w1|w2)|tokEmb|posEmb)$/;
-  function isQuantLinear(key) { return QUANT_LINEAR_RE.test(key); }
-
-  function addInto(dst, src) {
-    for (let i = 0; i < dst.length; i++) dst[i] += src[i];
-  }
-
-  function rowSumInto(dst, Y, r, c) {
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      for (let j = 0; j < c; j++) dst[j] += Y[o + j];
-    }
-  }
-
-  /* ---- LayerNorm（Ba et al., 2016） ---- */
-  function layernormFwd(X, g, b, r, c) {
-    const Y = new Float64Array(r * c);
-    const xhat = new Float64Array(r * c);
-    const rstd = new Float64Array(r);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      let mu = 0;
-      for (let j = 0; j < c; j++) mu += X[o + j];
-      mu /= c;
-      let v = 0;
-      for (let j = 0; j < c; j++) { const d = X[o + j] - mu; v += d * d; }
-      v /= c;
-      const rs = 1 / Math.sqrt(v + 1e-5);
-      rstd[i] = rs;
-      for (let j = 0; j < c; j++) {
-        const xh = (X[o + j] - mu) * rs;
-        xhat[o + j] = xh;
-        Y[o + j] = g[j] * xh + b[j];
-      }
-    }
-    return { Y, xhat, rstd };
-  }
-
-  function layernormBwd(dY, xhat, rstd, g, r, c) {
-    const dX = new Float64Array(r * c);
-    const dg = new Float64Array(c), db = new Float64Array(c);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      let s1 = 0, s2 = 0;
-      for (let j = 0; j < c; j++) {
-        const dxh = dY[o + j] * g[j];
-        dg[j] += dY[o + j] * xhat[o + j];
-        db[j] += dY[o + j];
-        s1 += dxh;
-        s2 += dxh * xhat[o + j];
-      }
-      const rs = rstd[i];
-      for (let j = 0; j < c; j++) {
-        dX[o + j] = (rs / c) * (c * (dY[o + j] * g[j]) - s1 - xhat[o + j] * s2);
-      }
-    }
-    return { dX, dg, db };
-  }
-
-  /* ---- GELU（tanh 近似，GPT-2 标准） ---- */
-  const GELU_C = Math.sqrt(2 / Math.PI);
-  function geluFwd(X) {
-    const Y = new Float64Array(X.length);
-    for (let i = 0; i < X.length; i++) {
-      const x = X[i];
-      Y[i] = 0.5 * x * (1 + Math.tanh(GELU_C * (x + 0.044715 * x * x * x)));
-    }
-    return Y;
-  }
-  function geluBwd(dY, X) {
-    const dX = new Float64Array(X.length);
-    for (let i = 0; i < X.length; i++) {
-      const x = X[i];
-      const inner = GELU_C * (x + 0.044715 * x * x * x);
-      const t = Math.tanh(inner);
-      const dt = (1 - t * t) * GELU_C * (1 + 3 * 0.044715 * x * x);
-      dX[i] = dY[i] * (0.5 * (1 + t) + 0.5 * x * dt);
-    }
-    return dX;
-  }
-
-  /* ---- RMSNorm（Zhang & Sennrich 2019；LLaMA/Mistral 标准） ----
-   * y = g ⊙ (x / RMS(x))，RMS(x) = sqrt(mean(x²) + eps)。
-   * 与 LayerNorm 的差别：不去均值、无偏置 —— 更省算力，且实测在大模型上等价或更优。
-   * 反向用同一 xhat 约定（增益前归一化值），故与 layernormBwd 签名完全兼容。 */
-  const RMS_EPS = 1e-5;
-  // 签名与 layernormFwd 对齐（b 位置保留但忽略），这样前向分发可以无脑二选一
-  function rmsnormFwd(X, g, b, r, c) {
-    const Y = new Float64Array(r * c);
-    const xhat = new Float64Array(r * c);
-    const rstd = new Float64Array(r);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      let ss = 0;
-      for (let j = 0; j < c; j++) ss += X[o + j] * X[o + j];
-      const rs = 1 / Math.sqrt(ss / c + RMS_EPS);
-      rstd[i] = rs;
-      for (let j = 0; j < c; j++) {
-        const xh = X[o + j] * rs;
-        xhat[o + j] = xh;
-        Y[o + j] = g[j] * xh;
-      }
-    }
-    return { Y, xhat, rstd };
-  }
-  function rmsnormBwd(dY, xhat, rstd, g, r, c) {
-    const dX = new Float64Array(r * c);
-    const dg = new Float64Array(c);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      const rs = rstd[i];
-      let s = 0; // Σ_j (dY_j · g_j · xhat_j)
-      for (let j = 0; j < c; j++) s += dY[o + j] * g[j] * xhat[o + j];
-      const inv = 1 / c;
-      for (let j = 0; j < c; j++) {
-        const dy = dY[o + j] * g[j];
-        dg[j] += dY[o + j] * xhat[o + j];
-        dX[o + j] = rs * (dy - xhat[o + j] * inv * s);
-      }
-    }
-    return { dX, dg, db: null };
-  }
-
-  /* ---- QK-norm（Gemma 2/3 / Chameleon / ViT-22B）----
-   * 对每个注意力头的 Q/K 向量做 RMSNorm（增益按 head_dim 维、跨头共享），
-   * 在 RoPE 旋转之前应用：稳定注意力 logits 尺度，抑制训练发散。
-   * 行布局：每个头向量长 dh，起始偏移 off，行间跨度 stride（qkvDim）。 */
-  function qkNormFwd(qkv, rows, nHeads, dh, stride, off, g) {
-    const xhat = new Float64Array(rows * nHeads * dh);
-    const rstd = new Float64Array(rows * nHeads);
-    for (let i = 0; i < rows; i++) {
-      for (let h = 0; h < nHeads; h++) {
-        const o = i * stride + off + h * dh;
-        const hi = (i * nHeads + h) * dh;
-        let ss = 0;
-        for (let p = 0; p < dh; p++) ss += qkv[o + p] * qkv[o + p];
-        const rs = 1 / Math.sqrt(ss / dh + RMS_EPS);
-        rstd[i * nHeads + h] = rs;
-        for (let p = 0; p < dh; p++) {
-          const xh = qkv[o + p] * rs;
-          xhat[hi + p] = xh;
-          qkv[o + p] = g[p] * xh; // 就地归一（RoPE 前的 Q/K 段）
-        }
-      }
-    }
-    return { xhat, rstd };
-  }
-  // 反向：dX = rs·(dY·g − xhat·mean(dY·g·xhat))；dg 跨头跨行累加（增益共享）
-  function qkNormBwd(dqkv, xhat, rstd, rows, nHeads, dh, stride, off, g, dg) {
-    const inv = 1 / dh;
-    for (let i = 0; i < rows; i++) {
-      for (let h = 0; h < nHeads; h++) {
-        const o = i * stride + off + h * dh;
-        const hi = (i * nHeads + h) * dh;
-        const rs = rstd[i * nHeads + h];
-        let s = 0; // Σ_p (dY_p · g_p · xhat_p)
-        for (let p = 0; p < dh; p++) s += dqkv[o + p] * g[p] * xhat[hi + p];
-        for (let p = 0; p < dh; p++) {
-          const dy = dqkv[o + p] * g[p];
-          dg[p] += dqkv[o + p] * xhat[hi + p];
-          dqkv[o + p] = rs * (dy - xhat[hi + p] * inv * s);
-        }
-      }
-    }
-  }
-
-  /* ---- SiLU / SwiGLU（Shazeer 2020；LLaMA/Mistral/PaLM 标准 FFN） ----
-   * SwiGLU(x) = SiLU(xW_gate) ⊙ (xW_up)，SiLU(z) = z·σ(z)。
-   * 本实现把 gate 与 up 拼成一次矩阵乘（w1: D → 2·FH），少一次 matmul。
-   * pre 布局：每行 [gate(FH) | up(FH)]。 */
-  function siluF(x) { return x / (1 + Math.exp(-x)); }
-  function swigluFwd(pre, r, h) {
-    const out = new Float64Array(r * h);
-    for (let i = 0; i < r; i++) {
-      const po = i * 2 * h, oo = i * h;
-      for (let j = 0; j < h; j++) out[oo + j] = siluF(pre[po + j]) * pre[po + h + j];
-    }
-    return out;
-  }
-  function swigluBwd(dout, pre, r, h) {
-    const dpre = new Float64Array(r * 2 * h);
-    for (let i = 0; i < r; i++) {
-      const po = i * 2 * h, oo = i * h;
-      for (let j = 0; j < h; j++) {
-        const g = pre[po + j], u = pre[po + h + j];
-        const sg = 1 / (1 + Math.exp(-g));
-        dpre[po + j] = dout[oo + j] * u * (sg + g * sg * (1 - sg)); // ∂/∂gate
-        dpre[po + h + j] = dout[oo + j] * g * sg;                    // ∂/∂up
-      }
-    }
-    return dpre;
-  }
-
-  /* ---- RoPE 旋转位置编码（Su et al. 2021；LLaMA/Mistral 标准） ----
-   * 对 Q/K 的每个相邻维度对施加角度 pos·θ_p 的旋转，θ_p = base^(-2p/dh)。
-   * 关键性质：旋转后 q_i·k_j 只依赖相对距离 (i-j) —— 故天然支持长度外推，
-   * 且使滑动窗口 KV cache 在任意绝对位置下都与全序列重算逐位一致。
-   * sign=+1 前向（逆时针）；sign=-1 反向（正交矩阵的逆 = 其转置）。 */
-  const ROPE_BASE = 10000;
-  function ropeApply(X, T, D, H, dh, posOff, sign, Hk, stride, freqScale) {
-    Hk = Hk || H;                 // K 段头数（GQA 下 < H）；默认 = H（MHA）
-    stride = stride || 3 * D;     // qkv 行宽（GQA 下 = D + 2·KV·dh）
-    const half = dh >> 1;
-    if (half <= 0) return;
-    // YaRN/NTK：per-(dim-pair) 频率缩放（freqScale[p] = 1/scale_i，恒等时缺省）。
-    // 位置无关，故缓存的已旋转 K 与任意 Q 的相对角度一致。
-    const inv = new Float64Array(half);
-    for (let p = 0; p < half; p++) {
-      let f = Math.pow(ROPE_BASE, -2 * p / dh);
-      if (freqScale) f *= freqScale[p];
-      inv[p] = f;
-    }
-    for (let i = 0; i < T; i++) {
-      const pos = i + posOff;
-      const row = i * stride;
-      for (let p = 0; p < half; p++) {
-        const th = pos * inv[p];
-        const cs = Math.cos(th), sn = Math.sin(th) * sign;
-        // Q 段：base 0，H 个头
-        for (let h = 0; h < H; h++) {
-          const q = row + h * dh + (p << 1);
-          const x0 = X[q], x1 = X[q + 1];
-          X[q] = x0 * cs - x1 * sn;
-          X[q + 1] = x0 * sn + x1 * cs;
-        }
-        // K 段：base D，Hk 个头
-        const base = row + D;
-        for (let h = 0; h < Hk; h++) {
-          const q = base + h * dh + (p << 1);
-          const x0 = X[q], x1 = X[q + 1];
-          X[q] = x0 * cs - x1 * sn;
-          X[q + 1] = x0 * sn + x1 * cs;
-        }
-      }
-    }
-  }
-
-  /* ---- Softmax（按行） ---- */
-  function softmaxRows(S, r, c) {
-    const P = new Float64Array(r * c);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      let mx = -Infinity;
-      for (let j = 0; j < c; j++) if (S[o + j] > mx) mx = S[o + j];
-      let s = 0;
-      for (let j = 0; j < c; j++) { const e = Math.exp(S[o + j] - mx); P[o + j] = e; s += e; }
-      const inv = 1 / s;
-      for (let j = 0; j < c; j++) P[o + j] *= inv;
-    }
-    return P;
-  }
-  function softmaxBwd(dP, P, r, c) {
-    const dS = new Float64Array(r * c);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      let s = 0;
-      for (let j = 0; j < c; j++) s += dP[o + j] * P[o + j];
-      for (let j = 0; j < c; j++) dS[o + j] = P[o + j] * (dP[o + j] - s);
-    }
-    return dS;
-  }
-
-  /* ---- Top-k 行选择（MoE 路由用） ---- */
-  // 每行取概率最大的 k 个下标（升序稳定排序后取尾部），返回 idx/val 行主序数组
-  function topkRows(P, r, c, k) {
-    const idx = new Int32Array(r * k);
-    const val = new Float64Array(r * k);
-    for (let i = 0; i < r; i++) {
-      const o = i * c;
-      const order = [];
-      for (let j = 0; j < c; j++) order.push(j);
-      order.sort((a, b) => P[o + a] - P[o + b]); // 升序；并列保持插入序（稳定）
-      for (let t = 0; t < k; t++) {
-        const e = order[c - 1 - t];
-        idx[i * k + t] = e;
-        val[i * k + t] = P[o + e];
-      }
-    }
-    return { idx, val };
-  }
-
-  /* ---- MoE 前馈：路由网络 + top-k 专家散射 + 负载均衡辅助损失 ----
-   * 前向：logits = M·wg + bg → softmax → top-k 选专家 → 各专家 FFN 加权求和。
-   * 反向所需的中间量（各专家子集的 M/pre/h1/out、路由概率、计数）一并缓存。 */
-  function moeForward(model, P, k, M, T, D, FH) {
-    const E = model.nExp, K = model.topK;
-    const W1 = model.useSwi ? 2 * FH : FH;
-    const rlogits = mm(M, P[k + 'wg'], T, D, E);
-    for (let i = 0; i < T; i++) { const o = i * E; for (let j = 0; j < E; j++) rlogits[o + j] += P[k + 'bg'].d[j]; }
-    const probs = softmaxRows(rlogits, T, E);
-    const tk = topkRows(probs, T, E, K);
-    const f = new Int32Array(E);
-    const exp = [];
-    for (let e = 0; e < E; e++) exp.push({ rows: [], g: [], pre: null, h1: null, out: null, Msub: null });
-    for (let i = 0; i < T; i++) {
-      for (let j = 0; j < K; j++) { const e = tk.idx[i * K + j]; exp[e].rows.push(i); exp[e].g.push(tk.val[i * K + j]); f[e]++; }
-    }
-    const ff = new Float64Array(T * D);
-    for (let e = 0; e < E; e++) {
-      const ex = exp[e];
-      const cnt = ex.rows.length;
-      if (cnt === 0) continue;
-      const Msub = new Float64Array(cnt * D);
-      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D; for (let j = 0; j < D; j++) Msub[o2 + j] = M[oi + j]; }
-      const ek = `${k}e${e}.`;
-      const pre = mm(Msub, P[ek + 'w1'], cnt, D, W1);
-      for (let r2 = 0; r2 < cnt; r2++) { const o = r2 * W1; for (let j = 0; j < W1; j++) pre[o + j] += P[ek + 'b1'].d[j]; }
-      const h1 = model.useSwi ? swigluFwd(pre, cnt, FH) : geluFwd(pre);
-      const out = mm(h1, P[ek + 'w2'], cnt, FH, D);
-      for (let r2 = 0; r2 < cnt; r2++) { const o = r2 * D; for (let j = 0; j < D; j++) out[o + j] += P[ek + 'b2'].d[j]; }
-      ex.pre = pre; ex.h1 = h1; ex.out = out; ex.Msub = Msub;
-      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D, g = ex.g[r2]; for (let j = 0; j < D; j++) ff[oi + j] += g * out[o2 + j]; }
-    }
-    // 辅助负载均衡损失（Switch/GDP-MoE）：E·Σ_e f_e·P_e，冻结 f_e（离散选择不回传）
-    let aux = 0;
-    for (let e = 0; e < E; e++) {
-      let sp = 0;
-      for (let i = 0; i < T; i++) sp += probs[i * E + e];
-      aux += E * (f[e] / T) * (sp / T);
-    }
-    return { ff, moe: { rlogits, probs, idx: tk.idx, gate: tk.val, exp, f, E, K, T, M, k, aux } };
-  }
-
-  /* ---- MoE 反向：专家路径（标准 FFN 反向，按 top-k 子集累加）+ 路由路径 ----
-   * 路由路径：dgate=dot(dff, out) 注入 dprobs（仅选中位置）；再加辅助损失梯度
-   * ∂/∂probs[i,e]=auxWeight·E·count_e/T²（冻结 f_e），经 softmaxBwd 回传至 wg/bg。 */
-  function moeBackward(model, P, G, moe, dff, T, D) {
-    const E = moe.E, K = moe.K, FH = model.fh, W1 = model.useSwi ? 2 * FH : FH;
-    const dM = new Float64Array(T * D);
-    const k = moe.k;
-    // 1) 专家路径
-    for (let e = 0; e < E; e++) {
-      const ex = moe.exp[e];
-      const cnt = ex.rows.length;
-      if (cnt === 0) continue;
-      const ek = `${k}e${e}.`;
-      const dout = new Float64Array(cnt * D);
-      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D, g = ex.g[r2]; for (let j = 0; j < D; j++) dout[o2 + j] = dff[oi + j] * g; }
-      addInto(G[ek + 'w2'], matmulTA(ex.h1, dout, cnt, FH, D));
-      rowSumInto(G[ek + 'b2'], dout, cnt, D);
-      const dh1 = matmulAtB(dout, P[ek + 'w2'].d, cnt, D, FH);
-      const dpre = model.useSwi ? swigluBwd(dh1, ex.pre, cnt, FH) : geluBwd(dh1, ex.pre);
-      addInto(G[ek + 'w1'], matmulTA(ex.Msub, dpre, cnt, D, W1));
-      rowSumInto(G[ek + 'b1'], dpre, cnt, W1);
-      const dMsub = matmulAtB(dpre, P[ek + 'w1'].d, cnt, W1, D);
-      for (let r2 = 0; r2 < cnt; r2++) { const oi = ex.rows[r2] * D, o2 = r2 * D; for (let j = 0; j < D; j++) dM[oi + j] += dMsub[o2 + j]; }
-    }
-    // 2) 路由路径
-    const dprobs = new Float64Array(T * E);
-    for (let e = 0; e < E; e++) {
-      const ex = moe.exp[e];
-      for (let r2 = 0; r2 < ex.rows.length; r2++) {
-        const ti = ex.rows[r2];
-        let s = 0; for (let j = 0; j < D; j++) s += dff[ti * D + j] * ex.out[r2 * D + j];
-        dprobs[ti * E + e] = s;
-      }
-    }
-    // 辅助损失梯度（冻结 f_e）：∂/∂probs[i,e] = auxWeight·E·count_e/T²
-    const aw = model.auxWeight;
-    for (let e = 0; e < E; e++) {
-      const term = aw * E * moe.f[e] / (T * T);
-      for (let i = 0; i < T; i++) dprobs[i * E + e] += term;
-    }
-    const dRlogits = softmaxBwd(dprobs, moe.probs, T, E);
-    addInto(G[k + 'wg'], matmulTA(moe.M, dRlogits, T, D, E));
-    rowSumInto(G[k + 'bg'], dRlogits, T, E);
-    const dMr = matmulAtB(dRlogits, P[k + 'wg'].d, T, E, D);
-    for (let i = 0; i < T * D; i++) dM[i] += dMr[i];
-    return dM;
-  }
-
-  /* ---- 交叉熵（logits 前 n 行对 targets；totalRows 补零至完整行数供反向使用） ---- */
-  function crossEntropy(logits, targets, n, V, totalRows) {
-    const rows = totalRows || n;
-    let loss = 0;
-    const dlogits = new Float64Array(rows * V);
-    for (let i = 0; i < n; i++) {
-      const o = i * V;
-      let mx = -Infinity;
-      for (let j = 0; j < V; j++) if (logits[o + j] > mx) mx = logits[o + j];
-      let s = 0;
-      for (let j = 0; j < V; j++) { const e = Math.exp(logits[o + j] - mx); dlogits[o + j] = e; s += e; }
-      const inv = 1 / s;
-      for (let j = 0; j < V; j++) dlogits[o + j] *= inv;
-      loss -= Math.log(dlogits[o + targets[i]]);
-      dlogits[o + targets[i]] -= 1;
-    }
-    const invN = 1 / n;
-    for (let k = 0; k < n * V; k++) dlogits[k] *= invN;
-    return { loss: loss * invN, dlogits };
-  }
-
-  /* ==========================================================================
-   * 二、字符级分词器
-   * ======================================================================== */
-  class Tokenizer {
-    constructor(text) {
-      const chars = [...new Set([...String(text)])].sort();
-      this.kind = 'char';
-      this.chars = chars;
-      this.stoi = new Map(chars.map((ch, i) => [ch, i]));
-      this.itos = chars;
-    }
-    get vocabSize() { return this.chars.length; }
-    encode(text) {
-      const out = [];
-      for (const ch of String(text)) {
-        const id = this.stoi.get(ch);
-        if (id !== undefined) out.push(id); // 未知字符静默跳过（字符级词表的既定行为）
-      }
-      return out;
-    }
-    decode(ids) {
-      let s = '';
-      for (const id of ids) s += this.itos[id] ?? '';
-      return s;
-    }
-  }
-
-  /* ==========================================================================
-   * 二之二、BPE 分词器（GPT-2 字节级标准实现）
-   *
-   * 三件套，与 GPT-2 / tiktoken 同源：
-   *   1. 字节级映射：把 256 个字节映射到 256 个可打印 Unicode 字符，
-   *      使任意 UTF-8 文本（含中文、emoji）都能无损表示为字符序列。
-   *   2. 预分词 regex（GPT-2 原文）：先把文本切成"词块"，BPE 只在块内合并，
-   *      避免跨词污染（这是 BPE 质量的关键，也是朴素实现的常见缺陷）。
-   *   3. 频率合并训练：反复统计相邻符号对频次、合并最高频者，直至词表达标。
-   * 编码用 merge-rank 贪心（等价 GPT-2 实现），解码一次性拼字节再 UTF-8 解码，
-   * 因此跨 token 的多字节汉字也能正确还原。
-   * ======================================================================== */
-  const BYTE_ENC = (() => {
-    const bs = [];
-    for (let b = 0x21; b <= 0x7e; b++) bs.push(b);   // '!' ~ '~'
-    for (let b = 0xa1; b <= 0xac; b++) bs.push(b);   // '¡' ~ '¬'
-    for (let b = 0xae; b <= 0xff; b++) bs.push(b);   // '®' ~ 'ÿ'
-    const map = new Map();
-    let n = 0;
-    for (const b of bs) map.set(b, String.fromCharCode(b));
-    for (let b = 0; b < 256; b++) {
-      if (!map.has(b)) map.set(b, String.fromCharCode(256 + n++));
-    }
-    return map;
-  })();
-  const BYTE_DEC = new Map([...BYTE_ENC].map(([b, c]) => [c, b]));
-
-  // GPT-2 预分词正则（原文照搬）：缩写 | 可选空格+字母 | 可选空格+数字 | 可选空格+其它非空白 | 尾随空白
-  const PRE_RE = new RegExp(
-    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+", 'gu');
-
-  /** UTF-8 文本 -> 字节级字符序列（可逆） */
-  function textToByteChars(s) {
-    const bytes = new TextEncoder().encode(s);
-    let out = '';
-    for (let i = 0; i < bytes.length; i++) out += BYTE_ENC.get(bytes[i]);
-    return out;
-  }
-  /** 字节级字符序列 -> UTF-8 文本（可逆） */
-  function byteCharsToText(s) {
-    const bytes = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) bytes[i] = BYTE_DEC.get(s[i]) ?? 63;
-    return new TextDecoder().decode(bytes);
-  }
-
-  class BPETokenizer {
-    /**
-     * @param {string} text 训练语料
-     * @param {number} vocabSize 目标词表大小（字节级下 ≥256）
-     * @param {Object} opts
-     *   minPairFreq: 最低合并频次（低于则提前停止，默认 2）
-     *   byteLevel:   基元选择 —— true = 256 字节（GPT-2 标准，覆盖任意 UTF-8）；
-     *                 false = 语料字符（中文语料下显著更省 token，且不会生成半截 UTF-8）
-     */
-    constructor(text, vocabSize = 512, opts) {
-      const o = Object.assign({ minPairFreq: 2, byteLevel: true }, opts || {});
-      this.kind = 'bpe';
-      this.byteLevel = !!o.byteLevel;
-      const target = Math.max(this.byteLevel ? 256 : 1, vocabSize | 0);
-      // 词块 <-> 符号序列（字节级要多一层 UTF-8 编解码）
-      const toSym = (w) => (this.byteLevel ? [...textToByteChars(w)] : [...w]);
-
-      // 1) 预分词并统计词频
-      const freq = new Map();
-      for (const m of String(text).matchAll(PRE_RE)) {
-        const w = m[0];
-        freq.set(w, (freq.get(w) || 0) + 1);
-      }
-      // 2) 每个词块转成符号数组（BPE 只在块内合并）
-      const seqs = [];
-      for (const [w, n] of freq) seqs.push({ s: toSym(w), n });
-
-      // 3) 初始词表：字节级 = 256 个字节基元；字符级 = 语料中的全部字符
-      const vocab = [];
-      if (this.byteLevel) { for (let b = 0; b < 256; b++) vocab.push(BYTE_ENC.get(b)); }
-      else { vocab.push(...[...new Set([...String(text)])].sort()); }
-      if (vocab.length > target) vocab.length = target;
-      const merges = []; // [[a, b], ...]，下标即 merge rank
-
-      // 4) 频率合并：每轮统计相邻对频次，合并最高频者
-      while (vocab.length < target) {
-        const cnt = new Map();
-        for (const { s, n } of seqs) {
-          for (let i = 0; i + 1 < s.length; i++) {
-            const key = s[i] + '\u0000' + s[i + 1];
-            cnt.set(key, (cnt.get(key) || 0) + n);
-          }
-        }
-        let best = null, bestN = o.minPairFreq - 1;
-        for (const [k, n] of cnt) if (n > bestN) { bestN = n; best = k; }
-        if (!best) break; // 没有再值得合并的对
-        const parts = best.split('\u0000');
-        const a = parts[0], b = parts[1], tok = a + b;
-        vocab.push(tok);
-        merges.push([a, b]);
-        for (const seq of seqs) {
-          const out = [];
-          let i = 0;
-          while (i < seq.s.length) {
-            if (i + 1 < seq.s.length && seq.s[i] === a && seq.s[i + 1] === b) { out.push(tok); i += 2; }
-            else { out.push(seq.s[i]); i++; }
-          }
-          seq.s = out;
-        }
-      }
-
-      this.chars = vocab;
-      this.merges = merges;
-      this.itos = vocab;
-      this.stoi = new Map(vocab.map((t, i) => [t, i]));
-      this.ranks = new Map(merges.map((m, i) => [m[0] + m[1], i]));
-    }
-
-    get vocabSize() { return this.chars.length; }
-
-    /** 文本 -> id 序列。逐词块用 merge-rank 贪心合并（等价 GPT-2/tiktoken） */
-    encode(text) {
-      const out = [];
-      for (const m of String(text).matchAll(PRE_RE)) {
-        let s = this.byteLevel ? [...textToByteChars(m[0])] : [...m[0]];
-        while (s.length > 1) {
-          let bestRank = Infinity, bestI = -1;
-          for (let i = 0; i + 1 < s.length; i++) {
-            const r = this.ranks.get(s[i] + s[i + 1]);
-            if (r !== undefined && r < bestRank) { bestRank = r; bestI = i; }
-          }
-          if (bestI < 0) break;
-          s.splice(bestI, 2, s[bestI] + s[bestI + 1]);
-        }
-        for (const t of s) {
-          const id = this.stoi.get(t);
-          if (id !== undefined) out.push(id);
-          else for (const ch of t) { // 兜底：拆到字节基元（理论上不会触发）
-            const cid = this.stoi.get(ch);
-            if (cid !== undefined) out.push(cid);
-          }
-        }
-      }
-      return out;
-    }
-
-    /** id 序列 -> 文本。字节级先拼全部字节再一次性 UTF-8 解码，跨 token 汉字无损 */
-    decode(ids) {
-      let s = '';
-      for (const id of ids) s += this.itos[id] ?? '';
-      return this.byteLevel ? byteCharsToText(s) : s;
-    }
-  }
-
-  /* ==========================================================================
-   * 三、GPT 模型（前向 + 手写反向传播）
-   * ======================================================================== */
-  class GPTModel {
-    /**
-     * @param {Object} cfg { vocabSize, blockSize, nLayer, nHead, dModel, seed }
-     *   架构开关（默认全部为 GPT-2 原设计，保持向后兼容；'llama' 预设见 ARCH_PRESETS）：
-     *   norm: 'ln'（LayerNorm，GPT-2）| 'rmsnorm'（RMSNorm，LLaMA/Mistral）
-     *   ffn:  'gelu'（GPT-2）        | 'swiglu'（SiLU 门控，LLaMA/Mistral）
-     *   pos:  'learned'（可学习位置嵌入，GPT-2）| 'rope'（旋转位置编码，LLaMA/Mistral）
-     *   ffnHidden: FFN 隐藏层宽度，默认 4·dModel（LLaMA 惯例为 ⌊2/3·4D⌋，可显式传入）
-     *   MoE 开关（默认稠密，nExp=1；nExp>1 即混合专家，现代顶级 LLM 核心稀疏架构）：
-     *   nExp:    专家数量（每层 N 个独立 FFN + 1 个路由网络）
-     *   topK:    top-k 门控（每个 token 仅激活 topK 个专家，默认 1）
-     *   auxWeight: 负载均衡辅助损失权重（Switch/GDP-MoE，默认 0.01；非 MoE 为 0）
-     *   稀疏注意力开关（Mistral/Gemma 谱系）：
-     *   window: 滑动窗口。标量=所有层同窗口；数组=逐层窗口（长度须=nLayer，Gemma 2/3 局部/全局交错）；
-     *           哨兵 {alt:N}=偶数层全因果(0)、奇数层窗口 N 的 1:1 交错。0 = 全因果，默认
-     *   稳定化开关（Gemma 2 配方，默认全关 = 逐位兼容旧模型）：
-     *   qkNorm:  true 时对每个头的 Q/K 向量做 RMSNorm（RoPE 前，增益 head_dim 维跨头共享）
-     *   logitCap: 最终 logits 软帽 logits = cap·tanh(logits/cap)（Gemma 2 用 30；0 = 不启用）
-     *   kvQuant: KV 缓存量化（8 = INT8，per-(token,KV头) 对称 absmax；0 = Float64，默认）
-     */
-    constructor(cfg) {
-      if (cfg.dModel % cfg.nHead !== 0) {
-        throw new Error(`dModel(${cfg.dModel}) 必须能被 nHead(${cfg.nHead}) 整除`);
-      }
-      this.cfg = Object.assign({ seed: 42, norm: 'ln', ffn: 'gelu', pos: 'learned' }, cfg);
-      const { vocabSize: V, blockSize: T, nLayer: L, nHead: H, dModel: D } = this.cfg;
-      if (this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
-        throw new Error(`RoPE 要求每个 head 维度 dh=${D / H} 为偶数`);
-      }
-      // GQA（分组查询注意力）：KV 头数可小于 Q 头数（LLaMA-2/3 标准）。
-      // 默认 nKvHead = nHead 即 MHA，完全向后兼容。
-      const KV = cfg.nKvHead != null ? cfg.nKvHead : H;
-      if (KV < 1 || KV > H || H % KV !== 0) {
-        throw new Error(`nKvHead(${KV}) 需满足 1 <= nKvHead <= nHead(${H}) 且 nHead 可被整除`);
-      }
-      const dh = D / H;
-      this.KV = KV; this.dh = dh; this.g = H / KV; this.qkvDim = D + 2 * KV * dh;
-      this.useRope = this.cfg.pos === 'rope';
-      this.useRms = this.cfg.norm === 'rmsnorm';
-      this.useSwi = this.cfg.ffn === 'swiglu';
-      this.fh = this.cfg.ffnHidden || 4 * D;
-      // MoE（混合专家）：nExp>1 时每层 FFN 替换为 N 个专家 + top-k 路由网络；
-      // 现代顶级 LLM（Mixtral/GPT-4/DeepSeek）的核心稀疏架构。nExp=1 即稠密（零回归）。
-      this.nExp = cfg.nExp || 1;
-      this.topK = Math.min(cfg.topK || 1, this.nExp);
-      this.useMoE = this.nExp > 1;
-      this.auxWeight = cfg.auxWeight != null ? cfg.auxWeight : (this.useMoE ? 0.01 : 0);
-      // 滑动窗口注意力（SWA，Mistral/Gemma）：window>0 时查询 i 只 attend 键 [i-window+1, i]；
-      // window=0（默认）即标准全因果，逐位兼容旧模型。三种写法归一化为逐层数组 this.windows：
-      //   标量 s      -> 所有层同窗口 [s,s,...]
-      //   数组 [a,b]  -> 逐层窗口（长度须 = nLayer，Gemma 2/3 局部/全局层交错）
-      //   哨兵 {alt:N} -> 偶数层全因果(0)、奇数层窗口 N（Gemma 2 的 1:1 交错模式）
-      const wRaw = cfg.window;
-      let wArr;
-      if (Array.isArray(wRaw)) {
-        if (wRaw.length !== L) {
-          throw new Error(`window 数组长度(${wRaw.length}) 需等于 nLayer(${L})`);
-        }
-        wArr = wRaw.map((v) => (v > 0 ? Math.floor(v) : 0));
-      } else if (wRaw && typeof wRaw === 'object' && wRaw.alt > 0) {
-        const w = Math.floor(wRaw.alt);
-        wArr = [];
-        for (let l = 0; l < L; l++) wArr.push(l % 2 === 1 ? w : 0); // 偶数层全局，奇数层局部
-      } else {
-        const w = wRaw > 0 ? Math.floor(wRaw) : 0;
-        wArr = new Array(L).fill(w);
-      }
-      this.windows = wArr;   // 逐层窗口（权威字段，0 = 该层全因果/全局）
-      this.window = Array.isArray(wRaw) ? wArr.slice()
-        : (wRaw && typeof wRaw === 'object' ? { alt: Math.floor(wRaw.alt) } : wArr[0]); // 兼容读取：原样反映配置
-      // Gemma 2 稳定化组件：QK-norm（RoPE 前逐头 RMSNorm）与 logit soft-cap。默认全关。
-      this.qkNorm = !!cfg.qkNorm;
-      this.logitCap = cfg.logitCap > 0 ? +cfg.logitCap : 0;
-      // KV 缓存 INT8 量化：仅影响 forwardStep 增量路径（forward 全序列不走缓存）
-      this.kvQuant = cfg.kvQuant === 8 ? 8 : 0;
-      // Attention Sink（StreamingLLM）：恒驻缓存首 K 个锚点 token，支持无限上下文流式推理；0 = 关闭（逐位兼容）
-      this.attentionSink = cfg.attentionSink > 0 ? Math.floor(cfg.attentionSink) : 0;
-      // YaRN 长度外推（RoPE 频率插值 + 注意力温度缩放）：
-      //   cfg.ropeScale = { type:'yarn'|'ntk', factor, originalMaxLength, betaFast, betaSlow }
-      //   factor<=1 或未配置 -> 恒等变换（freqScale=null、attnScale=1，逐位兼容）。
-      let ropeFreqScale = null, attentionScaling = 1;
-      const rs = cfg.ropeScale;
-      if (rs && (rs.factor || 0) > 1) {
-        const factor = +rs.factor;
-        const dim = dh;                       // 旋转维 = 头维度 dh（YaRN 公式的 rotary dim）
-        const base = ROPE_BASE;
-        const orig = rs.originalMaxLength || T || 2048;
-        const half = dh >> 1;
-        ropeFreqScale = new Float64Array(half);
-        if (rs.type === 'ntk') {
-          // 简单 NTK-aware：全局基频缩放 ntk = factor^(dim/(dim-2))
-          const ntk = Math.pow(factor, dim / (dim - 2));
-          for (let p = 0; p < half; p++) ropeFreqScale[p] = 1 / ntk;
-        } else {
-          // YaRN NTK-by-parts：高频维（小 p）保留、低频维（大 p）插值，平滑过渡（HF 同式）
-          const betaFast = rs.betaFast || 32, betaSlow = rs.betaSlow || 1;
-          const low = Math.max(0, Math.floor(dim * Math.log(orig / (2 * Math.PI * betaFast)) / (2 * Math.log(base))));
-          const high = Math.min(half - 1, Math.ceil(dim * Math.log(orig / (2 * Math.PI * betaSlow)) / (2 * Math.log(base))));
-          for (let p = 0; p < half; p++) {
-            let ramp;
-            if (p <= low) ramp = 0;
-            else if (p >= high) ramp = 1;
-            else { const r = (p - low) / Math.max(1, high - low); ramp = r * r * (3 - 2 * r); } // smoothstep
-            const mask = 1 - ramp;                 // HF: inv_freq_mask = 1 - ramp
-            ropeFreqScale[p] = Math.pow(factor, -mask); // inv_freq /= factor^mask（∈ [1/factor, 1]）
-          }
-        }
-        // 注意力温度（YaRN mscale）：缩放 softmax 前 logits，补偿频率插值带来的幅度变化
-        attentionScaling = factor > 1 ? 0.1 * Math.log(factor) / Math.log(2) : 1;
-      }
-      this.ropeFreqScale = ropeFreqScale;
-      this.attentionScaling = attentionScaling;
-      this.quantized = false;
-      const rng = mulberry32(this.cfg.seed);
-      const P = (this.params = {});
-      const add = (name, r, c, scale) => {
-        const p = { d: new Float64Array(r * c), r, c };
-        const s = 0.02 * (scale || 1);
-        for (let i = 0; i < p.d.length; i++) p.d[i] = randn(rng) * s;
-        P[name] = p;
-      };
-      const zeros = (name, n) => { P[name] = { d: new Float64Array(n), r: 1, c: n }; };
-      const ones = (name, n) => {
-        const p = { d: new Float64Array(n), r: 1, c: n };
-        p.d.fill(1);
-        P[name] = p;
-      };
-      add('tokEmb', V, D);
-      if (!this.useRope) add('posEmb', T, D); // RoPE 不需要位置嵌入
-      const rscale = 1 / Math.sqrt(2 * L); // GPT-2：按残差深度缩放输出投影初始化
-      const FH = this.fh;
-      for (let l = 0; l < L; l++) {
-        const k = `l${l}.`;
-        add(k + 'wqkv', D, this.qkvDim); zeros(k + 'bqkv', this.qkvDim);
-        add(k + 'wproj', D, D, rscale); zeros(k + 'bproj', D);
-        if (this.useMoE) {
-          // 路由网络：x → 各专家门控 logits（softmax over experts）
-          add(k + 'wg', D, this.nExp); zeros(k + 'bg', this.nExp);
-          // N 个专家 FFN（各自独立的 SwiGLU/GELU 两层），复用稠密 FFN 的同一宽度约定
-          for (let e = 0; e < this.nExp; e++) {
-            const ek = `${k}e${e}.`;
-            add(ek + 'w1', D, this.useSwi ? 2 * FH : FH);
-            zeros(ek + 'b1', this.useSwi ? 2 * FH : FH);
-            add(ek + 'w2', FH, D, rscale); zeros(ek + 'b2', D);
-          }
-        } else {
-          // SwiGLU 的 w1 一次产出 gate 与 up 两半（D → 2·FH），少一次矩阵乘
-          add(k + 'w1', D, this.useSwi ? 2 * FH : FH);
-          zeros(k + 'b1', this.useSwi ? 2 * FH : FH);
-          add(k + 'w2', FH, D, rscale); zeros(k + 'b2', D);
-        }
-        ones(k + 'ln1.g', D); if (!this.useRms) zeros(k + 'ln1.b', D);
-        ones(k + 'ln2.g', D); if (!this.useRms) zeros(k + 'ln2.b', D);
-        if (this.qkNorm) { ones(k + 'qg', dh); ones(k + 'kg', dh); } // QK-norm 增益（head_dim 维跨头共享）
-      }
-      ones('lnf.g', D); if (!this.useRms) zeros('lnf.b', D);
-      // 输出头与 tokEmb 权重共享（weight tying，GPT-1/2 标准做法）
-      this.grads = {};
-      for (const key in P) this.grads[key] = new Float64Array(P[key].d.length);
-      this.zeroGrads();
-    }
-
-    zeroGrads() {
-      for (const key in this.grads) this.grads[key].fill(0);
-    }
-
-    paramCount() {
-      let n = 0;
-      for (const key in this.params) {
-        const p = this.params[key];
-        n += p.q ? p.q.length : p.d.length;
-      }
-      return n;
-    }
-
-    /** 导出 INT8 权重量化推理副本（weight-only PTQ）。
-     * 线性权重（wqkv/wproj/w1/w2/tokEmb/posEmb）转为 {q, scale} 常驻 Int8，
-     * 偏置与归一化参数保持 Float64。原模型（训练态）不受影响。 */
-    quantize() {
-      const m = Object.create(GPTModel.prototype);
-      m.cfg = this.cfg;
-      m.useRms = this.useRms; m.useSwi = this.useSwi; m.useRope = this.useRope;
-      m.KV = this.KV; m.g = this.g; m.fh = this.fh; m.dh = this.dh;
-      m.qkvDim = this.qkvDim; m.quantized = true;
-      m.nExp = this.nExp; m.topK = this.topK; m.useMoE = this.useMoE; m.auxWeight = this.auxWeight;
-      m.window = this.window; m.windows = this.windows.slice();
-      m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant; m.attentionSink = this.attentionSink;
-      m.ropeFreqScale = this.ropeFreqScale; m.attentionScaling = this.attentionScaling;
-      m.params = {};
-      for (const key in this.params) {
-        const p = this.params[key];
-        if (p && p.d && isQuantLinear(key)) {
-          const d = p.d;
-          let maxAbs = 0;
-          for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > maxAbs) maxAbs = a; }
-          const scale = maxAbs / 127 || 1;
-          const q = new Int8Array(d.length);
-          for (let i = 0; i < d.length; i++) {
-            let v = Math.round(d[i] / scale);
-            q[i] = v > 127 ? 127 : v < -127 ? -127 : v;
-          }
-          m.params[key] = { q, scale };
-        } else {
-          m.params[key] = { d: p.d ? p.d.slice() : p.d };
-        }
-      }
-      return m;
-    }
-
-    /** 前向传播，返回 { logits(T×V), cache }，cache 供反向传播使用 */
-    forward(tokens) {
-      const { vocabSize: V, blockSize: B, nLayer: L, nHead: H, dModel: D } = this.cfg;
-      const dh = this.dh, KV = this.KV, g = this.g, qkvDim = this.qkvDim;
-      const P = this.params;
-      const T = Math.min(tokens.length, B);
-      const toks = tokens.length > B ? tokens.slice(tokens.length - B) : tokens;
-
-      const NF = this.useRms ? rmsnormFwd : layernormFwd;
-      const nb = (key) => (P[key] ? P[key].d : null);
-
-      // 1) token 嵌入 + 位置嵌入（RoPE 模式下无位置嵌入）
-      let X = new Float64Array(T * D);
-      const te = P.tokEmb, pe = P.posEmb;
-      const teQ = te.q, peQ = pe ? pe.q : null;
-      for (let i = 0; i < T; i++) {
-        const t = toks[i], o = i * D;
-        for (let j = 0; j < D; j++) {
-          const tv = teQ ? te.q[t * D + j] * te.scale : te.d[t * D + j];
-          X[o + j] = peQ ? tv + pe.q[o + j] * pe.scale : (pe ? tv + pe.d[o + j] : tv);
-        }
-      }
-
-      const layers = [];
-      for (let l = 0; l < L; l++) {
-        const k = `l${l}.`;
-        // 2) pre-LN #1 -> 因果多头自注意力
-        const ln1 = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), T, D);
-        const A = ln1.Y;
-        const qkv = mm(A, P[k + 'wqkv'], T, D, qkvDim);
-        for (let i = 0; i < T; i++) {
-          const o = i * qkvDim;
-          for (let j = 0; j < qkvDim; j++) qkv[o + j] += P[k + 'bqkv'].d[j];
-        }
-        // RoPE：就地旋转 Q/K 段（V 段不旋转）。QK-norm 先于 RoPE（Gemma 2 顺序）
-        let qk = null;
-        if (this.qkNorm) {
-          const qn = qkNormFwd(qkv, T, H, dh, qkvDim, 0, P[k + 'qg'].d);  // Q 段（偏移 0，H 个头）
-          const kn = qkNormFwd(qkv, T, KV, dh, qkvDim, D, P[k + 'kg'].d); // K 段（偏移 D，KV 个头）
-          qk = { qx: qn.xhat, qr: qn.rstd, kx: kn.xhat, kr: kn.rstd };
-        }
-        if (this.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim, this.ropeFreqScale);
-        const ctx = new Float64Array(T * D);
-        const Ps = [];
-        const scale = 1 / Math.sqrt(dh);
-        const attnScale = this.attentionScaling; // YaRN 注意力温度（=1 恒等）
-        for (let h = 0; h < H; h++) {
-          const kvh = (h / g) | 0;                 // 该 Q 头对应的 KV 头
-          const ko = D + kvh * dh;                 // K 段偏移
-          const vo = D + KV * dh + kvh * dh;        // V 段偏移
-          const S = new Float64Array(T * T);
-          const win = this.windows[l]; // 0 = 该层全因果（GPT-2 原行为）
-          for (let i = 0; i < T; i++) {
-            const qi = i * qkvDim + h * dh;
-            // 因果掩码（j <= i）叠加滑动窗口左边界（j >= i-window+1，Mistral/Gemma）
-            const jLo = win > 0 && i - win + 1 > 0 ? i - win + 1 : 0;
-            for (let j = jLo; j <= i; j++) { // 窗口内：计算注意力分数
-              const kj = j * qkvDim + ko;
-              let s = 0;
-              for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
-              S[i * T + j] = s * scale * attnScale;
-            }
-            for (let j = 0; j < jLo; j++) S[i * T + j] = -1e9;  // 窗口左侧屏蔽（窗外历史）
-            for (let j = i + 1; j < T; j++) S[i * T + j] = -1e9; // 未来位置屏蔽
-          }
-          const Pm = softmaxRows(S, T, T);
-          Ps.push(Pm);
-          for (let i = 0; i < T; i++) {
-            const jLo = win > 0 && i - win + 1 > 0 ? i - win + 1 : 0;
-            for (let p = 0; p < dh; p++) {
-              let s = 0;
-              for (let j = jLo; j <= i; j++) s += Pm[i * T + j] * qkv[j * qkvDim + vo + p];
-              ctx[i * D + h * dh + p] = s;
-            }
-          }
-        }
-        let attn = mm(ctx, P[k + 'wproj'], T, D, D);
-        for (let i = 0; i < T; i++) {
-          const o = i * D;
-          for (let j = 0; j < D; j++) attn[o + j] += P[k + 'bproj'].d[j];
-        }
-        const xMid = new Float64Array(T * D);
-        for (let i = 0; i < T * D; i++) xMid[i] = X[i] + attn[i]; // 残差连接
-
-        // 3) pre-LN #2 -> 前馈网络（MoE 稀疏 / 稠密 GELU/SwiGLU 双路径）
-        const ln2 = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), T, D);
-        const M = ln2.Y;
-        const FH = this.fh;
-        let ff, pre1 = null, h1 = null, moe = null;
-        if (this.useMoE) {
-          const r = moeForward(this, P, k, M, T, D, FH);
-          ff = r.ff; moe = r.moe;
-        } else {
-          const W1 = this.useSwi ? 2 * FH : FH;
-          pre1 = mm(M, P[k + 'w1'], T, D, W1);
-          for (let i = 0; i < T; i++) {
-            const o = i * W1;
-            for (let j = 0; j < W1; j++) pre1[o + j] += P[k + 'b1'].d[j];
-          }
-          h1 = this.useSwi ? swigluFwd(pre1, T, FH) : geluFwd(pre1);
-          ff = mm(h1, P[k + 'w2'], T, FH, D);
-          for (let i = 0; i < T; i++) {
-            const o = i * D;
-            for (let j = 0; j < D; j++) ff[o + j] += P[k + 'b2'].d[j];
-          }
-        }
-        const xOut = new Float64Array(T * D);
-        for (let i = 0; i < T * D; i++) xOut[i] = xMid[i] + ff[i]; // 残差连接
-
-        layers.push({ ln1, A, qkv, Ps, ctx, xMid, ln2, M, pre1, h1, moe, qk });
-        X = xOut;
-      }
-
-      // 4) 最终归一化 + 权重共享输出头（+ Gemma 2 logit soft-cap：cap·tanh(x/cap)）
-      const lnf = NF(X, P['lnf.g'].d, nb('lnf.b'), T, D);
-      const Hf = lnf.Y;
-      let logits = mmAtB(Hf, P.tokEmb, T, D, V);
-      if (this.logitCap > 0) {
-        const cap = this.logitCap;
-        for (let i = 0; i < logits.length; i++) logits[i] = cap * Math.tanh(logits[i] / cap);
-      }
-      return { logits, cache: { T, dh, H, D, L, layers, lnf, Hf, toks, logits } };
-    }
-
-    /** 反向传播：dlogits(T×V) -> 累加至 this.grads */
-    backward(cache, dlogits) {
-      const { T, dh, H, D, L } = cache;
-      const { vocabSize: V } = this.cfg;
-      const P = this.params, G = this.grads;
-      const NB = this.useRms ? rmsnormBwd : layernormBwd;
-
-      // 权重共享输出头反向：logits = Hf @ Wte^T
-      //   dWte = dlogits^T @ Hf ；dHf = dlogits @ Wte
-      // Gemma 2 logit soft-cap 反向：lg = cap·tanh(x/cap) ⇒ dlg/dx = sech²(x/cap) = 1 − (lg/cap)²
-      // （lg 为缓存中的 capped logits，lg/cap 即 tanh(x/cap)，不可再套一层 tanh）
-      if (this.logitCap > 0) {
-        const cap = this.logitCap, lg = cache.logits;
-        for (let i = 0; i < dlogits.length; i++) {
-          const u = lg[i] / cap;
-          dlogits[i] *= 1 - u * u;
-        }
-      }
-      addInto(G.tokEmb, matmulTA(dlogits, cache.Hf, T, V, D));
-      const dHf = matmul(dlogits, P.tokEmb.d, T, V, D);
-      // 最终归一化反向（dY 形状 T×D）
-      const lnfb = NB(dHf, cache.lnf.xhat, cache.lnf.rstd, P['lnf.g'].d, T, D);
-      addInto(G['lnf.g'], lnfb.dg);
-      if (G['lnf.b']) addInto(G['lnf.b'], lnfb.db);
-      let dX = lnfb.dX;
-
-      for (let l = L - 1; l >= 0; l--) {
-        const k = `l${l}.`;
-        const c = cache.layers[l];
-        // xOut = xMid + ff => dff = dX, dxMid = dX
-        const dff = dX;
-        let dM;
-        if (this.useMoE) {
-          dM = moeBackward(this, P, G, c.moe, dff, T, D);
-        } else {
-          const FH = this.fh, W1 = this.useSwi ? 2 * FH : FH;
-          addInto(G[k + 'w2'], matmulTA(c.h1, dff, T, FH, D));
-          rowSumInto(G[k + 'b2'], dff, T, D);
-          const dh1 = matmulAtB(dff, P[k + 'w2'].d, T, D, FH);
-          const dpre1 = this.useSwi ? swigluBwd(dh1, c.pre1, T, FH) : geluBwd(dh1, c.pre1);
-          addInto(G[k + 'w1'], matmulTA(c.M, dpre1, T, D, W1));
-          rowSumInto(G[k + 'b1'], dpre1, T, W1);
-          dM = matmulAtB(dpre1, P[k + 'w1'].d, T, W1, D);
-        }
-        const ln2b = NB(dM, c.ln2.xhat, c.ln2.rstd, P[k + 'ln2.g'].d, T, D);
-        addInto(G[k + 'ln2.g'], ln2b.dg);
-        if (G[k + 'ln2.b']) addInto(G[k + 'ln2.b'], ln2b.db);
-        const dxMid = new Float64Array(T * D);
-        for (let i = 0; i < T * D; i++) dxMid[i] = dX[i] + ln2b.dX[i];
-
-        // xMid = x0 + attn => dattn = dxMid, dx0 = dxMid
-        const dattn = dxMid;
-        addInto(G[k + 'wproj'], matmulTA(c.ctx, dattn, T, D, D));
-        rowSumInto(G[k + 'bproj'], dattn, T, D);
-        const dctx = matmulAtB(dattn, P[k + 'wproj'].d, T, D, D);
-
-        const qkvDim = this.qkvDim, KV = this.KV, g = this.g;
-        const dqkv = new Float64Array(T * qkvDim);
-        for (let h = 0; h < H; h++) {
-          const kvh = (h / g) | 0;
-          const ko = D + kvh * dh;
-          const vo = D + KV * dh + kvh * dh;
-          const Pm = c.Ps[h];
-          const dP = new Float64Array(T * T);
-          const dVh = new Float64Array(T * dh);
-          for (let i = 0; i < T; i++) {
-            for (let j = 0; j < T; j++) {
-              let s = 0;
-              for (let p = 0; p < dh; p++) s += dctx[i * D + h * dh + p] * c.qkv[j * qkvDim + vo + p];
-              dP[i * T + j] = s;
-            }
-          }
-          // dV[j] = Σ_{i≥j} P[i][j] · dctx[i]（ctx[i] = Σ_j P[i][j]·V[j]，按列累加）
-          for (let j = 0; j < T; j++) {
-            for (let p = 0; p < dh; p++) {
-              let s = 0;
-              for (let i = j; i < T; i++) s += Pm[i * T + j] * dctx[i * D + h * dh + p];
-              dVh[j * dh + p] = s;
-            }
-          }
-          const dS = softmaxBwd(dP, Pm, T, T);
-          const scale = 1 / Math.sqrt(dh);
-          const attnScale = this.attentionScaling; // 与 forward 同因子（线性推送）
-          // dQ[i] = Σ_{j≤i} dS[i][j] · K[j]（因果掩码右侧为零）
-          for (let i = 0; i < T; i++) {
-            for (let p = 0; p < dh; p++) {
-              let sq = 0;
-              for (let j = 0; j <= i; j++) {
-                sq += dS[i * T + j] * c.qkv[j * qkvDim + ko + p];
-              }
-              dqkv[i * qkvDim + h * dh + p] = sq * scale * attnScale;
-            }
-          }
-          // dK[i] = Σ_{a≥i} dS[a][i] · Q[a]（列方向：所有 a≥i 的行都向 K[i] 传梯度）
-          for (let i = 0; i < T; i++) {
-            for (let p = 0; p < dh; p++) {
-              let sk = 0;
-              for (let a = i; a < T; a++) {
-                sk += dS[a * T + i] * c.qkv[a * qkvDim + h * dh + p];
-              }
-              dqkv[i * qkvDim + ko + p] += sk * scale * attnScale; // 共享 KV 头：多个 Q 头累加
-            }
-          }
-          for (let i = 0; i < T; i++) {
-            for (let p = 0; p < dh; p++) dqkv[i * qkvDim + vo + p] += dVh[i * dh + p];
-          }
-        }
-        // RoPE 反向：旋转是正交变换，其雅可比的转置 = 反向旋转（频率缩放与正向一致）
-        if (this.useRope) ropeApply(dqkv, T, D, H, dh, 0, -1, KV, qkvDim, this.ropeFreqScale);
-        // QK-norm 反向（前向顺序：norm → RoPE，反向顺序：RoPE⁻¹ → norm⁻¹）
-        if (this.qkNorm) {
-          qkNormBwd(dqkv, c.qk.qx, c.qk.qr, T, H, dh, qkvDim, 0, P[k + 'qg'].d, G[k + 'qg']);
-          qkNormBwd(dqkv, c.qk.kx, c.qk.kr, T, KV, dh, qkvDim, D, P[k + 'kg'].d, G[k + 'kg']);
-        }
-        addInto(G[k + 'wqkv'], matmulTA(c.A, dqkv, T, D, qkvDim));
-        rowSumInto(G[k + 'bqkv'], dqkv, T, qkvDim);
-        const dA = matmulAtB(dqkv, P[k + 'wqkv'].d, T, qkvDim, D);
-        const ln1b = NB(dA, c.ln1.xhat, c.ln1.rstd, P[k + 'ln1.g'].d, T, D);
-        addInto(G[k + 'ln1.g'], ln1b.dg);
-        if (G[k + 'ln1.b']) addInto(G[k + 'ln1.b'], ln1b.db);
-        const dx0 = new Float64Array(T * D);
-        for (let i = 0; i < T * D; i++) dx0[i] = dxMid[i] + ln1b.dX[i];
-        dX = dx0;
-      }
-
-      // 嵌入层反向（token 嵌入散列累加 + 位置嵌入）
-      for (let i = 0; i < T; i++) {
-        const t = cache.toks[i], o = i * D;
-        for (let j = 0; j < D; j++) {
-          G.tokEmb[t * D + j] += dX[o + j];
-          if (G.posEmb) G.posEmb[o + j] += dX[o + j];
-        }
-      }
-    }
-
-    /** 评估模式：返回 (loss, 预测准确率) */
-    evaluate(tokens) {
-      const V = this.cfg.vocabSize;
-      const T = Math.min(tokens.length, this.cfg.blockSize);
-      if (T < 2) return { loss: Infinity, acc: 0 };
-      const toks = tokens.length > this.cfg.blockSize ? tokens.slice(tokens.length - this.cfg.blockSize) : tokens;
-      const { logits } = this.forward(toks);
-      const targets = [];
-      for (let i = 1; i < T; i++) targets.push(toks[i]);
-      const { loss } = crossEntropy(logits, targets, T - 1, V);
-      let correct = 0;
-      for (let i = 0; i < T - 1; i++) {
-        let best = 0;
-        for (let j = 1; j < V; j++) if (logits[i * V + j] > logits[i * V + best]) best = j;
-        if (best === targets[i]) correct++;
-      }
-      return { loss, acc: correct / (T - 1) };
-    }
-  }
-
-  /* ==========================================================================
-   * 四、训练器（AdamW + 梯度裁剪 + warmup/cosine 学习率）
-   * ======================================================================== */
-  function train(model, tokens, opts) {
-    const o = Object.assign({
-      steps: 200, lr: 3e-3, batch: null, warmup: 20, seed: 0,
-      logEvery: 20, onStep: null, wd: 0.01, gradClip: 1.0, fixedBatch: null,
-      state: null, stepOffset: 0, totalSteps: null,
-    }, opts);
-    if (tokens.length < 2 && !o.fixedBatch) throw new Error('训练语料至少需要 2 个 token');
-    if (o.fixedBatch && o.fixedBatch.length < 2) throw new Error('固定批次至少需要 2 个 token');
-    const B = o.batch || model.cfg.blockSize;
-    const V = model.cfg.vocabSize;
-    const total = o.totalSteps || o.steps;
-    const off = o.stepOffset;
-    // Adam 状态：传入 state 可断点续训（分块训练不丢动量与数据流）
-    const st = o.state || { m: {}, v: {}, t: 0, rngA: o.seed >>> 0 };
-    const m = st.m, v = st.v;
-    for (const key in model.params) {
-      if (!(key in m)) m[key] = new Float64Array(model.params[key].d.length);
-      if (!(key in v)) v[key] = new Float64Array(model.params[key].d.length);
-    }
-    let a = st.rngA === undefined ? (o.seed >>> 0) : st.rngA; // 批次采样 RNG 状态随续训延续
-    const rng = function () {
-      a |= 0; a = (a + 0x6D2B79F5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-    const b1 = 0.9, b2 = 0.95, eps = 1e-8;
-    let t = st.t;
-    const history = [];
-    for (let step = 0; step < o.steps; step++) {
-      const g = step + off; // 全局步号（用于学习率调度）
-      // 学习率：线性 warmup -> cosine 衰减至 10%
-      const lrNow = g < o.warmup
-        ? o.lr * (g + 1) / o.warmup
-        : o.lr * (0.1 + 0.9 * 0.5 * (1 + Math.cos(Math.PI * Math.min(1, (g - o.warmup) / Math.max(1, total - o.warmup)))));
-      let batchToks;
-      if (o.fixedBatch) {
-        batchToks = o.fixedBatch;
-      } else {
-        const maxStart = Math.max(0, tokens.length - B - 1);
-        const start = Math.floor(rng() * (maxStart + 1));
-        batchToks = [];
-        for (let i = 0; i < Math.min(B, tokens.length - 1); i++) batchToks.push(tokens[start + i]);
-      }
-      const T = batchToks.length;
-      const targets = [];
-      for (let i = 1; i < T; i++) targets.push(batchToks[i]);
-      model.zeroGrads();
-      const { logits, cache } = model.forward(batchToks);
-      const { loss, dlogits } = crossEntropy(logits, targets, T - 1, V, T);
-      model.backward(cache, dlogits);
-      // 负载均衡辅助损失（仅 MoE）：E·Σ_e f_e·P_e，乘以 auxWeight 并入总损失
-      let reported = loss;
-      if (model.useMoE && model.auxWeight) {
-        let aux = 0;
-        for (let l = 0; l < model.cfg.nLayer; l++) aux += cache.layers[l].moe.aux;
-        reported = loss + model.auxWeight * aux;
-      }
-      // 全局梯度范数裁剪
-      let gsq = 0;
-      for (const key in model.grads) {
-        const g = model.grads[key];
-        for (let i = 0; i < g.length; i++) gsq += g[i] * g[i];
-      }
-      const norm = Math.sqrt(gsq);
-      const clipScale = norm > o.gradClip ? o.gradClip / norm : 1;
-      t++;
-      const bc1 = 1 - Math.pow(b1, t), bc2 = 1 - Math.pow(b2, t);
-      for (const key in model.params) {
-        const p = model.params[key].d, g = model.grads[key], mk = m[key], vk = v[key];
-        for (let i = 0; i < p.length; i++) {
-          const gi = g[i] * clipScale;
-          mk[i] = b1 * mk[i] + (1 - b1) * gi;
-          vk[i] = b2 * vk[i] + (1 - b2) * gi * gi;
-          const mh = mk[i] / bc1, vh = vk[i] / bc2;
-          p[i] -= lrNow * (mh / (Math.sqrt(vh) + eps) + o.wd * p[i]); // AdamW：解耦权重衰减
-        }
-      }
-      history.push(reported);
-      if (o.onStep) o.onStep(step, reported, lrNow, norm);
-    }
-    st.t = t;
-    st.rngA = a;
-    return { history, finalLoss: history[history.length - 1], state: st };
-  }
-
-  /* ==========================================================================
-   * 五、推理加速：KV Cache（增量解码）
-   * ----------------------------------------------------------------------------
-   * 复用 GPT-2 标准 KV 缓存：每步只算 1 个新 token，历史 K/V 直接复用。
-   * 生成 N 个 token 的复杂度由 O(N·T²·D) 降至 O(T²·D + N·T·D)。
-   * 硬不变量：缓存路径输出的 logits 必须与全序列 forward 的最后一行逐位相等。
-   * ======================================================================== */
-
-  /** 初始化 KV 缓存：每层 K/V 各预分配 blockSize×D */
-  /**
-   * KV 缓存量化写入：把一行 K/V（kvDim 维）按「每 token × 每 KV 头」粒度做对称 absmax 量化。
-   * 粒度选 per-(token,head) 而非 per-token：RoPE 后同一头内数值量级接近，分头可显著压低动态范围，
-   * 且写入时即可确定 scale（无需校准集、无需回填重标量），天然适配增量追加。
-   * 误差硬界：|dequant(x) − x| ≤ scale/2 = absmax/254（相对误差 ≤ 1/254 ≈ 0.39%）。
-   */
-  function kvWriteRow(buf, sc, row, kvDim, KV, dh, src, srcOff) {
-    const o = row * kvDim;
-    for (let hh = 0; hh < KV; hh++) {
-      let ab = 0;
-      for (let p = 0; p < dh; p++) { const v = Math.abs(src[srcOff + hh * dh + p]); if (v > ab) ab = v; }
-      const s = ab > 0 ? ab / 127 : 1; // 全零行 scale 取 1（解量化仍为 0）
-      sc[row * KV + hh] = s;
-      const b = o + hh * dh;
-      for (let p = 0; p < dh; p++) {
-        let q = Math.round(src[srcOff + hh * dh + p] / s);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
-        buf[b + p] = q;
-      }
-    }
-  }
-
-  /**
-   * 初始化 KV 缓存。kvQuant=8 时 K/V 存 Int8Array（+ per-(token,head) scale），
-   * 每元素 1 字节 + 每头 8 字节 scale；kvQuant=0（默认）为 Float64Array，逐位兼容旧行为。
-   */
-  function initKVCache(model) {
-    const { nLayer: L, blockSize: B } = model.cfg;
-    const kvDim = model.KV * model.dh; // GQA 下 K/V 每位置维度 = KV 头数 · headDim
-    const KV = model.KV, q8 = model.kvQuant === 8;
-    // Attention Sink / StreamingLLM：缓存容量 = 锚点 K + 滚动窗口 R；无锚点时退化为原滑动窗口（容量 = blockSize）
-    const sink = model.attentionSink > 0 ? model.attentionSink : 0;
-    const maxWin = model.windows.reduce((a, b) => (b > a ? b : a), 0);
-    const R = maxWin > 0 ? maxWin : (model.cfg.rollingWindow > 0 ? Math.floor(model.cfg.rollingWindow) : 256);
-    const cap = sink > 0 ? sink + R : B;
-    const K = [], V = [], Ks = [], Vs = [];
-    for (let l = 0; l < L; l++) {
-      K.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
-      V.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
-      if (q8) { Ks.push(new Float64Array(cap * KV)); Vs.push(new Float64Array(cap * KV)); }
-    }
-    return { K, V, Ks, Vs, n: 0, q8, cap, sink };
-  }
-
-  /**
-   * 单步增量前向：处理绝对位置 pos 上的单个 token，写入并复用 KV 缓存。
-   * 缓存槽位（kv.n）与绝对位置（pos）解耦：
-   *  - 槽位是缓存数组下标，写满后靠 kvShift 平移；
-   *  - pos 只喂给 RoPE（可无限增长）与位置嵌入（钳位到 blockSize-1）。
-   *  RoPE 的注意力分数只依赖相对距离，因此滑动窗口后仍与全序列重算逐位一致。
-   */
-  function forwardStep(model, tokenId, pos, kv) {
-    const { dModel: D, nHead: H, nLayer: L, vocabSize: V0, blockSize: B } = model.cfg;
-    const dh = model.dh, scale = 1 / Math.sqrt(dh);
-    const attnScale = model.attentionScaling || 1; // YaRN 注意力温度（与 forward 同因子）
-    const KV = model.KV, qkvDim = model.qkvDim, kvDim = KV * dh;
-    const P = model.params;
-    const NF = model.useRms ? rmsnormFwd : layernormFwd;
-    const nb = (key) => (P[key] ? P[key].d : null);
-    const FH = model.fh;
-    const slot = kv.n;        // 写入槽位
-    const nValid = slot + 1;  // 参与注意力的有效位置数（含当前 token）
-
-    // 1) token 嵌入 + 位置嵌入（单行，量化权重走解量化查表）
-    let X = new Float64Array(D);
-    const posIdx = Math.min(pos, B - 1);
-    const te = P.tokEmb, pe = P.posEmb;
-    for (let j = 0; j < D; j++) {
-      const tv = te.q ? te.q[tokenId * D + j] * te.scale : te.d[tokenId * D + j];
-      X[j] = pe
-        ? (pe.q ? pe.q[posIdx * D + j] * pe.scale : pe.d[posIdx * D + j]) + tv
-        : tv;
-    }
-
-    for (let l = 0; l < L; l++) {
-      const k = `l${l}.`;
-      // 2) pre-norm #1 -> QKV
-      const A = NF(X, P[k + 'ln1.g'].d, nb(k + 'ln1.b'), 1, D).Y;
-      const qkv = mm(A, P[k + 'wqkv'], 1, D, qkvDim);
-      for (let j = 0; j < qkvDim; j++) qkv[j] += P[k + 'bqkv'].d[j];
-      // QK-norm（RoPE 前，逐头 RMSNorm，与 forward 同序）
-      if (model.qkNorm) {
-        qkNormFwd(qkv, 1, H, dh, qkvDim, 0, P[k + 'qg'].d);
-        qkNormFwd(qkv, 1, KV, dh, qkvDim, D, P[k + 'kg'].d);
-      }
-      if (model.useRope) ropeApply(qkv, 1, D, H, dh, pos, 1, KV, qkvDim, model.ropeFreqScale);
-
-      // 3) 写入缓存（K 取 QKV 中段，V 取尾段；GQA 下 K/V 各 kvDim 维）
-      //    kvQuant=8：写入即量化（Int8 + per-(token,head) scale）；否则原样存 Float64
-      const Ko = kv.K[l], Vo = kv.V[l], o = slot * kvDim;
-      if (kv.q8) {
-        kvWriteRow(Ko, kv.Ks[l], slot, kvDim, KV, dh, qkv, D);
-        kvWriteRow(Vo, kv.Vs[l], slot, kvDim, KV, dh, qkv, D + KV * dh);
-      } else {
-        for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
-      }
-
-      // 4) 因果 + 滑动窗口 + Attention Sink 注意力：
-      //    窗口 [jLo, nValid) 内 attend；若启用锚点(sink>0) 且锚点在窗口左侧，额外补 [0, sinkCount) 恒驻锚点（StreamingLLM）。
-      //    sink=0 时退化为原窗口注意力（逐位兼容）。
-      const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
-      const jLo = nValid - win; // 窗口左边界（缓存槽位下标）
-      const sink = model.attentionSink > 0 ? model.attentionSink : 0;
-      const sinkCount = sink > 0 ? Math.min(sink, jLo) : 0; // 窗口外、需显式补的锚点数
-      const attnLen = win + sinkCount;
-      const ctx = new Float64Array(D);
-      const kSc = kv.q8 ? kv.Ks[l] : null, vSc = kv.q8 ? kv.Vs[l] : null;
-      for (let h = 0; h < H; h++) {
-        const kvh = (h / model.g) | 0;
-        const S = new Float64Array(attnLen);
-        let si = 0;
-        for (let j = jLo; j < nValid; j++) {
-          // kvQuant=8 时缓存里是 int8 码字，读出时乘回该 (token,head) 的 scale 即解量化
-          const ks = kSc ? kSc[j * KV + kvh] : 1;
-          let s = 0;
-          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-          S[si++] = s * scale * attnScale;
-        }
-        for (let j = 0; j < sinkCount; j++) {
-          const ks = kSc ? kSc[j * KV + kvh] : 1;
-          let s = 0;
-          for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-          S[si++] = s * scale * attnScale;
-        }
-        const Pm = softmaxRows(S, 1, attnLen);
-        for (let p = 0; p < dh; p++) {
-          let s = 0, pi = 0;
-          for (let j = jLo; j < nValid; j++) {
-            const vs = vSc ? vSc[j * KV + kvh] : 1;
-            s += Pm[pi++] * (Vo[j * kvDim + kvh * dh + p] * vs);
-          }
-          for (let j = 0; j < sinkCount; j++) {
-            const vs = vSc ? vSc[j * KV + kvh] : 1;
-            s += Pm[pi++] * (Vo[j * kvDim + kvh * dh + p] * vs);
-          }
-          ctx[h * dh + p] = s;
-        }
-      }
-      let attn = mm(ctx, P[k + 'wproj'], 1, D, D);
-      for (let j = 0; j < D; j++) attn[j] += P[k + 'bproj'].d[j];
-      const xMid = new Float64Array(D);
-      for (let j = 0; j < D; j++) xMid[j] = X[j] + attn[j];
-
-      // 5) pre-norm #2 -> FFN（MoE 稀疏 / 稠密 双路径，单 token 增量）
-      const M = NF(xMid, P[k + 'ln2.g'].d, nb(k + 'ln2.b'), 1, D).Y;
-      let ff;
-      if (model.useMoE) {
-        const E = model.nExp, K = model.topK, W1 = model.useSwi ? 2 * FH : FH;
-        const rlogits = mm(M, P[k + 'wg'], 1, D, E);
-        for (let j = 0; j < E; j++) rlogits[j] += P[k + 'bg'].d[j];
-        const probs = softmaxRows(rlogits, 1, E);
-        const order = [];
-        for (let j = 0; j < E; j++) order.push(j);
-        order.sort((a, b) => probs[a] - probs[b]); // 升序，取尾部 K 个
-        ff = new Float64Array(D);
-        for (let t = 0; t < K; t++) {
-          const e = order[E - 1 - t], ek = `${k}e${e}.`;
-          const pre = mm(M, P[ek + 'w1'], 1, D, W1);
-          for (let j = 0; j < W1; j++) pre[j] += P[ek + 'b1'].d[j];
-          const h1 = model.useSwi ? swigluFwd(pre, 1, FH) : geluFwd(pre);
-          const out = mm(h1, P[ek + 'w2'], 1, FH, D);
-          for (let j = 0; j < D; j++) out[j] += P[ek + 'b2'].d[j];
-          const g = probs[e];
-          for (let j = 0; j < D; j++) ff[j] += g * out[j];
-        }
-      } else {
-        const W1 = model.useSwi ? 2 * FH : FH;
-        const pre1 = mm(M, P[k + 'w1'], 1, D, W1);
-        for (let j = 0; j < W1; j++) pre1[j] += P[k + 'b1'].d[j];
-        const h1 = model.useSwi ? swigluFwd(pre1, 1, FH) : geluFwd(pre1);
-        ff = mm(h1, P[k + 'w2'], 1, FH, D);
-        for (let j = 0; j < D; j++) ff[j] += P[k + 'b2'].d[j];
-      }
-      const xOut = new Float64Array(D);
-      for (let j = 0; j < D; j++) xOut[j] = xMid[j] + ff[j];
-      X = xOut;
-    }
-
-    // 6) 最终归一化 + 权重共享输出头（+ logit soft-cap，与 forward 一致）
-    const Hf = NF(X, P['lnf.g'].d, nb('lnf.b'), 1, D).Y;
-    kv.n = slot + 1;
-    let logits = mmAtB(Hf, P.tokEmb, 1, D, V0);
-    if (model.logitCap > 0) {
-      const cap = model.logitCap;
-      for (let j = 0; j < logits.length; j++) logits[j] = cap * Math.tanh(logits[j] / cap);
-    }
-    return { logits };
-  }
-
-  /** 缓存淘汰（Attention Sink / 滑动窗口）：
-   *  - sink>0（StreamingLLM）：恒驻 [0,sink) 锚点，仅平移窗口区 [sink, n) 左移 1，丢弃最旧的非锚点 token；
-   *  - sink=0：整体平移（丢弃最旧 token，含首 token）—— 纯滑动窗口，逐位兼容旧行为。
-   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。 */
-  function kvShift(model, kv) {
-    const { nLayer: L } = model.cfg;
-    const kvDim = model.KV * model.dh, KV = model.KV;
-    const n = kv.n, sink = kv.sink || 0;
-    if (sink > 0) {
-      // 仅滚动窗口区 [sink+1, n) -> [sink, n-1)，锚点 [0,sink) 原地不动（copyWithin 处理重叠左移）
-      const from = (sink + 1) * kvDim, to = sink * kvDim, cnt = (n - sink) * kvDim;
-      for (let l = 0; l < L; l++) {
-        kv.K[l].copyWithin(to, from, from + cnt);
-        kv.V[l].copyWithin(to, from, from + cnt);
-        if (kv.q8) { // scale 与码字必须同步平移，否则解量化错位
-          const Ksf = (sink + 1) * KV, Kst = sink * KV, Ksc = (n - sink) * KV;
-          kv.Ks[l].copyWithin(Kst, Ksf, Ksf + Ksc);
-          kv.Vs[l].copyWithin(Kst, Ksf, Ksf + Ksc);
-        }
-      }
-    } else {
-      for (let l = 0; l < L; l++) {
-        kv.K[l].copyWithin(0, kvDim, n * kvDim);
-        kv.V[l].copyWithin(0, kvDim, n * kvDim);
-        if (kv.q8) {
-          kv.Ks[l].copyWithin(0, KV, n * KV);
-          kv.Vs[l].copyWithin(0, KV, n * KV);
-        }
-      }
-    }
-    kv.n = n - 1;
-  }
-
-  /** 用给定 ids 预热缓存，返回末位 logits。
-   *  - sink>0（StreamingLLM）：处理整段 prompt，缓存满则按「锚点 + 滚动窗口」淘汰中段（保留首 sink 个锚点）。
-   *  - sink=0：原行为，超出 blockSize 取最后 B 个。 */
-  function warmupKV(model, ids, kv) {
-    if (kv.sink > 0) {
-      let logits = null;
-      for (let i = 0; i < ids.length; i++) {
-        if (kv.n >= kv.cap) kvShift(model, kv);
-        logits = forwardStep(model, ids[i], i, kv).logits;
-      }
-      return logits;
-    }
-    const B = model.cfg.blockSize;
-    const toks = ids.length > B ? ids.slice(ids.length - B) : ids;
-    let logits = null;
-    for (let i = 0; i < toks.length; i++) logits = forwardStep(model, toks[i], i, kv).logits;
-    kv.n = toks.length;
-    return logits;
-  }
-
-  /* ==========================================================================
-   * 六、模型持久化（无损 JSON）
-   * ======================================================================== */
-  /** 序列化模型。一并存词表（字符数组），保证导入后可完整重建分词器。
-   * 量化权重存为 {q:[...], s:scale}（Int8），未量化存为普通浮点数组。 */
-  function saveModel(model, tok) {
-    const params = {};
-    let quantized = false;
-    for (const key in model.params) {
-      const p = model.params[key];
-      if (p.q) { params[key] = { q: Array.from(p.q), s: p.scale }; quantized = true; }
-      else params[key] = Array.from(p.d);
-    }
-    return JSON.stringify({
-      format: 'flagship-ai', version: 2,
-      cfg: model.cfg, params, quantized,
-      vocab: tok ? tok.chars : null,
-      tokKind: tok ? (tok.kind || 'char') : null,
-      merges: tok && tok.kind === 'bpe' ? tok.merges : null,
-      bpeByteLevel: tok && tok.kind === 'bpe' ? !!tok.byteLevel : null,
-    });
-  }
-
-  /** 从存档恢复分词器（存档无词表时返回 null） */
-  function loadTokenizer(json) {
-    const obj = typeof json === 'string' ? JSON.parse(json) : json;
-    if (!obj || !Array.isArray(obj.vocab)) return null;
-    if (obj.tokKind === 'bpe') {
-      const t = Object.create(BPETokenizer.prototype);
-      t.kind = 'bpe';
-      t.chars = obj.vocab;
-      t.itos = obj.vocab;
-      t.stoi = new Map(obj.vocab.map((s, i) => [s, i]));
-      t.merges = obj.merges || [];
-      t.byteLevel = obj.bpeByteLevel !== false;
-      t.ranks = new Map(t.merges.map((m, i) => [m[0] + m[1], i]));
-      return t;
-    }
-    const t = Object.create(Tokenizer.prototype);
-    t.kind = 'char';
-    t.chars = obj.vocab;
-    t.stoi = new Map(obj.vocab.map((ch, i) => [ch, i]));
-    t.itos = obj.vocab;
-    return t;
-  }
-
-  function loadModel(json) {
-    const obj = typeof json === 'string' ? JSON.parse(json) : json;
-    if (!obj || obj.format !== 'flagship-ai') throw new Error('无法识别的模型格式');
-    const m = new GPTModel(obj.cfg);
-    for (const key in obj.params) {
-      const src = obj.params[key];
-      if (Array.isArray(src)) {
-        const dst = m.params[key];
-        if (!dst) throw new Error(`模型缺少参数 ${key}`);
-        if (src.length !== dst.d.length) throw new Error(`参数 ${key} 长度不匹配`);
-        dst.d.set(src);
-      } else {
-        // 量化权重：{q, s}
-        m.params[key] = { q: Int8Array.from(src.q), scale: src.s };
-      }
-    }
-    if (obj.quantized) m.quantized = true;
-    return m;
-  }
-
-  /* ==========================================================================
-   * 七、生成器（温度 / top-k / top-p / 贪心 / KV Cache）
-   * ======================================================================== */
-  function generate(model, tok, prompt, opts) {
-    const o = Object.assign({
-      maxNew: 100, temperature: 0.8, topK: 0, topP: 0, seed: 1234, useCache: true,
-    }, opts);
-    // maxTokens 为 maxNew 的别名，两者等价
-    const total = o.maxTokens != null ? o.maxTokens : o.maxNew;
-    const rng = mulberry32(o.seed);
-    const V = model.cfg.vocabSize;
-    const B = model.cfg.blockSize;
-    const ids = tok.encode(prompt);
-    if (ids.length === 0) ids.push(Math.floor(rng() * V));
-    const out = [];
-
-    const kv = o.useCache ? (o.kv || initKVCache(model)) : null;
-    // 预热（缓存模式）：位置嵌入从 0 开始，与全序列 forward 保持一致
-    let logits = kv ? warmupKV(model, ids, kv) : null;
-    // 锚点模式：pos 取绝对长度（warmup 已按绝对位置写缓存）；否则沿用末位（与原行为一致）
-    let pos = kv ? (kv.sink > 0 ? ids.length : Math.min(ids.length, B)) : 0;
-
-    for (let s = 0; s < total; s++) {
-      if (!kv) {
-        // 回退路径：每步全序列重算（用于交叉验证与数值对照）
-        const ctxIds = ids.slice(-B);
-        logits = model.forward(ctxIds).logits;
-      }
-      const last = kv ? 0 : (Math.min(ids.length, B) - 1) * V;
-      let idx;
-      if (o.temperature <= 0) { // 贪心解码
-        let best = 0;
-        for (let j = 1; j < V; j++) if (logits[last + j] > logits[last + best]) best = j;
-        idx = best;
-      } else {
-        const probs = new Float64Array(V);
-        let mx = -Infinity;
-        for (let j = 0; j < V; j++) {
-          const val = logits[last + j] / o.temperature;
-          probs[j] = val;
-          if (val > mx) mx = val;
-        }
-        // top-k：仅保留概率最高的 k 个
-        if (o.topK > 0 && o.topK < V) {
-          const sorted = Array.from(probs).sort((a, b) => b - a);
-          const thr = sorted[o.topK - 1];
-          for (let j = 0; j < V; j++) if (probs[j] < thr) probs[j] = -Infinity;
-          mx = -Infinity;
-          for (let j = 0; j < V; j++) if (probs[j] > mx) mx = probs[j];
-        }
-        let sum = 0;
-        for (let j = 0; j < V; j++) { const e = Math.exp(probs[j] - mx); probs[j] = e; sum += e; }
-        for (let j = 0; j < V; j++) probs[j] /= sum;
-        // top-p（核心采样）：在 top-k 之后的分布上按累积概率截断长尾
-        if (o.topP > 0 && o.topP < 1) {
-          const order = Array.from(probs).map((p, j) => ({ p, j })).sort((a, b) => b.p - a.p);
-          let acc = 0, cut = order.length;
-          for (let i = 0; i < order.length; i++) {
-            acc += order[i].p;
-            if (acc >= o.topP) { cut = i + 1; break; }
-          }
-          sum = 0;
-          for (let i = 0; i < order.length; i++) {
-            if (i >= cut) probs[order[i].j] = 0; else sum += probs[order[i].j];
-          }
-          for (let j = 0; j < V; j++) probs[j] /= sum;
-        }
-        const r = rng();
-        let acc = 0;
-        idx = V - 1;
-        for (let j = 0; j < V; j++) { acc += probs[j]; if (r <= acc) { idx = j; break; } }
-      }
-      ids.push(idx);
-      out.push(idx);
-
-      // 推进 KV 缓存（pos 为绝对位置，可无限增长；槽位由 kv.n 管理）
-      // - 序列长度 < 缓存容量：纯增量，与全序列 forward 严格逐位等价
-      // - 超出后：缓存满则淘汰（Attention Sink 保锚点 / 否则滑动窗口丢弃最旧 token）。
-      //   RoPE 下注意力只依赖相对距离，故窗口滑动后仍与全序列重算逐位一致。
-      if (kv) {
-        if (kv.n >= (kv.cap || B)) kvShift(model, kv);
-        logits = forwardStep(model, idx, pos, kv).logits;
-        pos++;
-      }
-    }
-    return { text: tok.decode(out), ids: out };
-  }
-
-  /* 架构预设：一行切换到现代 LLM 的标准配方 */
-  const ARCH_PRESETS = {
-    gpt2: { norm: 'ln', ffn: 'gelu', pos: 'learned' },                 // GPT-2 / 本项目默认
-    llama: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope' },            // LLaMA / Mistral（MHA）
-    'llama-gqa': { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2 }, // LLaMA + GQA 演示
-    // Mixtral 风格：LLaMA 配方 + GQA + MoE（4 专家 top-2 路由）。nExp/topK 可在 cfg 覆盖。
-    mixtral: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, nExp: 4, topK: 2, auxWeight: 0.01 },
-    // 滑动窗口注意力（SWA）：LLaMA 配方 + GQA + window=64（Mistral/Gemma 稀疏注意力）。
-    swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
-    // Gemma 2/3 完整配方：LLaMA 基座 + GQA + 局部/全局层交错 + QK-norm + logit soft-cap 30。
-    gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 }, qkNorm: true, logitCap: 30 },
-  };
-  /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
-  function applyPreset(cfg, preset) {
-    const p = ARCH_PRESETS[preset];
-    if (!p) throw new Error(`未知架构预设：${preset}（可用：${Object.keys(ARCH_PRESETS).join(', ')}）`);
-    return Object.assign({}, cfg, p);
-  }
-
-  return {
-    mulberry32, randn,
-    matmul, matmulAtB, matmulTA,
-    layernormFwd, layernormBwd,
-    rmsnormFwd, rmsnormBwd,
-    geluFwd, geluBwd, siluF, swigluFwd, swigluBwd,
-    ropeApply, softmaxRows, softmaxBwd,
-    crossEntropy,
-    Tokenizer, BPETokenizer, GPTModel, train, generate,
-    initKVCache, forwardStep, warmupKV, kvShift, saveModel, loadModel, loadTokenizer,
-    ARCH_PRESETS, applyPreset, textToByteChars, byteCharsToText,
-  };
-});
-
-});
-/* [module /src/namespace.js] */
-__FLAGSHIP_MODULES__.define("/src/namespace.js", function (module, exports, require, __dirname) {
-/* 旗舰 AI v12 · 命名空间与加载顺序真源
- * 规则（共享知识 K3 / K4）：
- *   - 所有层文件为 IIFE 注入 globalThis.FlagshipAI 命名空间
- *   - Node 与浏览器共用同一份 __loadOrder（src/index.js 与 scripts/build-demo.js 共读）
- *   - 加载顺序自底向上：L10 → L9 → … → L1
- * Phase 0：__loadOrder 为空（尚未拆层），buildPublicAPI 暂未启用。
- */
-'use strict';
-const NS = (globalThis.FlagshipAI = globalThis.FlagshipAI || {});
-
-// 自底向上加载顺序（K4）：L10 → L9 → … → L1。
-// Phase 1（T02）：L10 微指令登记中心 + A/C 两域 192 项、L9 数值基础、L8 数值内核。
-// Phase 2（T03）：追加 L7 张量/L6 后端/L5 自动微分/L4 神经算子/L3 架构组装；
-//   legacy 的 forward+backward 单体已拆为 L4 算子 + L3 组装（index.js 覆写原型接管）。
-// 后续 Phase（T04/T05）将追加 L2/L1。
-// 加载顺序（K4）自底向上：L10 骨架 → L9 数值基础 → L8 数值内核 → L10 指令实现。
-// 注意：A/C 两域微指令在模块求值期捕获 NS.L8.matmul/reduce 与 NS.L9.special
-// （见各 A/C 文件顶部的 const 捕获），故 L8/L9 必须在其之前加载。L10 的
-// registry/invariant 仅搭建骨架（不依赖 L8/L9 求值），故置于最前。
-NS.__loadOrder = [
-  // L10 · 微指令登记中心（最底层骨架：registry + invariant）
-  './L10-microisa/registry.js',
-  './L10-microisa/invariant.js',
-  // L9 · 数值基础（A/C 域微指令的标量/函数依赖）
-  './L9-numbase/rng.js',
-  './L9-numbase/fp-ops.js',
-  './L9-numbase/special.js',
-  './L9-numbase/assert.js',
-  // L8 · 数值内核（A/C 域微指令的矩阵/归约依赖）
-  './L8-kernel/matmul.js',
-  './L8-kernel/reduce.js',
-  './L8-kernel/quantize.js',
-  // L10 · 微指令实现（A/C 两域，依赖上方 L8/L9，故置于其后）
-  './L10-microisa/A-scalar-000.js',
-  './L10-microisa/A-scalar-001.js',
-  './L10-microisa/A-scalar-002.js',
-  './L10-microisa/C-matrix-000.js',
-  './L10-microisa/C-matrix-001.js',
-  './L10-microisa/C-matrix-002.js',
-  './L10-microisa/B-vector-000.js',
-  './L10-microisa/B-vector-001.js',
-  './L10-microisa/B-vector-002.js',
-  './L10-microisa/E-shape-000.js',
-  './L10-microisa/E-shape-001.js',
-  './L10-microisa/E-shape-002.js',
-  // L10 · D 域（注意力基元，96 项）：打分/缩放、掩码、softmax·LSE、
-  //   RoPE、ALiBi、温度与信息量、GQA/MQA 头映射、KV Cache 基元。
-  './L10-microisa/D-attention-000.js',
-  './L10-microisa/D-attention-001.js',
-  './L10-microisa/D-attention-002.js',
-  // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
-  './L7-tensor/tensor.js',
-  './L7-tensor/shape.js',
-  './L7-tensor/arena.js',
-  './L7-tensor/kv-cache.js',
-  // L6 · 后端运行时（kernel 注册/派发 + profile；P0 默认 CPU(JS) exact 通道）
-  './L6-backend/kernel-registry.js',
-  './L6-backend/backend.js',
-  './L6-backend/backend-cpu.js',
-  // L5 · 自动微分（Path A：VJP 注册中心 + tape 契约 + 梯度检验工厂；P1 再长 IR）
-  './L5-autograd/vjp-registry.js',
-  './L5-autograd/tape.js',
-  './L5-autograd/gradcheck.js',
-  // L4 · 神经算子（依赖 L8/L9；内部顺序：activation 先于 moe）
-  './L4-ops/norm.js',
-  './L4-ops/activation.js',
-  './L4-ops/positional.js',
-  './L4-ops/softmax.js',
-  './L4-ops/linear.js',
-  './L4-ops/attention.js',
-  './L4-ops/moe.js',
-  './L4-ops/loss.js',
-  './L4-ops/registry.js',
-  // L3 · 架构组装（forward/backward 重组装 + GPTModel + presets）
-  './L3-arch/blocks.js',
-  './L3-arch/gpt-model.js',
-  './L3-arch/presets.js',
-  // L2 · 编排管线（T04 接管：tokenizer/train/generate/sampler/evaluate/persistence/config）
-  './L2-pipeline/tokenizer.js',
-  './L2-pipeline/train.js',
-  './L2-pipeline/generate.js',
-  './L2-pipeline/sampler.js',
-  './L2-pipeline/evaluate.js',
-  './L2-pipeline/persistence.js',
-  './L2-pipeline/config.js',
-];
-
-// 公共 API 构建（Phase 0 暂未启用；后续接管后由 src/index.js 调用）。
-// 必须导出与 v11 完全一致的导出清单（CI 断言 Object.keys 一致）。
-NS.buildPublicAPI = function buildPublicAPI() {
-  return NS;
-};
-
-module.exports = NS;
-
-});
-/* [module /src/index.js] */
-__FLAGSHIP_MODULES__.define("/src/index.js", function (module, exports, require, __dirname) {
-/* 旗舰 AI v12 · 公共 API 入口
- * 加载顺序（自底向上）：L10 → L9 → … → L1（见 src/namespace.js __loadOrder）。
- *
- * Phase 1（T02）：L10/L9/L8 抽离 + 192 项微指令逐位验证；模型壳整体复制 legacy 导出。
- * Phase 2（T03）：forward+backward 单体拆为 L4 算子 + L3 组装（GPTModel 子类覆写）。
- * Phase 3（T04）：十层实现正式接管本入口 —— 不再转发 legacy：
- *   - GPTModel                 = NS.L3.gpt_model.GPTModel
- *     （构造器/zeroGrads/paramCount/quantize 为 verbatim lift，RNG 消费顺序与 legacy
- *      冻结一致 → R1 安全；forward/backward 委托 L3 blocks 重组装）
- *   - train / generate         = NS.L2.{train,generate}
- *     （verbatim lift，内部依赖改引 L4.loss / L7.kv_cache / L9.rng；采样逻辑逐字保留，
- *      不提取公共函数 —— 保 RNG 消费顺序 → R4/R5 安全）
- *   - saveModel/loadModel/loadTokenizer = NS.L2.persistence
- *     （loadModel 造 L3 模型 → R7 存档闭环由十层真正接管）
- *   - Tokenizer/BPETokenizer/textToByteChars/byteCharsToText = NS.L2.tokenizer
- *   - ARCH_PRESETS/applyPreset = NS.L3.presets
- *   - 逐算子导出               = L8/L9/L4 verbatim lift（R9 逐位验证）
- *   - KV 四件套                = NS.L7.kv_cache
- *   legacy 自此仅作为 scripts/regression-v11.js 的 V11 基准被加载，不在本文件出现。
- *
- * 关键不变量（K15）：导出键集合与 v11 的 return 完全一致（34 个键，不多不少）。
- *   加载期有计数硬门禁（下方）；键集逐名一致性由 tests/api-contract.test.js
- *   对 legacy 逐键断言（测试文件允许 require legacy，层文件不允许）。
- */
-'use strict';
-const NS = require('./namespace.js');
-const path = require('path');
-
-// 1) 自底向上加载十层（K4）：路径相对 src/，与 __loadOrder 真源一致。
-for (const rel of NS.__loadOrder) {
-  require(path.join(__dirname, rel));
-}
-
-// 2) 构建公共 API：34 个键全部由十层实现提供（K15：与 v11 return 完全一致）。
-const api = {
-  // L9 · 数值基础（RNG）
-  mulberry32: NS.L9.rng.mulberry32,
-  randn: NS.L9.rng.randn,
-  // L8 · 数值内核（矩阵乘）
-  matmul: NS.L8.matmul.matmul,
-  matmulAtB: NS.L8.matmul.matmulAtB,
-  matmulTA: NS.L8.matmul.matmulTA,
-  // L4 · 神经算子（归一化）
-  layernormFwd: NS.L4.norm.layernormFwd,
-  layernormBwd: NS.L4.norm.layernormBwd,
-  rmsnormFwd: NS.L4.norm.rmsnormFwd,
-  rmsnormBwd: NS.L4.norm.rmsnormBwd,
-  // L4 · 神经算子（激活 / 门控）
-  geluFwd: NS.L4.activation.geluFwd,
-  geluBwd: NS.L4.activation.geluBwd,
-  siluF: NS.L4.activation.siluF,
-  swigluFwd: NS.L4.activation.swigluFwd,
-  swigluBwd: NS.L4.activation.swigluBwd,
-  // L4 · 神经算子（位置编码）
-  ropeApply: NS.L4.positional.ropeApply,
-  // L8 · 数值内核（softmax：模型热路径走 L8 内核，L4.softmax 为其语义门面）
-  softmaxRows: NS.L8.reduce.softmaxRows,
-  softmaxBwd: NS.L8.reduce.softmaxBwd,
-  // L4 · 神经算子（损失）
-  crossEntropy: NS.L4.loss.crossEntropy,
-  // L2 · 编排管线（分词器）
-  Tokenizer: NS.L2.tokenizer.Tokenizer,
-  BPETokenizer: NS.L2.tokenizer.BPETokenizer,
-  textToByteChars: NS.L2.tokenizer.textToByteChars,
-  byteCharsToText: NS.L2.tokenizer.byteCharsToText,
-  // L3 · 架构组装（模型壳 + 架构预设）
-  GPTModel: NS.L3.gpt_model.GPTModel,
-  ARCH_PRESETS: NS.L3.presets.ARCH_PRESETS,
-  applyPreset: NS.L3.presets.applyPreset,
-  // L2 · 编排管线（训练 / 生成）
-  train: NS.L2.train.train,
-  generate: NS.L2.generate.generate,
-  // L7 · 张量与内存（KV Cache）
-  initKVCache: NS.L7.kv_cache.initKVCache,
-  forwardStep: NS.L7.kv_cache.forwardStep,
-  warmupKV: NS.L7.kv_cache.warmupKV,
-  kvShift: NS.L7.kv_cache.kvShift,
-  // L2 · 编排管线（持久化）
-  saveModel: NS.L2.persistence.saveModel,
-  loadModel: NS.L2.persistence.loadModel,
-  loadTokenizer: NS.L2.persistence.loadTokenizer,
-};
-
-// 3) K15 加载期硬门禁：键数必须为 34（键集逐名一致性见 tests/api-contract.test.js）。
-if (Object.keys(api).length !== 34) {
-  throw new Error('K15 违例：公共 API 导出键数量 ' + Object.keys(api).length + ' ≠ 34');
-}
-
-// 4) 各层注册中心自举（仅登记元数据供自检/文档，不改数值路径，Δ=0 无影响）。
-//    L4 算子目录：把 L4 算子登记为可检索元数据。
-if (NS.L4 && NS.L4.registry && NS.L4.registry.bootstrap) NS.L4.registry.bootstrap();
-//    L5 VJP 注册中心 + L6 kernel 注册中心：把 L4 backward / L4+L8 内核登记为
-//    VJP 与 kernel（L5/L6 先于 L4 加载，故在全部层加载完后补登；幂等、惰性守卫）。
-if (NS.L5 && NS.L5.registry && NS.L5.registry.bootstrap) NS.L5.registry.bootstrap();
-if (NS.L6 && NS.L6.kernel && NS.L6.kernel.bootstrap) NS.L6.kernel.bootstrap();
-if (NS.L6 && NS.L6.backend && NS.L6.backend.refreshBackends) NS.L6.backend.refreshBackends();
-
-module.exports = api;
-
-});
-/* [module /src/L10-microisa/registry.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/registry.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · 登记中心（registry）
  * ----------------------------------------------------------------------------
@@ -2369,9 +395,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/registry.js", function (module, e
   L10.DOMAINS = DOMAINS;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/invariant.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/invariant.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · 不变量与性质测试工具（invariant）
  * ----------------------------------------------------------------------------
@@ -2544,9 +567,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/invariant.js", function (module, 
   L10.check = check;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L9-numbase/rng.js] */
-__FLAGSHIP_MODULES__.define("/src/L9-numbase/rng.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L9 数值基础 · 确定性伪随机（rng）
  * ----------------------------------------------------------------------------
@@ -2589,9 +609,6 @@ __FLAGSHIP_MODULES__.define("/src/L9-numbase/rng.js", function (module, exports,
   NS.L9.rng.randn = randn;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L9-numbase/fp-ops.js] */
-__FLAGSHIP_MODULES__.define("/src/L9-numbase/fp-ops.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L9 数值基础 · 浮点原语（fp-ops）
  * ----------------------------------------------------------------------------
@@ -2665,9 +682,6 @@ __FLAGSHIP_MODULES__.define("/src/L9-numbase/fp-ops.js", function (module, expor
   NS.L9.fpOps.isNaNNum = isNaNNum;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L9-numbase/special.js] */
-__FLAGSHIP_MODULES__.define("/src/L9-numbase/special.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L9 数值基础 · 特殊函数（special）
  * ----------------------------------------------------------------------------
@@ -2760,9 +774,6 @@ __FLAGSHIP_MODULES__.define("/src/L9-numbase/special.js", function (module, expo
   NS.L9.special.GELU_C = GELU_C;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L9-numbase/assert.js] */
-__FLAGSHIP_MODULES__.define("/src/L9-numbase/assert.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L9 数值基础 · 断言与哨兵（assert）
  * ----------------------------------------------------------------------------
@@ -2851,9 +862,6 @@ __FLAGSHIP_MODULES__.define("/src/L9-numbase/assert.js", function (module, expor
   NS.L9.assert.DEBUG = DEBUG;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L8-kernel/matmul.js] */
-__FLAGSHIP_MODULES__.define("/src/L8-kernel/matmul.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L8 数值内核 · 矩阵乘法内核（matmul）
  * ----------------------------------------------------------------------------
@@ -2968,9 +976,6 @@ __FLAGSHIP_MODULES__.define("/src/L8-kernel/matmul.js", function (module, export
   NS.L8.matmul.QUANT_LINEAR_RE = QUANT_LINEAR_RE;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L8-kernel/reduce.js] */
-__FLAGSHIP_MODULES__.define("/src/L8-kernel/reduce.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L8 数值内核 · 归约算子（reduce）
  * ----------------------------------------------------------------------------
@@ -3062,9 +1067,6 @@ __FLAGSHIP_MODULES__.define("/src/L8-kernel/reduce.js", function (module, export
   NS.L8.reduce.topkRows = topkRows;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L8-kernel/quantize.js] */
-__FLAGSHIP_MODULES__.define("/src/L8-kernel/quantize.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L8 数值内核 · 权重量化（quantize）
  * ----------------------------------------------------------------------------
@@ -3122,9 +1124,6 @@ __FLAGSHIP_MODULES__.define("/src/L8-kernel/quantize.js", function (module, expo
   NS.L8.quantize.quantError = quantError;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/A-scalar-000.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-000.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · A 域（标量算术与初等函数）· 第 1/3 批（A001–A032）
  * ----------------------------------------------------------------------------
@@ -3404,9 +1403,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-000.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/A-scalar-001.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-001.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · A 域（标量算术与初等函数）· 第 2/3 批（A033–A064）
  * ----------------------------------------------------------------------------
@@ -3674,9 +1670,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-001.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/A-scalar-002.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-002.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · A 域（标量算术与初等函数）· 第 3/3 批（A065–A096）
  * ----------------------------------------------------------------------------
@@ -3937,9 +1930,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/A-scalar-002.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/C-matrix-000.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-000.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · C 域（矩阵/张量运算）· 第 1/3 批（C001–C032）
  * ----------------------------------------------------------------------------
@@ -4212,9 +2202,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-000.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/C-matrix-001.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-001.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · C 域（矩阵/张量运算）· 第 2/3 批（C033–C064）
  * ----------------------------------------------------------------------------
@@ -4463,9 +2450,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-001.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/C-matrix-002.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-002.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · C 域（矩阵/张量运算）· 第 3/3 批（C065–C096）
  * ----------------------------------------------------------------------------
@@ -4740,9 +2724,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/C-matrix-002.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/B-vector-000.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-000.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · B 域（向量运算）· 第 1/3 批（B001–B032）
  * ----------------------------------------------------------------------------
@@ -5071,9 +3052,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-000.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/B-vector-001.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-001.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · B 域（向量运算）· 第 2/3 批（B033–B064）
  * ----------------------------------------------------------------------------
@@ -5432,9 +3410,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-001.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/B-vector-002.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-002.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · B 域（向量运算）· 第 3/3 批（B065–B096）
  * ----------------------------------------------------------------------------
@@ -5804,9 +3779,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/B-vector-002.js", function (modul
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/E-shape-000.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-000.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · E 域（形状与索引）· 第 1/3 批（E001–E032）
  * ----------------------------------------------------------------------------
@@ -6302,9 +4274,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-000.js", function (module
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/E-shape-001.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-001.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · E 域（形状与索引）· 第 2/3 批（E033–E064）
  * ----------------------------------------------------------------------------
@@ -6805,9 +4774,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-001.js", function (module
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/E-shape-002.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-002.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · E 域（形状与索引）· 第 3/3 批（E065–E096）
  * ----------------------------------------------------------------------------
@@ -7286,9 +5252,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/E-shape-002.js", function (module
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/D-attention-000.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-000.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · D 域（注意力基元）· 第 1/3 批（D001–D032）
  * ----------------------------------------------------------------------------
@@ -7871,9 +5834,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-000.js", function (mo
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/D-attention-001.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-001.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · D 域（注意力基元）· 第 2/3 批（D033–D064）
  * ----------------------------------------------------------------------------
@@ -8441,9 +6401,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-001.js", function (mo
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L10-microisa/D-attention-002.js] */
-__FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-002.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L10 微指令 · D 域（注意力基元）· 第 3/3 批（D065–D096）
  * ----------------------------------------------------------------------------
@@ -9097,9 +7054,6 @@ __FLAGSHIP_MODULES__.define("/src/L10-microisa/D-attention-002.js", function (mo
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L7-tensor/tensor.js] */
-__FLAGSHIP_MODULES__.define("/src/L7-tensor/tensor.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L7 张量与内存 · 张量（tensor）
  * ----------------------------------------------------------------------------
@@ -9314,9 +7268,6 @@ __FLAGSHIP_MODULES__.define("/src/L7-tensor/tensor.js", function (module, export
   NS.L7.tensor.isContiguous = isContiguous;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L7-tensor/shape.js] */
-__FLAGSHIP_MODULES__.define("/src/L7-tensor/shape.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L7 张量与内存 · 形状运算（shape）
  * ----------------------------------------------------------------------------
@@ -9445,9 +7396,6 @@ __FLAGSHIP_MODULES__.define("/src/L7-tensor/shape.js", function (module, exports
   NS.L7.shape.invertPerm = invertPerm;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L7-tensor/arena.js] */
-__FLAGSHIP_MODULES__.define("/src/L7-tensor/arena.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L7 张量与内存 · 竞技场分配器（arena）
  * ----------------------------------------------------------------------------
@@ -9506,9 +7454,6 @@ __FLAGSHIP_MODULES__.define("/src/L7-tensor/arena.js", function (module, exports
   NS.L7.arena.arena = arena;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L7-tensor/kv-cache.js] */
-__FLAGSHIP_MODULES__.define("/src/L7-tensor/kv-cache.js", function (module, exports, require, __dirname) {
 /* L7 张量与内存 · KV Cache（连续 KV + kvQuant=8 + Attention Sink）
  * 所属层：L7（张量与内存）｜ 允许依赖：L8（数值内核）、L9、L4（神经算子，惰性引用）
  * 主要 @ref：GPT-2 KV Cache；LLM.int8() kvQuant；StreamingLLM (Attention Sink)
@@ -9737,9 +7682,6 @@ __FLAGSHIP_MODULES__.define("/src/L7-tensor/kv-cache.js", function (module, expo
   NS.L7.kv_cache.warmupKV = warmupKV;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L6-backend/kernel-registry.js] */
-__FLAGSHIP_MODULES__.define("/src/L6-backend/kernel-registry.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L6 后端运行时 · 内核注册表（kernel registry）
  * ----------------------------------------------------------------------------
@@ -9896,9 +7838,6 @@ __FLAGSHIP_MODULES__.define("/src/L6-backend/kernel-registry.js", function (modu
   bootstrap();
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L6-backend/backend.js] */
-__FLAGSHIP_MODULES__.define("/src/L6-backend/backend.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L6 后端运行时 · 后端抽象（backend registry / profile / fallback）
  * ----------------------------------------------------------------------------
@@ -10027,9 +7966,6 @@ __FLAGSHIP_MODULES__.define("/src/L6-backend/backend.js", function (module, expo
   NS.L6.backend.refreshBackends = refreshBackends;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L6-backend/backend-cpu.js] */
-__FLAGSHIP_MODULES__.define("/src/L6-backend/backend-cpu.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L6 后端运行时 · 默认 CPU(JS) 后端
  * ----------------------------------------------------------------------------
@@ -10118,9 +8054,6 @@ __FLAGSHIP_MODULES__.define("/src/L6-backend/backend-cpu.js", function (module, 
   NS.L6.backend.setProfile('exact');
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L5-autograd/vjp-registry.js] */
-__FLAGSHIP_MODULES__.define("/src/L5-autograd/vjp-registry.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L5 自动微分 · VJP 注册中心（registry）
  * ----------------------------------------------------------------------------
@@ -10214,9 +8147,6 @@ __FLAGSHIP_MODULES__.define("/src/L5-autograd/vjp-registry.js", function (module
   NS.L5.vjp_registry = NS.L5.registry;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L5-autograd/tape.js] */
-__FLAGSHIP_MODULES__.define("/src/L5-autograd/tape.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L5 自动微分 · Tape 契约（cache 结构约定）
  * ----------------------------------------------------------------------------
@@ -10331,9 +8261,6 @@ __FLAGSHIP_MODULES__.define("/src/L5-autograd/tape.js", function (module, export
   NS.L5.tape.CACHE_KEYS = CACHE_KEYS.slice();
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L5-autograd/gradcheck.js] */
-__FLAGSHIP_MODULES__.define("/src/L5-autograd/gradcheck.js", function (module, exports, require, __dirname) {
 /* ============================================================================
  * L5 自动微分 · 中心差分梯度检验工厂（gradcheck）
  * ----------------------------------------------------------------------------
@@ -10426,9 +8353,6 @@ __FLAGSHIP_MODULES__.define("/src/L5-autograd/gradcheck.js", function (module, e
   NS.L5.gradcheck.checkAll = checkAll;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/norm.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/norm.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 归一化族
  * 所属层：L4（神经算子）｜ 允许依赖：L8（数值内核）、L9（数值基础）
  * 主要 @ref：Ba et al. 2016 (LayerNorm)；Zhang & Sennrich 2019 (RMSNorm)；
@@ -10580,9 +8504,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/norm.js", function (module, exports, re
   NS.L4.norm.qkNormBwd = qkNormBwd;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/activation.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/activation.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 激活族
  * 所属层：L4（神经算子）｜ 允许依赖：L8、L9
  * 主要 @ref：Hendrycks & Gimpel 2016 (GELU)；Shazeer 2020 (SwiGLU/SiLU)
@@ -10650,9 +8571,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/activation.js", function (module, expor
   NS.L4.activation.swigluBwd = swigluBwd;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/positional.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/positional.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 位置编码（RoPE）
  * 所属层：L4（神经算子）｜ 允许依赖：L8、L9
  * 主要 @ref：Su et al. 2021 (RoFormer RoPE)；(P1) NTK-by-parts / YaRN 外推
@@ -10712,9 +8630,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/positional.js", function (module, expor
   NS.L4.positional.ropeApply = ropeApply;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/softmax.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/softmax.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · Softmax / Top-k
  * 所属层：L4（神经算子）｜ 允许依赖：L8、L9
  * 主要 @ref：数值稳定 softmax（max 平移）；MoE 路由 top-k（Shazeer 2018）
@@ -10738,9 +8653,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/softmax.js", function (module, exports,
   NS.L4.softmax.topkRows = topkRows;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/linear.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/linear.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 线性层门面（mm + bias-add 统一封装）
  * 所属层：L4（神经算子）｜ 允许依赖：L8（数值内核 matmul 族）、L9
  * 主要 @ref：LLM.int8() 权重解量化分发；weight-only PTQ
@@ -10779,9 +8691,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/linear.js", function (module, exports, 
   NS.L4.linear.linear = linear;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/attention.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/attention.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 多头注意力（MHA / GQA / SWA / 层交错 / KV 增量）
  * 所属层：L4（神经算子）｜ 允许依赖：L8（softmaxRows/softmaxBwd 等）、L9
  * 主要 @ref：Vaswani et al. 2017 (Attention)；Gemma 2/3 层交错 SWA；StreamingLLM
@@ -10963,9 +8872,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/attention.js", function (module, export
   NS.L4.attention.attnStep = attnStep;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/moe.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/moe.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · MoE 稀疏前馈（路由 + top-k 专家散射 + 负载均衡辅助损失）
  * 所属层：L4（神经算子）｜ 允许依赖：L8（matmul 族 / 归约 / softmax）、L4.activation、L9
  * 主要 @ref：Shazeer 2018 (Sparsely-Gated MoE)；Switch Transformer / GDP-MoE 负载均衡
@@ -11074,9 +8980,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/moe.js", function (module, exports, req
   NS.L4.moe.moeBackward = moeBackward;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/loss.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/loss.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 交叉熵损失
  * 所属层：L4（神经算子）｜ 允许依赖：L8、L9
  * 主要 @ref：Softmax + NLL（等价于 cross-entropy）；数值稳定 log-sum-exp 取 max
@@ -11116,9 +9019,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/loss.js", function (module, exports, re
   NS.L4.loss.crossEntropy = crossEntropy;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L4-ops/registry.js] */
-__FLAGSHIP_MODULES__.define("/src/L4-ops/registry.js", function (module, exports, require, __dirname) {
 /* L4 神经算子 · 算子注册表（v11 的 if-else → 注册式开关）
  * 所属层：L4（神经算子）｜ 允许依赖：L8、L9（本文件仅登记元数据，不参与热路径）
  * 说明：登记 L4 已实现的算子及其 fwd/bwd 引用，供自检 / UI / 文档查询。
@@ -11170,9 +9070,6 @@ __FLAGSHIP_MODULES__.define("/src/L4-ops/registry.js", function (module, exports
   NS.L4.registry.bootstrap = bootstrap;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L3-arch/blocks.js] */
-__FLAGSHIP_MODULES__.define("/src/L3-arch/blocks.js", function (module, exports, require, __dirname) {
 /* L3 架构 · Block 级 forward/backward 组装（替代 legacy 123+134 行单体）
  * 所属层：L3（架构组装）｜ 允许依赖：L4（神经算子）、L8（数值内核）、L9
  * 主要 @ref：GPT-2 (Radford 2019) 残差栈；LLaMA/Mistral (RMSNorm+SwiGLU+RoPE)；
@@ -11389,9 +9286,6 @@ __FLAGSHIP_MODULES__.define("/src/L3-arch/blocks.js", function (module, exports,
   NS.L3.blocks.backward = backward;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L3-arch/gpt-model.js] */
-__FLAGSHIP_MODULES__.define("/src/L3-arch/gpt-model.js", function (module, exports, require, __dirname) {
 /* L3 架构 · GPTModel（参数布局 + zeroGrads + paramCount + quantize + fwd/bwd 委托）
  * 所属层：L3（架构组装）｜ 允许依赖：L4（神经算子）、L8（数值内核）、L9（数值基础）、L3.blocks
  * 主要 @ref：GPT-2 (Radford 2019)；LLaMA/Mistral；Mixtral MoE；Gemma 2/3；StreamingLLM；YaRN
@@ -11622,14 +9516,19 @@ __FLAGSHIP_MODULES__.define("/src/L3-arch/gpt-model.js", function (module, expor
 
     /** 反向传播：委托 L3.blocks 重组装（T03，Δ=0） */
     backward(cache, dlogits) { return NS.L3.blocks.backward(this, cache, dlogits); }
+
+    /** 评估模式：返回 { loss, acc }。
+     *  方法体已随 L2 编排管线落地为 NS.L2.evaluate.evaluate(model, tokens)，
+     *  此处保留 legacy GPTModel.prototype.evaluate 的**对象表面契约** —— 若只搬走方法体
+     *  而不在模型上保留该成员，调用方（如 scripts/probe-v3.js 的 `m.evaluate(tokens)`）
+     *  会直接拿到 `m.evaluate is not a function`。惰性引用 L2（L2 晚于 L3 加载，
+     *  但本方法只在调用期求值，安全）。 */
+    evaluate(tokens) { return NS.L2.evaluate.evaluate(this, tokens); }
   }
 
   NS.L3.gpt_model.GPTModel = GPTModel;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L3-arch/presets.js] */
-__FLAGSHIP_MODULES__.define("/src/L3-arch/presets.js", function (module, exports, require, __dirname) {
 /* L3 架构 · 架构预设（ARCH_PRESETS / applyPreset）
  * 所属层：L3（架构组装）｜ 允许依赖：（无跨层依赖，自包含）
  * 迁移方式：从 legacy flagship-engine.v11.js 第 1685–1701 行【原样搬】。
@@ -11662,9 +9561,6 @@ __FLAGSHIP_MODULES__.define("/src/L3-arch/presets.js", function (module, exports
   NS.L3.presets.applyPreset = applyPreset;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/tokenizer.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/tokenizer.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 分词器（字符级 Tokenizer + GPT-2 字节级 BPETokenizer）
  * 所属层：L2（编排管线）｜ 允许依赖：无（自包含，零跨层调用）
  * 主要 @ref：GPT-2 byte-level BPE（Radford et al. 2019）；tiktoken
@@ -11843,9 +9739,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/tokenizer.js", function (module, e
   NS.L2.tokenizer.byteCharsToText = byteCharsToText;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/train.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/train.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 训练器（AdamW + 梯度裁剪 + warmup/cosine 学习率）
  * 所属层：L2（编排管线）｜ 允许依赖：L4（神经算子 · crossEntropy）
  * 主要 @ref：AdamW（Loshchilov & Hutter 2019）；GPT-2 训练配方
@@ -11949,9 +9842,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/train.js", function (module, expor
   NS.L2.train.train = train;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/generate.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/generate.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 生成器（温度 / top-k / top-p / 贪心 / KV Cache）
  * 所属层：L2（编排管线）｜ 允许依赖：L7（张量与内存 · KV Cache）、L9（数值基础 · mulberry32）
  * 主要 @ref：GPT-2 采样；top-k/top-p（Holtzman 2019）；Attention Sink（StreamingLLM）
@@ -12060,9 +9950,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/generate.js", function (module, ex
   NS.L2.generate.generate = generate;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/sampler.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/sampler.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 采样器（可复用的干净版 greedy / temperature / top-k / top-p）
  * 所属层：L2（编排管线）｜ 允许依赖：无（自包含，零跨层调用）
  * 主要 @ref：top-k/top-p 采样（Holtzman 2019）；temperature scaling
@@ -12159,9 +10046,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/sampler.js", function (module, exp
   NS.L2.sampler.softmaxTemp = softmaxTemp;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/evaluate.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/evaluate.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 评估器（loss + 预测准确率）
  * 所属层：L2（编排管线）｜ 允许依赖：L4（神经算子 · crossEntropy）
  * 主要 @ref：next-token 预测评估（交叉熵 + top-1 准确率）
@@ -12197,9 +10081,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/evaluate.js", function (module, ex
   NS.L2.evaluate.evaluate = evaluate;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/persistence.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/persistence.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 模型持久化（无损 JSON 存档 / 读档）
  * 所属层：L2（编排管线）｜ 允许依赖：L2.tokenizer（恢复分词器）、L3.gpt_model（重建模型）
  * 主要 @ref：GPT-2 checkpoint 序列化；Int8 对称量化权重（{q, s}）
@@ -12282,9 +10163,6 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/persistence.js", function (module,
   NS.L2.persistence.loadTokenizer = loadTokenizer;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
-/* [module /src/L2-pipeline/config.js] */
-__FLAGSHIP_MODULES__.define("/src/L2-pipeline/config.js", function (module, exports, require, __dirname) {
 /* L2 编排管线 · 运行配置（确定性 spec / 哈希，复现性支持）
  * 所属层：L2（编排管线）｜ 允许依赖：无（自包含，零跨层调用）
  * 主要 @ref：FNV-1a 哈希；可复现训练配方（seed + 语料哈希 + 架构配置）
@@ -12336,17 +10214,607 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/config.js", function (module, expo
   NS.L2.config.runSpec = runSpec;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
-});
+/* L1 应用层 · 浏览器演示应用（demo-app）
+ * ============================================================================
+ * 所属层：L1（应用层）
+ * 允许依赖：L0（装配产物 NS.L0.API）—— 依赖在 **调用期** 经 engine() 惰性取得，
+ *   不在模块求值期捕获，因此本文件可在任意时刻被 Node 的 __loadOrder 循环求值而
+ *   不产生副作用（K5：无 CommonJS 加载语法、无 Node 专属全局、无网络/宿主 API）。
+ * 主要 @ref：nanoGPT 上手范式（train loop / loss 曲线 / 采样面板）
+ * 迁移方式：从 src/app.js【整文件搬】（UI 逻辑零改写，Δ=0 同义）：
+ *   - 依赖来源改写：`const F = window.FlagshipAI` → `engine()` 读 NS.L0.API；
+ *     `const VF = window.FlagshipVerify` → 调用期读 globalThis.FlagshipVerify；
+ *     目的：浏览器 demo 由 legacy 单体（原 src/flagship-engine.js 转发）切到真十层装配产物。
+ *   - 启动方式改写：原 IIFE 立即执行 → 现注册为 NS.L1.app.start(ns)，由
+ *     scripts/build-demo.js 在 __FLAGSHIP_APP__ 槽位内联追加启动调用。
+ *   - 事件绑定 / 训练分块 / 曲线绘制 / 自检逐项执行的全部逻辑逐行保留。
+ * 模板侧契约不变：仍通过 id 直接操作 DOM（corpus/log/chart/prompt/output/...），
+ *   demo.template.html 无需任何改动。
+ * ========================================================================*/
+;(function (NS) {
+  NS.L1 = NS.L1 || {};
 
-/* ===== 浏览器端装配入口：跑真实 src/index.js（双端同码） ===== */
-(function () {
-  'use strict';
-  var M = window.__FLAGSHIP_MODULES__;
-  var api = M.require('/src/index.js', './index.js');
-  var ns = globalThis.FlagshipAI;          // 层命名空间（L3–L10 挂载点）
-  globalThis.FlagshipAI = api;             // 公共 API（与 Node module.exports 同构：34 键）
-  globalThis.FlagshipNS = ns;              // 命名空间（浏览器可查 L10/L9/… 状态）
-  delete window.__FLAGSHIP_MODULES__;
+  /** 取 L0 装配产物（34 键公共 API）。惰性求值以避开「层加载顺序 → API 尚未装配」的取值陷阱，
+   *  并对两种 L0 形态都做兜底：优先 NS.L0.API（assemble 产物），其次直接调 NS.L0.assemble(ns)，
+   *  最后兼容「构建脚本已把 34 键并入命名空间」的写法。结果回写缓存，保证全进程同一份。
+   *  @returns {Object} 34 键公共 API
+   */
+  function engine() {
+    if (NS.L0 && NS.L0.API) return NS.L0.API;
+    if (NS.L0 && NS.L0.assemble) {
+      NS.L0.API = NS.L0.assemble(NS);
+      return NS.L0.API;
+    }
+    if (NS.GPTModel) return NS; // 构建脚本已把 34 键并入命名空间对象本体
+    throw new Error('L0 尚未装配：请先调用 NS.L0.assemble(NS)');
+  }
+
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    tok: null, model: null, trainState: null,
+    history: [], stepsDone: 0, totalSteps: 0,
+    training: false, stopFlag: false, stale: true,
+  };
+
+  function now() {
+    return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }
+  function log(msg, cls) {
+    const el = $('log');
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = `[${now()}] ${msg}`;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  /* ---------- 模型构建 ---------- */
+  function buildModel() {
+    const F = engine();
+    const corpus = $('corpus').value;
+    if (corpus.replace(/\s/g, '').length < 10) {
+      log('语料太短（至少 10 个非空白字符），拒绝构建', 'err');
+      return false;
+    }
+    const dModel = +$('dModel').value, nHead = +$('nHead').value;
+    if (dModel % nHead !== 0) {
+      log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
+      return false;
+    }
+    const nKvHeadRaw = $('nKvHead').value.trim();
+    let nKvHead = -1;
+    if (nKvHeadRaw !== '') {
+      nKvHead = +nKvHeadRaw;
+      if (!(nKvHead >= 1 && nKvHead <= nHead && nHead % nKvHead === 0)) {
+        log(`nKvHead(${nKvHead}) 需满足 1 <= nKvHead <= nHead(${nHead}) 且 nHead 可被整除`, 'err');
+        return false;
+      }
+    }
+    const tokMode = $('tokenizer').value;
+    const arch = $('arch').value;
+    try {
+      if (tokMode === 'char') {
+        state.tok = new F.Tokenizer(corpus);
+      } else {
+        const byteLevel = tokMode === 'bpe-byte';
+        state.tok = new F.BPETokenizer(corpus, +$('vocabSize').value || 320, { byteLevel });
+      }
+      let cfg = {
+        vocabSize: state.tok.vocabSize,
+        blockSize: +$('blockSize').value,
+        nLayer: +$('nLayer').value,
+        nHead: nHead,
+        dModel: dModel,
+        seed: +$('seed').value || 42,
+      };
+      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa' || arch === 'gemma') cfg = F.applyPreset(cfg, arch);
+      if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
+      // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
+      const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
+      if (nExpRaw !== '') {
+        const nExp = +nExpRaw;
+        if (!(nExp >= 1)) { log('nExp 需 ≥ 1', 'err'); return false; }
+        cfg.nExp = nExp;
+        if (topKRaw !== '') {
+          const topK = +topKRaw;
+          if (!(topK >= 1 && topK <= nExp)) { log(`topK(${topK}) 需满足 1 ≤ topK ≤ nExp(${nExp})`, 'err'); return false; }
+          cfg.topK = topK;
+        } else if (!cfg.topK) cfg.topK = 1;
+      } else if (topKRaw !== '' && cfg.nExp) {
+        cfg.topK = Math.min(+topKRaw, cfg.nExp);
+      }
+      // 稀疏注意力覆盖：全因果 / 统一窗口 / Gemma 交错三种模式；
+      // 选 swa/gemma 预设且保持「全因果」时不覆盖（跟随预设）
+      const wMode = $('windowMode').value;
+      if (wMode === 'uniform' || wMode === 'alt') {
+        const winRaw = $('window').value.trim();
+        const wN = winRaw === '' ? 32 : +winRaw;
+        if (!(wN >= 1)) { log('window 需 ≥ 1', 'err'); return false; }
+        cfg.window = wMode === 'alt' ? { alt: wN } : wN;
+      } else if (arch !== 'swa' && arch !== 'gemma') {
+        cfg.window = 0;
+      }
+      // Gemma 2 稳定化组件：qkNorm 三态（空=跟随预设 / on / off）；logitCap 0=不启用
+      const qnMode = $('qkNorm').value;
+      if (qnMode === 'on') cfg.qkNorm = true;
+      else if (qnMode === 'off') cfg.qkNorm = false;
+      const capRaw = $('logitCap').value.trim();
+      if (capRaw !== '') {
+        const cap = +capRaw;
+        if (!(cap >= 0)) { log('logitCap 需 ≥ 0（0=不启用）', 'err'); return false; }
+        cfg.logitCap = cap;
+      }
+      // KV 缓存 INT8 量化（推理期显存压缩）：8=启用，0=关闭（默认）
+      const kvqRaw = $('kvQuant').value.trim();
+      if (kvqRaw !== '') {
+        const kvq = +kvqRaw;
+        if (!(kvq === 0 || kvq === 8)) { log('kvQuant 仅支持 0（关闭）或 8（INT8）', 'err'); return false; }
+        cfg.kvQuant = kvq;
+      }
+      // Attention Sink / StreamingLLM：推理期恒驻首 K 个锚点 token，支持无限上下文流式推理
+      const sinkRaw = $('attentionSink').value.trim();
+      if (sinkRaw !== '') {
+        const sink = +sinkRaw;
+        if (!(sink >= 0)) { log('attentionSink 需 ≥ 0（0=关闭）', 'err'); return false; }
+        cfg.attentionSink = sink;
+        if (sink > 0) {
+          const rwRaw = $('rollingWindow').value.trim();
+          const rw = rwRaw === '' ? 256 : +rwRaw;
+          if (!(rw >= 1)) { log('rollingWindow 需 ≥ 1', 'err'); return false; }
+          cfg.rollingWindow = rw;
+        }
+      }
+      // YaRN 长度外推：factor>1 时启用 NTK-by-parts RoPE 频率插值 + 注意力温度（长上下文外推）
+      const yfRaw = $('yarnFactor').value.trim();
+      if (yfRaw !== '') {
+        const yf = +yfRaw;
+        if (!(yf >= 1)) { log('yarnFactor 需 ≥ 1（1=关闭外推）', 'err'); return false; }
+        if (yf > 1) {
+          const yt = $('yarnType').value === 'ntk' ? 'ntk' : 'yarn';
+          cfg.ropeScale = { type: yt, factor: yf, originalMaxLength: +$('blockSize').value };
+        }
+      }
+      state.arch = arch;
+      state.tokMode = tokMode;
+      state.model = new F.GPTModel(cfg);
+    } catch (e) {
+      log('构建失败: ' + e.message, 'err');
+      return false;
+    }
+    state.trainState = null;
+    state.history = [];
+    state.stepsDone = 0;
+    state.stale = false;
+    const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
+    const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
+    const winLabel = state.model.windows.some(w => w > 0)
+      ? (state.model.windows.every(w => w === state.model.windows[0]) ? `SWA(window=${state.model.windows[0]})` : `层交错SWA[${state.model.windows}]`)
+      : '全因果';
+    const stabLabel = (state.model.qkNorm ? 'QK-norm' : '') + (state.model.logitCap > 0 ? `+cap${state.model.logitCap}` : '');
+    const stabFull = stabLabel ? ` / ${stabLabel}` : '';
+    const kvqFull = state.model.kvQuant === 8 ? ' / KV-INT8' : '';
+    const sinkFull = state.model.attentionSink > 0 ? ` / Sink(${state.model.attentionSink})` : '';
+    const yarnFull = state.model.ropeFreqScale ? ` / YaRN×${state.model.attentionScaling.toFixed(2)}` : '';
+    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
+    $('trainBtn').disabled = false;
+    $('genBtn').disabled = true;
+    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    drawChart();
+    return true;
+  }
+
+  /* ---------- 训练（分块） ---------- */
+  function startTraining() {
+    if (state.training) return;
+    if (state.stale && !buildModel()) return;
+    state.totalSteps = +$('steps').value;
+    state.training = true;
+    state.stopFlag = false;
+    $('trainBtn').disabled = true;
+    $('stopBtn').disabled = false;
+    $('buildBtn').disabled = true;
+    log(`开始训练：共 ${state.totalSteps} 步，lr=${$('lr').value}，batch=${$('blockSize').value}`);
+    trainChunk();
+  }
+
+  function trainChunk() {
+    if (state.stopFlag || state.stepsDone >= state.totalSteps) { finishTraining(); return; }
+    const F = engine();
+    const chunk = Math.min(8, state.totalSteps - state.stepsDone);
+    const ids = state.tok.encode($('corpus').value);
+    let lastLoss = 0;
+    const res = F.train(state.model, ids, {
+      steps: chunk,
+      lr: +$('lr').value,
+      batch: +$('blockSize').value,
+      warmup: Math.min(30, Math.floor(state.totalSteps / 5)),
+      seed: 0,
+      state: state.trainState,
+      stepOffset: state.stepsDone,
+      totalSteps: state.totalSteps,
+      onStep: (_s, loss) => { lastLoss = loss; },
+    });
+    state.trainState = res.state;
+    for (const h of res.history) state.history.push(h);
+    state.stepsDone += chunk;
+    $('progFill').style.width = (100 * state.stepsDone / state.totalSteps).toFixed(1) + '%';
+    $('progText').textContent = `${state.stepsDone}/${state.totalSteps} 步 · loss ${lastLoss.toFixed(4)}`;
+    drawChart();
+    setTimeout(trainChunk, 0);
+  }
+
+  function finishTraining() {
+    state.training = false;
+    const ids = state.tok.encode($('corpus').value);
+    const ev = state.model.evaluate(ids);
+    $('trainBtn').disabled = false;
+    $('stopBtn').disabled = true;
+    $('buildBtn').disabled = false;
+    $('genBtn').disabled = false;
+    $('exportBtn').disabled = false;
+    log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${state.history[state.history.length - 1].toFixed(4)}，全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`, state.stopFlag ? 'warn' : 'ok');
+  }
+
+  /* ---------- Loss 曲线（log 纵轴） ---------- */
+  function drawChart() {
+    const cv = $('chart');
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = 180;
+    if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 44, padR = 8, padT = 10, padB = 20;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + ih * i / 4;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    }
+    const h = state.history;
+    if (!h.length) {
+      ctx.fillText('等待训练数据…', padL + 6, padT + 14);
+      return;
+    }
+    const minL = Math.max(1e-4, Math.min(...h));
+    const maxL = Math.max(...h);
+    const lo = Math.log10(minL), hi = Math.log10(maxL);
+    const span = Math.max(0.5, hi - lo);
+    const X = (i) => padL + iw * (h.length === 1 ? 1 : i / (h.length - 1));
+    const Y = (v) => padT + ih * (1 - (Math.log10(Math.max(1e-4, v)) - (hi - span)) / span);
+    for (let i = 0; i <= 4; i++) {
+      const lv = Math.pow(10, hi - span + span * i / 4);
+      ctx.fillText(lv >= 0.01 ? lv.toFixed(2) : lv.toExponential(0), 4, padT + ih * i / 4 + 3);
+    }
+    ctx.strokeStyle = '#4f46e5';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < h.length; i++) {
+      const x = X(i), y = Y(h[i]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#4f46e5';
+    ctx.font = '11px ui-monospace, monospace';
+    ctx.fillText(`loss ${h[h.length - 1].toFixed(4)}`, W - padR - 76, padT + 12);
+  }
+
+  /* ---------- 生成 ---------- */
+  function doGenerate() {
+    if (!state.model) { log('请先构建并训练模型', 'warn'); return; }
+    const F = engine();
+    const useQuant = $('quant') && $('quant').checked;
+    const model = useQuant ? state.model.quantize() : state.model;
+    const t0 = performance.now();
+    const r = F.generate(model, state.tok, $('prompt').value, {
+      maxNew: +$('maxNew').value,
+      temperature: +$('temperature').value,
+      topK: +$('topK').value,
+      seed: +$('genSeed').value || 1234,
+    });
+    const ms = performance.now() - t0;
+    $('output').textContent = r.text;
+    const tps = ms > 0 ? (r.ids.length / ms * 1000).toFixed(0) : '—';
+    log(`生成 ${r.ids.length} token，耗时 ${ms.toFixed(0)}ms（${tps} token/s · KV cache${useQuant ? ' · INT8 量化' : ''} · 温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
+  }
+
+  /* ---------- 模型持久化 ---------- */
+  function doExport() {
+    if (!state.model) return;
+    const F = engine();
+    const json = F.saveModel(state.model, state.tok);
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'flagship-model.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    log(`模型导出完成：${(json.length / 1024 / 1024).toFixed(2)} MB（含 ${state.tok.vocabSize} 词表 + 分词器元数据）`);
+  }
+
+  function handleImport(ev) {
+    const F = engine();
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const json = String(reader.result);
+        const model = F.loadModel(json);
+        const tok = F.loadTokenizer(json);
+        if (!tok) throw new Error('存档缺少词表');
+        state.model = model;
+        state.tok = tok;
+        state.trained = true;
+        state.stepsDone = 0;
+        state.totalSteps = 0;
+        state.history = [];
+        state.stale = false;
+        $('modelInfo').textContent =
+          `词表 ${tok.vocabSize} · 参数 ${model.paramCount().toLocaleString()}（导入）`;
+        $('genBtn').disabled = false;
+        $('exportBtn').disabled = false;
+        drawChart();
+        log(`模型导入成功：${model.paramCount().toLocaleString()} 参数，可直接生成`);
+      } catch (err) {
+        log('导入失败：' + err.message, 'err');
+      }
+      ev.target.value = '';
+    };
+    reader.readAsText(file);
+  }
+
+  /* ---------- 一键自检（逐项执行） ---------- */
+  function runSelfCheck() {
+    const VF = globalThis.FlagshipVerify;
+    $('checkBtn').disabled = true;
+    const tbody = $('checkBody');
+    tbody.innerHTML = '';
+    log('自检开始：共 ' + VF.CHECKS.length + ' 项，逐项运行中…');
+    let i = 0, passCount = 0;
+    const next = () => {
+      if (i >= VF.CHECKS.length) {
+        log(`自检结束：${passCount}/${VF.CHECKS.length} 通过 ${passCount === VF.CHECKS.length ? '✅ 全绿' : '❌ 存在失败'}`, passCount === VF.CHECKS.length ? 'ok' : 'err');
+        $('checkBtn').disabled = false;
+        return;
+      }
+      const c = VF.CHECKS[i];
+      let r;
+      try {
+        const out = c.run() || {};
+        r = { pass: out.pass !== false, detail: out.detail || '' };
+      } catch (e) {
+        r = { pass: false, detail: '异常: ' + e.message };
+      }
+      if (r.pass) passCount++;
+      const tr = document.createElement('tr');
+      const td1 = document.createElement('td');
+      td1.textContent = String(i + 1);
+      const td2 = document.createElement('td');
+      td2.textContent = c.name;
+      const td3 = document.createElement('td');
+      td3.textContent = r.pass ? '✅ 通过' : '❌ 失败';
+      td3.className = r.pass ? 'ok' : 'err';
+      const td4 = document.createElement('td');
+      td4.className = 'detail';
+      td4.textContent = r.detail;
+      tr.append(td1, td2, td3, td4);
+      tbody.appendChild(tr);
+      i++;
+      setTimeout(next, 20);
+    };
+    setTimeout(next, 30);
+  }
+
+  /* ---------- 事件绑定 ---------- */
+  function markStale(msg) {
+    if (state.model) {
+      state.stale = true;
+      $('genBtn').disabled = true;
+      if (msg) $('modelInfo').textContent = msg;
+    }
+  }
+
+  function bind() {
+    $('buildBtn').addEventListener('click', buildModel);
+    $('trainBtn').addEventListener('click', startTraining);
+    $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
+    $('genBtn').addEventListener('click', doGenerate);
+    $('checkBtn').addEventListener('click', runSelfCheck);
+    $('exportBtn').addEventListener('click', doExport);
+    $('importBtn').addEventListener('click', () => $('importFile').click());
+    $('importFile').addEventListener('change', handleImport);
+    // 语料与模型结构/分词器/架构变动都需重新构建
+    $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
+    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant', 'attentionSink', 'rollingWindow', 'yarnFactor', 'yarnType'].forEach((id) => {
+      $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
+    });
+    // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式（gemma 预设自带 QK-norm/soft-cap，留空即跟随）
+    $('arch').addEventListener('change', () => {
+      const a = $('arch').value;
+      if (a === 'gemma') { $('windowMode').value = 'alt'; $('qkNorm').value = ''; $('logitCap').value = ''; }
+      else if (a === 'swa') $('windowMode').value = 'uniform';
+    });
+    window.addEventListener('resize', drawChart);
+    log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');
+    log('默认语料已载入，点击「构建模型」开始');
+  }
+
+  /** 启动演示应用：绑定 DOM 事件。
+   *  @param {Object} ns 命名空间（约定由 build-demo.js 传入 globalThis.FlagshipAI）
+   */
+  function start(ns) {
+    if (!document.getElementById('log')) {
+      throw new Error('L1.app.start：模板 DOM 尚未就绪（缺少 #log）');
+    }
+    if (ns.L0 && ns.L0.assemble) ns.L0.assemble(ns); // 装配幂等守卫：未装配则补一次
+    engine();                                        // 立即解析一次装配产物，早失败早暴露
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', bind);
+    } else {
+      bind();
+    }
+  }
+
+
+  NS.L1.app = {
+    start: start,
+    bind: bind,
+    buildModel: buildModel,
+    startTraining: startTraining,
+    doGenerate: doGenerate,
+    doExport: doExport,
+    runSelfCheck: runSelfCheck,
+    drawChart: drawChart,
+    state: state,
+  };
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* L0 装配层 · 公共 API 组装（assemble）
+ * ============================================================================
+ * 所属层：L0（装配层）
+ * 允许依赖：全部层（L10 → … → L2）。本层位于 __loadOrder 最末，装配动作发生在
+ *   所有层求值完成之后（由调用方显式调用 assemble(ns)），故文件求值期不做任何取值。
+ * 迁移方式：从 T04 版 src/index.js 第 34–96 行【原样搬】（Δ=0 契约）：
+ *   - 34 个键的「键名 → 来源」映射逐字搬运（顺序亦保持），来源全部指向 NS.Ln.x 真十层符号；
+ *   - K15 装配期硬门禁（EXPORTED_KEYS 逐名一致 + 无 undefined）搬入本层，
+ *     Node 与浏览器同享，两侧键集由构造保证一致，而非靠约定；
+ *   - 注册中心自举（L4.registry / L5.registry / L6.kernel / L6.backend）搬入并保留幂等守卫。
+ * 为什么单独成层（关键动因）：Node（src/index.js）与浏览器（scripts/build-demo.js 内联）
+ *   必须走**同一份装配逻辑**；若两端各写一遍映射，键集迟早漂移并击穿 K15。
+ *   抽出为 L0 唯一真源后，「两侧键集逐名一致」由构造保证。
+ *
+ * T05 收口：本文件是 L0 装配层的唯一实现（原 src/L0-assembly/bootstrap.js 已删除——
+ *   它只有 34 键映射，缺 K15 断言、注册中心自举与 NS.L0.API 挂载，功能不对等）。
+ *   目录名 L0-boot 与既有 L2-pipeline / L3-arch / L4-ops 风格一致。
+ * ========================================================================*/
+;(function (NS) {
+  NS.L0 = NS.L0 || {};
+
+  /** 与 v11 return 清单逐名对应（K15 契约；任一侧增删键都必须红）。
+   *  本常量是 34 键契约的唯一真源：Node（src/index.js）与浏览器
+   *  （scripts/build-demo.js 内联）经 assemble() 共享同一份逐名门禁。
+   *  必须保持已排序状态：逐名比对依赖 gotKeys 与 wantKeys 同序。
+   */
+  const EXPORTED_KEYS = [
+    'mulberry32', 'randn',
+    'matmul', 'matmulAtB', 'matmulTA',
+    'layernormFwd', 'layernormBwd',
+    'rmsnormFwd', 'rmsnormBwd',
+    'geluFwd', 'geluBwd', 'siluF', 'swigluFwd', 'swigluBwd',
+    'ropeApply', 'softmaxRows', 'softmaxBwd',
+    'crossEntropy',
+    'Tokenizer', 'BPETokenizer', 'GPTModel', 'train', 'generate',
+    'initKVCache', 'forwardStep', 'warmupKV', 'kvShift', 'saveModel', 'loadModel', 'loadTokenizer',
+    'ARCH_PRESETS', 'applyPreset', 'textToByteChars', 'byteCharsToText',
+  ].sort();
+
+  /** 把已装载的命名空间组装为 34 键公共 API。
+   *  @param {{L9:Object,L8:Object,L7:Object,L6:Object,L5:Object,L4:Object,L3:Object,L2:Object}} ns
+   *         已按 __loadOrder 装载完毕的命名空间（通常就是 NS 自身）。
+   *  @returns {Object} 34 键公共 API（同时挂到 ns.L0.API 供浏览器侧取用）。
+   */
+  function assemble(ns) {
+    // 1) 构建公共 API：34 个键全部由十层实现提供（K15：与 v11 return 完全一致）。
+    const api = {
+      // L9 · 数值基础（RNG）
+      mulberry32: ns.L9.rng.mulberry32,
+      randn: ns.L9.rng.randn,
+      // L8 · 数值内核（矩阵乘）
+      matmul: ns.L8.matmul.matmul,
+      matmulAtB: ns.L8.matmul.matmulAtB,
+      matmulTA: ns.L8.matmul.matmulTA,
+      // L4 · 神经算子（归一化）
+      layernormFwd: ns.L4.norm.layernormFwd,
+      layernormBwd: ns.L4.norm.layernormBwd,
+      rmsnormFwd: ns.L4.norm.rmsnormFwd,
+      rmsnormBwd: ns.L4.norm.rmsnormBwd,
+      // L4 · 神经算子（激活 / 门控）
+      geluFwd: ns.L4.activation.geluFwd,
+      geluBwd: ns.L4.activation.geluBwd,
+      siluF: ns.L4.activation.siluF,
+      swigluFwd: ns.L4.activation.swigluFwd,
+      swigluBwd: ns.L4.activation.swigluBwd,
+      // L4 · 神经算子（位置编码）
+      ropeApply: ns.L4.positional.ropeApply,
+      // L8 · 数值内核（softmax：模型热路径走 L8 内核，L4.softmax 为其语义门面）
+      softmaxRows: ns.L8.reduce.softmaxRows,
+      softmaxBwd: ns.L8.reduce.softmaxBwd,
+      // L4 · 神经算子（损失）
+      crossEntropy: ns.L4.loss.crossEntropy,
+      // L2 · 编排管线（分词器）
+      Tokenizer: ns.L2.tokenizer.Tokenizer,
+      BPETokenizer: ns.L2.tokenizer.BPETokenizer,
+      textToByteChars: ns.L2.tokenizer.textToByteChars,
+      byteCharsToText: ns.L2.tokenizer.byteCharsToText,
+      // L3 · 架构组装（模型壳 + 架构预设）
+      GPTModel: ns.L3.gpt_model.GPTModel,
+      ARCH_PRESETS: ns.L3.presets.ARCH_PRESETS,
+      applyPreset: ns.L3.presets.applyPreset,
+      // L2 · 编排管线（训练 / 生成）
+      train: ns.L2.train.train,
+      generate: ns.L2.generate.generate,
+      // L7 · 张量与内存（KV Cache）
+      initKVCache: ns.L7.kv_cache.initKVCache,
+      forwardStep: ns.L7.kv_cache.forwardStep,
+      warmupKV: ns.L7.kv_cache.warmupKV,
+      kvShift: ns.L7.kv_cache.kvShift,
+      // L2 · 编排管线（持久化）
+      saveModel: ns.L2.persistence.saveModel,
+      loadModel: ns.L2.persistence.loadModel,
+      loadTokenizer: ns.L2.persistence.loadTokenizer,
+    };
+
+    // 2) K15 装配期硬门禁：**逐名**比对装配结果与契约键清单。
+    //    只查数量是防不住漂移的（数量对但名字错、键名被拼错都必须红），
+    //    故此处按名字逐个对齐；Node 与浏览器经本函数共享同一套门禁，
+    //    两侧键集由构造保证一致，而非靠约定。
+    const gotKeys = Object.keys(api).sort();
+    if (gotKeys.length !== EXPORTED_KEYS.length
+        || gotKeys.some((k, i) => k !== EXPORTED_KEYS[i])) {
+      const missing = EXPORTED_KEYS.filter((k) => !(k in api));
+      const extra = gotKeys.filter((k) => EXPORTED_KEYS.indexOf(k) < 0);
+      throw new Error(
+        'K15 违例：公共 API 导出键与契约不一致（缺失 [' + missing.join(', ') +
+        ']；多余 [' + extra.join(', ') + ']）'
+      );
+    }
+    //    逐名比对只保证键名集合一致，不保证取值存在，故仍须逐个查 undefined
+    //    （键名对、数量为 34，但来源是 undefined 同样必须红）。
+    for (let i = 0; i < gotKeys.length; i++) {
+      if (api[gotKeys[i]] === undefined) {
+        throw new Error('K15 违例：公共 API 导出键 ' + gotKeys[i] + ' 为 undefined');
+      }
+    }
+
+    // 3) 各层注册中心自举（仅登记元数据供自检/文档，不改数值路径，Δ=0 无影响）。
+    //    L4 算子目录：把 L4 算子登记为可检索元数据。
+    if (ns.L4 && ns.L4.registry && ns.L4.registry.bootstrap) ns.L4.registry.bootstrap();
+    //    L5 VJP 注册中心 + L6 kernel 注册中心：把 L4 backward / L4+L8 内核登记为
+    //    VJP 与 kernel（L5/L6 先于 L4 加载，故在全部层加载完后补登；幂等、惰性守卫）。
+    if (ns.L5 && ns.L5.registry && ns.L5.registry.bootstrap) ns.L5.registry.bootstrap();
+    if (ns.L6 && ns.L6.kernel && ns.L6.kernel.bootstrap) ns.L6.kernel.bootstrap();
+    if (ns.L6 && ns.L6.backend && ns.L6.backend.refreshBackends) ns.L6.backend.refreshBackends();
+
+    // 4) 装配产物挂回命名空间（浏览器侧经 NS.L0.API 取用；Node 侧直接用返回值）。
+    ns.L0.API = api;
+    return api;
+  }
+
+  NS.L0.assemble = assemble;
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+
+/* L0 装配层引导（浏览器）：把十层装配为 34 键公共 API，并入 FlagshipAI 命名空间。
+   与 Node 端 src/index.js 共用 NS.L0.assemble(NS)，是两端唯一的 34 键映射真源，
+   并共享同一套 EXPORTED_KEYS 逐名硬门禁（K15），两侧不可能漂移。 */
+;(function () {
+  var NS = globalThis.FlagshipAI;
+  var api = NS.L0.assemble(NS);
+  for (var k in api) NS[k] = api[k];
 })();
 
 </script>
@@ -12366,7 +10834,8 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/config.js", function (module, expo
  * ========================================================================*/
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
-    const api = factory(require('./flagship-engine.js'));
+    // T05：自检套件跑十层实现（src/index.js），旧单体仅作零回归基准。
+    const api = factory(require('./index.js'));
     module.exports = api;
     if (require.main === module) {
       const results = api.runAll();
@@ -12732,402 +11201,13 @@ __FLAGSHIP_MODULES__.define("/src/L2-pipeline/config.js", function (module, expo
 document.getElementById('corpus').value = FlagshipCorpus.CORPUS;
 </script>
 <script>
-/* ============================================================================
- * 演示应用逻辑（app.js）— 仅浏览器环境运行
- * 训练分块执行（setTimeout 让出主线程），自检逐项执行，UI 不卡死。
- * 作者：晨星  ·  License: MIT
- * ========================================================================*/
-(function () {
-  'use strict';
-  const F = window.FlagshipAI;
-  const VF = window.FlagshipVerify;
 
-  const $ = (id) => document.getElementById(id);
-  const state = {
-    tok: null, model: null, trainState: null,
-    history: [], stepsDone: 0, totalSteps: 0,
-    training: false, stopFlag: false, stale: true,
-  };
-
-  function now() {
-    return new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  }
-  function log(msg, cls) {
-    const el = $('log');
-    const line = document.createElement('div');
-    if (cls) line.className = cls;
-    line.textContent = `[${now()}] ${msg}`;
-    el.appendChild(line);
-    el.scrollTop = el.scrollHeight;
-  }
-
-  /* ---------- 模型构建 ---------- */
-  function buildModel() {
-    const corpus = $('corpus').value;
-    if (corpus.replace(/\s/g, '').length < 10) {
-      log('语料太短（至少 10 个非空白字符），拒绝构建', 'err');
-      return false;
-    }
-    const dModel = +$('dModel').value, nHead = +$('nHead').value;
-    if (dModel % nHead !== 0) {
-      log(`dModel=${dModel} 必须被 nHead=${nHead} 整除`, 'err');
-      return false;
-    }
-    const nKvHeadRaw = $('nKvHead').value.trim();
-    let nKvHead = -1;
-    if (nKvHeadRaw !== '') {
-      nKvHead = +nKvHeadRaw;
-      if (!(nKvHead >= 1 && nKvHead <= nHead && nHead % nKvHead === 0)) {
-        log(`nKvHead(${nKvHead}) 需满足 1 <= nKvHead <= nHead(${nHead}) 且 nHead 可被整除`, 'err');
-        return false;
-      }
-    }
-    const tokMode = $('tokenizer').value;
-    const arch = $('arch').value;
-    try {
-      if (tokMode === 'char') {
-        state.tok = new F.Tokenizer(corpus);
-      } else {
-        const byteLevel = tokMode === 'bpe-byte';
-        state.tok = new F.BPETokenizer(corpus, +$('vocabSize').value || 320, { byteLevel });
-      }
-      let cfg = {
-        vocabSize: state.tok.vocabSize,
-        blockSize: +$('blockSize').value,
-        nLayer: +$('nLayer').value,
-        nHead: nHead,
-        dModel: dModel,
-        seed: +$('seed').value || 42,
-      };
-      if (arch === 'llama' || arch === 'llama-gqa' || arch === 'mixtral' || arch === 'swa' || arch === 'gemma') cfg = F.applyPreset(cfg, arch);
-      if (nKvHead !== -1) cfg.nKvHead = nKvHead; // 显式指定优先于预设
-      // MoE 覆盖：留空则跟随预设（mixtral=4专家/top2）；显式 nExp>1 即启用混合专家
-      const nExpRaw = $('nExp').value.trim(), topKRaw = $('topK').value.trim();
-      if (nExpRaw !== '') {
-        const nExp = +nExpRaw;
-        if (!(nExp >= 1)) { log('nExp 需 ≥ 1', 'err'); return false; }
-        cfg.nExp = nExp;
-        if (topKRaw !== '') {
-          const topK = +topKRaw;
-          if (!(topK >= 1 && topK <= nExp)) { log(`topK(${topK}) 需满足 1 ≤ topK ≤ nExp(${nExp})`, 'err'); return false; }
-          cfg.topK = topK;
-        } else if (!cfg.topK) cfg.topK = 1;
-      } else if (topKRaw !== '' && cfg.nExp) {
-        cfg.topK = Math.min(+topKRaw, cfg.nExp);
-      }
-      // 稀疏注意力覆盖：全因果 / 统一窗口 / Gemma 交错三种模式；
-      // 选 swa/gemma 预设且保持「全因果」时不覆盖（跟随预设）
-      const wMode = $('windowMode').value;
-      if (wMode === 'uniform' || wMode === 'alt') {
-        const winRaw = $('window').value.trim();
-        const wN = winRaw === '' ? 32 : +winRaw;
-        if (!(wN >= 1)) { log('window 需 ≥ 1', 'err'); return false; }
-        cfg.window = wMode === 'alt' ? { alt: wN } : wN;
-      } else if (arch !== 'swa' && arch !== 'gemma') {
-        cfg.window = 0;
-      }
-      // Gemma 2 稳定化组件：qkNorm 三态（空=跟随预设 / on / off）；logitCap 0=不启用
-      const qnMode = $('qkNorm').value;
-      if (qnMode === 'on') cfg.qkNorm = true;
-      else if (qnMode === 'off') cfg.qkNorm = false;
-      const capRaw = $('logitCap').value.trim();
-      if (capRaw !== '') {
-        const cap = +capRaw;
-        if (!(cap >= 0)) { log('logitCap 需 ≥ 0（0=不启用）', 'err'); return false; }
-        cfg.logitCap = cap;
-      }
-      // KV 缓存 INT8 量化（推理期显存压缩）：8=启用，0=关闭（默认）
-      const kvqRaw = $('kvQuant').value.trim();
-      if (kvqRaw !== '') {
-        const kvq = +kvqRaw;
-        if (!(kvq === 0 || kvq === 8)) { log('kvQuant 仅支持 0（关闭）或 8（INT8）', 'err'); return false; }
-        cfg.kvQuant = kvq;
-      }
-      // Attention Sink / StreamingLLM：推理期恒驻首 K 个锚点 token，支持无限上下文流式推理
-      const sinkRaw = $('attentionSink').value.trim();
-      if (sinkRaw !== '') {
-        const sink = +sinkRaw;
-        if (!(sink >= 0)) { log('attentionSink 需 ≥ 0（0=关闭）', 'err'); return false; }
-        cfg.attentionSink = sink;
-        if (sink > 0) {
-          const rwRaw = $('rollingWindow').value.trim();
-          const rw = rwRaw === '' ? 256 : +rwRaw;
-          if (!(rw >= 1)) { log('rollingWindow 需 ≥ 1', 'err'); return false; }
-          cfg.rollingWindow = rw;
-        }
-      }
-      // YaRN 长度外推：factor>1 时启用 NTK-by-parts RoPE 频率插值 + 注意力温度（长上下文外推）
-      const yfRaw = $('yarnFactor').value.trim();
-      if (yfRaw !== '') {
-        const yf = +yfRaw;
-        if (!(yf >= 1)) { log('yarnFactor 需 ≥ 1（1=关闭外推）', 'err'); return false; }
-        if (yf > 1) {
-          const yt = $('yarnType').value === 'ntk' ? 'ntk' : 'yarn';
-          cfg.ropeScale = { type: yt, factor: yf, originalMaxLength: +$('blockSize').value };
-        }
-      }
-      state.arch = arch;
-      state.tokMode = tokMode;
-      state.model = new F.GPTModel(cfg);
-    } catch (e) {
-      log('构建失败: ' + e.message, 'err');
-      return false;
-    }
-    state.trainState = null;
-    state.history = [];
-    state.stepsDone = 0;
-    state.stale = false;
-    const tokLabel = tokMode === 'char' ? '字符级' : ('BPE' + (tokMode === 'bpe-byte' ? '字节级' : '字符级'));
-    const gqaLabel = state.model.cfg.KV < state.model.cfg.nHead ? `GQA(${state.model.cfg.KV} KV头)` : 'MHA';
-    const winLabel = state.model.windows.some(w => w > 0)
-      ? (state.model.windows.every(w => w === state.model.windows[0]) ? `SWA(window=${state.model.windows[0]})` : `层交错SWA[${state.model.windows}]`)
-      : '全因果';
-    const stabLabel = (state.model.qkNorm ? 'QK-norm' : '') + (state.model.logitCap > 0 ? `+cap${state.model.logitCap}` : '');
-    const stabFull = stabLabel ? ` / ${stabLabel}` : '';
-    const kvqFull = state.model.kvQuant === 8 ? ' / KV-INT8' : '';
-    const sinkFull = state.model.attentionSink > 0 ? ` / Sink(${state.model.attentionSink})` : '';
-    const yarnFull = state.model.ropeFreqScale ? ` / YaRN×${state.model.attentionScaling.toFixed(2)}` : '';
-    log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
-    $('trainBtn').disabled = false;
-    $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
-    drawChart();
-    return true;
-  }
-
-  /* ---------- 训练（分块） ---------- */
-  function startTraining() {
-    if (state.training) return;
-    if (state.stale && !buildModel()) return;
-    state.totalSteps = +$('steps').value;
-    state.training = true;
-    state.stopFlag = false;
-    $('trainBtn').disabled = true;
-    $('stopBtn').disabled = false;
-    $('buildBtn').disabled = true;
-    log(`开始训练：共 ${state.totalSteps} 步，lr=${$('lr').value}，batch=${$('blockSize').value}`);
-    trainChunk();
-  }
-
-  function trainChunk() {
-    if (state.stopFlag || state.stepsDone >= state.totalSteps) { finishTraining(); return; }
-    const chunk = Math.min(8, state.totalSteps - state.stepsDone);
-    const ids = state.tok.encode($('corpus').value);
-    let lastLoss = 0;
-    const res = F.train(state.model, ids, {
-      steps: chunk,
-      lr: +$('lr').value,
-      batch: +$('blockSize').value,
-      warmup: Math.min(30, Math.floor(state.totalSteps / 5)),
-      seed: 0,
-      state: state.trainState,
-      stepOffset: state.stepsDone,
-      totalSteps: state.totalSteps,
-      onStep: (_s, loss) => { lastLoss = loss; },
-    });
-    state.trainState = res.state;
-    for (const h of res.history) state.history.push(h);
-    state.stepsDone += chunk;
-    $('progFill').style.width = (100 * state.stepsDone / state.totalSteps).toFixed(1) + '%';
-    $('progText').textContent = `${state.stepsDone}/${state.totalSteps} 步 · loss ${lastLoss.toFixed(4)}`;
-    drawChart();
-    setTimeout(trainChunk, 0);
-  }
-
-  function finishTraining() {
-    state.training = false;
-    const ids = state.tok.encode($('corpus').value);
-    const ev = state.model.evaluate(ids);
-    $('trainBtn').disabled = false;
-    $('stopBtn').disabled = true;
-    $('buildBtn').disabled = false;
-    $('genBtn').disabled = false;
-    $('exportBtn').disabled = false;
-    log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${state.history[state.history.length - 1].toFixed(4)}，全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`, state.stopFlag ? 'warn' : 'ok');
-  }
-
-  /* ---------- Loss 曲线（log 纵轴） ---------- */
-  function drawChart() {
-    const cv = $('chart');
-    const dpr = window.devicePixelRatio || 1;
-    const W = cv.clientWidth, H = 180;
-    if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const ctx = cv.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-    const padL = 44, padR = 8, padT = 10, padB = 20;
-    const iw = W - padL - padR, ih = H - padT - padB;
-    ctx.strokeStyle = '#e2e8f0';
-    ctx.fillStyle = '#64748b';
-    ctx.font = '10px ui-monospace, monospace';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = padT + ih * i / 4;
-      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    }
-    const h = state.history;
-    if (!h.length) {
-      ctx.fillText('等待训练数据…', padL + 6, padT + 14);
-      return;
-    }
-    const minL = Math.max(1e-4, Math.min(...h));
-    const maxL = Math.max(...h);
-    const lo = Math.log10(minL), hi = Math.log10(maxL);
-    const span = Math.max(0.5, hi - lo);
-    const X = (i) => padL + iw * (h.length === 1 ? 1 : i / (h.length - 1));
-    const Y = (v) => padT + ih * (1 - (Math.log10(Math.max(1e-4, v)) - (hi - span)) / span);
-    for (let i = 0; i <= 4; i++) {
-      const lv = Math.pow(10, hi - span + span * i / 4);
-      ctx.fillText(lv >= 0.01 ? lv.toFixed(2) : lv.toExponential(0), 4, padT + ih * i / 4 + 3);
-    }
-    ctx.strokeStyle = '#4f46e5';
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    for (let i = 0; i < h.length; i++) {
-      const x = X(i), y = Y(h[i]);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    ctx.fillStyle = '#4f46e5';
-    ctx.font = '11px ui-monospace, monospace';
-    ctx.fillText(`loss ${h[h.length - 1].toFixed(4)}`, W - padR - 76, padT + 12);
-  }
-
-  /* ---------- 生成 ---------- */
-  function doGenerate() {
-    if (!state.model) { log('请先构建并训练模型', 'warn'); return; }
-    const useQuant = $('quant') && $('quant').checked;
-    const model = useQuant ? state.model.quantize() : state.model;
-    const t0 = performance.now();
-    const r = F.generate(model, state.tok, $('prompt').value, {
-      maxNew: +$('maxNew').value,
-      temperature: +$('temperature').value,
-      topK: +$('topK').value,
-      seed: +$('genSeed').value || 1234,
-    });
-    const ms = performance.now() - t0;
-    $('output').textContent = r.text;
-    const tps = ms > 0 ? (r.ids.length / ms * 1000).toFixed(0) : '—';
-    log(`生成 ${r.ids.length} token，耗时 ${ms.toFixed(0)}ms（${tps} token/s · KV cache${useQuant ? ' · INT8 量化' : ''} · 温度 ${$('temperature').value} · top-k ${$('topK').value}）`);
-  }
-
-  /* ---------- 模型持久化 ---------- */
-  function doExport() {
-    if (!state.model) return;
-    const json = F.saveModel(state.model, state.tok);
-    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'flagship-model.json';
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-    log(`模型导出完成：${(json.length / 1024 / 1024).toFixed(2)} MB（含 ${state.tok.vocabSize} 词表 + 分词器元数据）`);
-  }
-
-  function handleImport(ev) {
-    const file = ev.target.files && ev.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const json = String(reader.result);
-        const model = F.loadModel(json);
-        const tok = F.loadTokenizer(json);
-        if (!tok) throw new Error('存档缺少词表');
-        state.model = model;
-        state.tok = tok;
-        state.trained = true;
-        state.stepsDone = 0;
-        state.totalSteps = 0;
-        state.history = [];
-        state.stale = false;
-        $('modelInfo').textContent =
-          `词表 ${tok.vocabSize} · 参数 ${model.paramCount().toLocaleString()}（导入）`;
-        $('genBtn').disabled = false;
-        $('exportBtn').disabled = false;
-        drawChart();
-        log(`模型导入成功：${model.paramCount().toLocaleString()} 参数，可直接生成`);
-      } catch (err) {
-        log('导入失败：' + err.message, 'err');
-      }
-      ev.target.value = '';
-    };
-    reader.readAsText(file);
-  }
-
-  /* ---------- 一键自检（逐项执行） ---------- */
-  function runSelfCheck() {
-    $('checkBtn').disabled = true;
-    const tbody = $('checkBody');
-    tbody.innerHTML = '';
-    log('自检开始：共 ' + VF.CHECKS.length + ' 项，逐项运行中…');
-    let i = 0, passCount = 0;
-    const next = () => {
-      if (i >= VF.CHECKS.length) {
-        log(`自检结束：${passCount}/${VF.CHECKS.length} 通过 ${passCount === VF.CHECKS.length ? '✅ 全绿' : '❌ 存在失败'}`, passCount === VF.CHECKS.length ? 'ok' : 'err');
-        $('checkBtn').disabled = false;
-        return;
-      }
-      const c = VF.CHECKS[i];
-      let r;
-      try {
-        const out = c.run() || {};
-        r = { pass: out.pass !== false, detail: out.detail || '' };
-      } catch (e) {
-        r = { pass: false, detail: '异常: ' + e.message };
-      }
-      if (r.pass) passCount++;
-      const tr = document.createElement('tr');
-      const td1 = document.createElement('td');
-      td1.textContent = String(i + 1);
-      const td2 = document.createElement('td');
-      td2.textContent = c.name;
-      const td3 = document.createElement('td');
-      td3.textContent = r.pass ? '✅ 通过' : '❌ 失败';
-      td3.className = r.pass ? 'ok' : 'err';
-      const td4 = document.createElement('td');
-      td4.className = 'detail';
-      td4.textContent = r.detail;
-      tr.append(td1, td2, td3, td4);
-      tbody.appendChild(tr);
-      i++;
-      setTimeout(next, 20);
-    };
-    setTimeout(next, 30);
-  }
-
-  /* ---------- 事件绑定 ---------- */
-  function markStale(msg) {
-    if (state.model) {
-      state.stale = true;
-      $('genBtn').disabled = true;
-      if (msg) $('modelInfo').textContent = msg;
-    }
-  }
-  document.addEventListener('DOMContentLoaded', () => {
-    $('buildBtn').addEventListener('click', buildModel);
-    $('trainBtn').addEventListener('click', startTraining);
-    $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
-    $('genBtn').addEventListener('click', doGenerate);
-    $('checkBtn').addEventListener('click', runSelfCheck);
-    $('exportBtn').addEventListener('click', doExport);
-    $('importBtn').addEventListener('click', () => $('importFile').click());
-    $('importFile').addEventListener('change', handleImport);
-    // 语料与模型结构/分词器/架构变动都需重新构建
-    $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
-    ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant', 'attentionSink', 'rollingWindow', 'yarnFactor', 'yarnType'].forEach((id) => {
-      $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
-    });
-    // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式（gemma 预设自带 QK-norm/soft-cap，留空即跟随）
-    $('arch').addEventListener('change', () => {
-      const a = $('arch').value;
-      if (a === 'gemma') { $('windowMode').value = 'alt'; $('qkNorm').value = ''; $('logitCap').value = ''; }
-      else if (a === 'swa') $('windowMode').value = 'uniform';
-    });
-    window.addEventListener('resize', drawChart);
-    log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');
-    log('默认语料已载入，点击「构建模型」开始');
-  });
+/* L1 应用层启动（浏览器）：把演示应用绑到 DOM。
+   demo-app.js 只在求值期注册 NS.L1.app，不碰 DOM，故必须在此显式启动。 */
+;(function () {
+  var NS = globalThis.FlagshipAI;
+  if (!NS.L1 || !NS.L1.app) throw new Error('L1 应用层未加载：demo-app.js 缺失');
+  NS.L1.app.start(NS);
 })();
 
 </script>

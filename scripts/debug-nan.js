@@ -1,5 +1,5 @@
 /* 定位现代架构训练 NaN 的根因 */
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 const { CORPUS } = require('../src/corpus.js');
 
 const tok = new F.Tokenizer(CORPUS);

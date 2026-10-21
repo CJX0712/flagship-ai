@@ -13,7 +13,8 @@
  * ========================================================================*/
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
-    const api = factory(require('./flagship-engine.js'));
+    // T05：自检套件跑十层实现（src/index.js），旧单体仅作零回归基准。
+    const api = factory(require('./index.js'));
     module.exports = api;
     if (require.main === module) {
       const results = api.runAll();

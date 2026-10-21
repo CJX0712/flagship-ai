@@ -12,7 +12,7 @@
  *   7. 存档 save/load 无损往返 + 专家参数完整恢复
  * 作者：晨星  ·  License: MIT
  * ======================================================================*/
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 const { CORPUS } = require('../src/corpus.js');
 
 let pass = 0, fail = 0;

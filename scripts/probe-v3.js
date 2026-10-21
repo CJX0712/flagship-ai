@@ -1,5 +1,5 @@
 /* v3.0 探路脚本：BPE / RoPE 不变量 / 现代架构 KV cache 一致性 / 多架构梯度检验 */
-const F = require('../src/flagship-engine.js');
+const F = require('../src/index.js');
 const { CORPUS } = require('../src/corpus.js');
 
 console.log('=== 1. BPE 分词器往返无损 ===');

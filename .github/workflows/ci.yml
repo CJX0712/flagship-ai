@@ -8,7 +8,7 @@ on:
 
 jobs:
   verify:
-    name: Verify & Benchmark (Node ${{ matrix.node }})
+    name: Verify & Ten-Layer Gates (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,26 +27,48 @@ jobs:
       - name: Install devDependencies
         run: npm install --no-audit --no-fund
 
-      - name: Self-check suite (12 invariants)
-        run: node src/verify.js
+      # ── 以下 6 个门禁按依赖顺序串行执行 ──
+      # 注意：本项目实测并行跑多个 node 进程会触发测试文件被杀的环境性假红，
+      # 因此严禁并发，一律用独立 step 顺序串联。
 
-      - name: Layer lint (no browser-hostile syntax in src/L*/**)
-        run: node scripts/lint-layers.js
+      # 守护：十层源码（src/L2..L10）不得出现浏览器/Node 双端不兼容的危险语法
+      # （如 with/eval、new Function、已废弃 API 等），保证 file:// 直开可用。
+      - name: 层文件静态检查 / Layer lint
+        run: npm run lint
 
-      - name: Zero-regression gate (v11 ↔ v12, R1–R10)
-        run: node scripts/regression-v11.js --emit-golden
+      # 守护：L10 微指令集登记数量。1024 项 ISA 中已落地的微指令数必须达标，
+      # 防止新增算子时忘记登记进 ISA 登记中心导致"有实现无编号"。
+      - name: 微指令覆盖率 / Micro-ISA coverage
+        run: npm run isa
 
-      - name: Architecture comparison probe
-        run: node scripts/probe-v3.js
+      # 守护：12 项核心不变量（RNG 确定性、softmax 行和、LN 归一化、因果掩码、
+      # 中心差分梯度检验、过拟合收敛、KV cache 逐位一致、存档往返等）。
+      # 这是整个引擎的数学正确性底线。
+      - name: 自检套件 / Self-check invariants
+        run: npm test
 
-      - name: GQA (Grouped-Query Attention) probe
-        run: node scripts/probe-v4-gqa.js
+      # 守护：L1..L10 各层的 181 个单元测试。
+      # 必须用裸 `node --test` 自动发现，不可传目录参数（传目录会被当单文件执行而假红）。
+      - name: 分层单元测试 / Layer unit tests
+        run: npm run test:layers
 
-      - name: INT8 weight-only quantization probe
-        run: node scripts/probe-v5-quant.js
+      # 守护：十层重构后与 v11 旧单体（src/legacy/flagship-engine.v11.js）逐位零回归。
+      # R1 参数 / R2 前向 / R3 反向 / R4 训练 / R5 生成 / R6 KV 增量 /
+      # R7 存档往返 / R8 量化 / R9 逐算子 / R10 探针快照，全部要求 maxΔ=0。
+      - name: 零回归门禁 / Zero-regression vs v11
+        run: npm run regression
 
-      - name: MoE (Mixture of Experts) probe
-        run: node scripts/probe-moe.js
+      # 守护：11 个功能探针（v3 多架构 / v4 GQA / v5 INT8 权重 / v7 MoE /
+      # v8 MoE×INT8 / v9 SWA / v10 层交错 / v11 Gemma2 稳定化 / v12 KV-INT8 /
+      # v13 StreamingLLM / v14 YaRN）端到端全绿，确保十层接管没有丢能力。
+      - name: 全量探针 / All probes
+        run: npm run test:all
+
+      # 守护：demo 构建链可用（把引擎+自检套件+应用内联进单文件 demo.html）。
+      # 这是"浏览器 file:// 双击直开"这条对外承诺的构建期证明。置于 test:all 之后、
+      # probe-demo 之前，确保浏览器产物新鲜。
+      - name: Demo 构建链 / Build demo.html
+        run: npm run build
 
       - name: MoE x INT8 combined probe
         run: node scripts/probe-moe-quant.js
