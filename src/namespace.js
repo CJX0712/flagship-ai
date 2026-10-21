@@ -53,6 +53,12 @@ NS.__loadOrder = [
   './L10-microisa/F-norm-000.js',
   './L10-microisa/F-norm-001.js',
   './L10-microisa/F-norm-002.js',
+  // L10 · G 域（激活与损失，96 项）：sigmoid/tanh/ReLU/LeakyReLU/ELU/Softplus/
+  //   Softsign/HardTanh/GELU/Swish/Mish/SELU/HardSigmoid/softmax/log_softmax、
+  //   MSE/MAE/Huber/SmoothL1/BCE/BCE-logits/CE/CE-logits/KL/Focal。
+  './L10-microisa/G-act-000.js',
+  './L10-microisa/G-act-001.js',
+  './L10-microisa/G-act-002.js',
   // L7 · 张量与内存（依赖 L8/L9；对外语义/KV/存档用裸 ndarray 四元组）
   './L7-tensor/tensor.js',
   './L7-tensor/shape.js',
