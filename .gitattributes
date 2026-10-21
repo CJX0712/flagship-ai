@@ -1,0 +1,4 @@
+# 强制 LF 行尾：保证 git archive 干净树重建的 demo.html 与仓库内产物逐字节一致。
+# 否则 Windows autocrlf 会把检出/导出文件转 CRLF，而 build-demo.js 产物统一为 \n，
+# 导致同样的源码在两端的 demo.html 字节不一致（仅换行符，内容等价）。
+* text=auto eol=lf
