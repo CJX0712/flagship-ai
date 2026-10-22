@@ -12,8 +12,14 @@
  *   - 启动方式改写：原 IIFE 立即执行 → 现注册为 NS.L1.app.start(ns)，由
  *     scripts/build-demo.js 在 __FLAGSHIP_APP__ 槽位内联追加启动调用。
  *   - 事件绑定 / 训练分块 / 曲线绘制 / 自检逐项执行的全部逻辑逐行保留。
- * 模板侧契约不变：仍通过 id 直接操作 DOM（corpus/log/chart/prompt/output/...），
- *   demo.template.html 无需任何改动。
+ *
+ * v15.6 演示层升级（本次改动，DOM id 契约零变更，仅新增元素）：
+ *   1. 内联提示条（#alertBox）：错误/警告不再用 alert 阻塞，改为页头醒目提示。
+ *   2. 按钮 busy 态：构建 / 训练 / 自检期间按钮禁用 + 文案变化 + 旋转指示。
+ *   3. 模型状态卡：#modelInfo 从纯文本升级为结构化 chips（参数量/层数/头数/量化…）。
+ *   4. Loss 曲线美化：坐标轴 + 网格 + 面积填充 + 最低值基线 + 深浅色自适应。
+ *   5. L10 微指令浏览器：注册中心全貌（stats 八域明细）+ 域筛选 + 关键字搜索 +
+ *      七件套详情 + 试运行（确定性 RNG 驱动 op.predicate 真实跑一次不变量）+ 批量跑。
  * ========================================================================*/
 ;(function (NS) {
   NS.L1 = NS.L1 || {};
@@ -43,13 +49,120 @@
   function now() {
     return new Date().toLocaleTimeString('zh-CN', { hour12: false });
   }
+
+  /** 页头内联提示（替代 alert，不阻塞交互）。
+   *  @param {string} msg 提示文本
+   *  @param {string} kind ''（错误）| 'warn' | 'ok'
+   */
+  function notify(msg, kind) {
+    const box = $('alertBox'), txt = $('alertText');
+    if (!box || !txt) return;
+    txt.textContent = msg;
+    box.className = 'alert-box show' + (kind ? ' ' + kind : '');
+    if (notify._t) clearTimeout(notify._t);
+    notify._t = setTimeout(() => { box.className = 'alert-box'; }, 6000);
+  }
+  function dismissNotify() {
+    const box = $('alertBox');
+    if (box) box.className = 'alert-box';
+  }
+
   function log(msg, cls) {
     const el = $('log');
     const line = document.createElement('div');
     if (cls) line.className = cls;
     line.textContent = `[${now()}] ${msg}`;
-    el.appendChild(line);
-    el.scrollTop = el.scrollHeight;
+    if (el) {
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+    if (cls === 'err') notify(msg, '');
+    else if (cls === 'warn') notify(msg, 'warn');
+  }
+
+  /* ---------- 按钮 busy 态：禁用 + 文案 + 旋转指示，回调后自动还原 ---------- */
+  function busy(btn, label, fn) {
+    if (!btn) { fn(); return; }
+    const old = btn.textContent;
+    btn.disabled = true;
+    if (btn.classList) btn.classList.add('busy');
+    btn.textContent = label;
+    setTimeout(() => {
+      try { fn(); } finally {
+        if (btn.classList) btn.classList.remove('busy');
+        btn.textContent = old;
+        btn.disabled = false;
+      }
+    }, 24);
+  }
+
+  /* ---------- 模型状态卡（#modelInfo）---------- */
+  function chips(chipList, hlKeys) {
+    const ul = document.createElement('ul');
+    ul.className = 'chips';
+    for (const c of chipList) {
+      const li = document.createElement('li');
+      li.className = 'chip' + (hlKeys && hlKeys.indexOf(c[0]) >= 0 ? ' hl' : '');
+      const b = document.createElement('b');
+      b.textContent = c[0];
+      const s = document.createElement('span');
+      s.textContent = c[1];
+      li.appendChild(b);
+      li.appendChild(s);
+      ul.appendChild(li);
+    }
+    return ul;
+  }
+
+  /** 把已构建模型的实况渲染为结构化 chips（数据全部取自 model 自身，不新造数据源）。 */
+  function renderModelInfo(model, tokLabel) {
+    const el = $('modelInfo');
+    if (!el || !model) return;
+    el.textContent = '';
+    const cfg = model.cfg || {};
+    const kv = cfg.KV != null ? cfg.KV : (cfg.nKvHead || cfg.nHead);
+    const attn = kv < cfg.nHead ? `GQA ${kv}/${cfg.nHead}` : `MHA ${cfg.nHead}`;
+    const win = (model.windows || []).some((w) => w > 0)
+      ? ((model.windows || []).every((w) => w === model.windows[0])
+        ? `SWA ${model.windows[0]}`
+        : `交错 [${model.windows}]`)
+      : '全因果';
+    const moe = model.nExp > 1 ? `MoE ${model.nExp}专家/top${model.topK}` : '稠密';
+    const stab = [];
+    if (model.qkNorm) stab.push('QK-norm');
+    if (model.logitCap > 0) stab.push('cap' + model.logitCap);
+    const list = [
+      ['架构', state.arch || '—'],
+      ['注意力', attn],
+      ['上下文', win],
+      ['参数量', (model.paramCount ? model.paramCount() : 0).toLocaleString()],
+      ['词表', String(cfg.vocabSize != null ? cfg.vocabSize : '—')],
+      ['层数', String(cfg.nLayer)],
+      ['头数', String(cfg.nHead)],
+      ['dModel', String(cfg.dModel)],
+      ['上下文长', String(cfg.blockSize)],
+      ['FFN', moe],
+      ['归一化', (cfg.norm || '—').toUpperCase()],
+      ['位置编码', (cfg.pos || '—')],
+      ['KV 缓存', model.kvQuant === 8 ? 'INT8 量化' : 'Float64'],
+      ['Sink', model.attentionSink > 0 ? String(model.attentionSink) : '关'],
+      ['YaRN', model.ropeFreqScale ? '×' + model.attentionScaling.toFixed(2) : '关'],
+      ['稳定化', stab.length ? stab.join('+') : '—'],
+      ['分词器', tokLabel || (state.tokMode === 'char' ? '字符级' : 'BPE')],
+      ['种子', String(cfg.seed)],
+    ];
+    el.appendChild(chips(list, ['架构', '注意力', '上下文', '参数量']));
+  }
+
+  /** 状态卡占位（未构建 / 配置已变更）。 */
+  function placeholderInfo(msg) {
+    const el = $('modelInfo');
+    if (!el) return;
+    el.textContent = '';
+    const d = document.createElement('div');
+    d.className = 'mi-empty';
+    d.textContent = msg;
+    el.appendChild(d);
   }
 
   /* ---------- 模型构建 ---------- */
@@ -182,7 +295,8 @@
     log(`模型已构建：[${arch} / ${tokLabel} / ${gqaLabel} / ${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · ${state.model.cfg.nLayer} 层 · ${state.model.cfg.nHead} 头 · d=${state.model.cfg.dModel} · 参数量 ${state.model.paramCount().toLocaleString()}`);
     $('trainBtn').disabled = false;
     $('genBtn').disabled = true;
-    $('modelInfo').textContent = `[${arch}/${gqaLabel}/${winLabel}${stabFull}${kvqFull}${sinkFull}${yarnFull}] 词表 ${state.tok.vocabSize} · 参数 ${state.model.paramCount().toLocaleString()}`;
+    renderModelInfo(state.model, tokLabel);
+    notify(`模型已构建：${state.model.paramCount().toLocaleString()} 参数 · ${gqaLabel} · ${winLabel}`, 'ok');
     drawChart();
     return true;
   }
@@ -194,11 +308,31 @@
     state.totalSteps = +$('steps').value;
     state.training = true;
     state.stopFlag = false;
-    $('trainBtn').disabled = true;
+    const tb = $('trainBtn');
+    tb.disabled = true;
+    if (tb.classList) tb.classList.add('busy');
+    tb.textContent = '训练中…';
     $('stopBtn').disabled = false;
     $('buildBtn').disabled = true;
+    setProg(0);
     log(`开始训练：共 ${state.totalSteps} 步，lr=${$('lr').value}，batch=${$('blockSize').value}`);
     trainChunk();
+  }
+
+  /** 进度条 + 进度文本统一更新。
+   *  @param {number} ratio 0..1
+   *  @param {string} text 进度文本
+   *  @param {boolean} done 完成态（进度条转绿）
+   */
+  function setProg(ratio, text, done) {
+    const fill = $('progFill');
+    if (fill) fill.style.width = (100 * Math.max(0, Math.min(1, ratio))).toFixed(1) + '%';
+    const bar = $('progBar');
+    if (bar && bar.classList) {
+      if (done) bar.classList.add('ok'); else bar.classList.remove('ok');
+    }
+    const t = $('progText');
+    if (t && text) t.textContent = text;
   }
 
   function trainChunk() {
@@ -221,69 +355,170 @@
     state.trainState = res.state;
     for (const h of res.history) state.history.push(h);
     state.stepsDone += chunk;
-    $('progFill').style.width = (100 * state.stepsDone / state.totalSteps).toFixed(1) + '%';
-    $('progText').textContent = `${state.stepsDone}/${state.totalSteps} 步 · loss ${lastLoss.toFixed(4)}`;
+    setProg(state.stepsDone / state.totalSteps,
+      `${state.stepsDone}/${state.totalSteps} 步 · loss ${lastLoss.toFixed(4)} · ${(100 * state.stepsDone / state.totalSteps).toFixed(0)}%`,
+      state.stepsDone >= state.totalSteps);
     drawChart();
     setTimeout(trainChunk, 0);
   }
 
   function finishTraining() {
     state.training = false;
-    const ids = state.tok.encode($('corpus').value);
-    const ev = state.model.evaluate(ids);
-    $('trainBtn').disabled = false;
+    const tb = $('trainBtn');
+    if (tb.classList) tb.classList.remove('busy');
+    tb.textContent = '开始训练';
+    tb.disabled = false;
     $('stopBtn').disabled = true;
     $('buildBtn').disabled = false;
     $('genBtn').disabled = false;
     $('exportBtn').disabled = false;
-    log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${state.history[state.history.length - 1].toFixed(4)}，全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`, state.stopFlag ? 'warn' : 'ok');
+    const last = state.history.length ? state.history[state.history.length - 1].toFixed(4) : '—';
+    let evText = '（未评估）';
+    try {
+      const ids = state.tok.encode($('corpus').value);
+      const ev = state.model.evaluate(ids);
+      evText = `全语料评估 loss ${ev.loss.toFixed(4)} · 下一字准确率 ${(ev.acc * 100).toFixed(1)}%`;
+    } catch (e) {
+      evText = '评估跳过：' + e.message;
+    }
+    log(`${state.stopFlag ? '训练已停止' : '训练完成'}：${state.stepsDone} 步，最终 batch loss ${last}，${evText}`, state.stopFlag ? 'warn' : 'ok');
   }
 
-  /* ---------- Loss 曲线（log 纵轴） ---------- */
+  /* ---------- Loss 曲线（log 纵轴 · 主题自适应） ---------- */
+  const CHART_FALLBACK = {
+    grid: '#e8edf5', axis: '#94a3b8', line: '#4f46e5',
+    line2: '#f59e0b', area: 'rgba(79, 70, 229, .14)', ink: '#334155',
+  };
+
+  /** 读取 CSS 变量（图表随 prefers-color-scheme 自适应）；取不到则用浅色兜底值。 */
+  function cssVar(name, fallback) {
+    let v = '';
+    try {
+      if (typeof getComputedStyle === 'function' && document && document.documentElement) {
+        v = getComputedStyle(document.documentElement).getPropertyValue(name) || '';
+      }
+    } catch (e) { v = ''; }
+    v = String(v).trim();
+    return v || fallback;
+  }
+
+  function fmtTick(v) {
+    if (v >= 100) return v.toFixed(0);
+    if (v >= 1) return v.toFixed(1);
+    if (v >= 0.01) return v.toFixed(3);
+    return v.toExponential(1);
+  }
+
   function drawChart() {
     const cv = $('chart');
-    const dpr = window.devicePixelRatio || 1;
-    const W = cv.clientWidth, H = 180;
-    if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    if (!cv || typeof cv.getContext !== 'function') return;
     const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    const W = cv.clientWidth || 520, H = 200;
+    if (cv.width !== Math.round(W * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    const padL = 44, padR = 8, padT = 10, padB = 20;
+
+    const C = {
+      grid: cssVar('--chart-grid', CHART_FALLBACK.grid),
+      axis: cssVar('--chart-axis', CHART_FALLBACK.axis),
+      line: cssVar('--chart-line', CHART_FALLBACK.line),
+      line2: cssVar('--chart-line-2', CHART_FALLBACK.line2),
+      area: cssVar('--chart-area', CHART_FALLBACK.area),
+      ink: cssVar('--chart-ink', CHART_FALLBACK.ink),
+    };
+    const padL = 48, padR = 14, padT = 16, padB = 28;
     const iw = W - padL - padR, ih = H - padT - padB;
-    ctx.strokeStyle = '#e2e8f0';
-    ctx.fillStyle = '#64748b';
     ctx.font = '10px ui-monospace, monospace';
+    ctx.textBaseline = 'middle';
+
+    // 空态：坐标轴骨架 + 提示
+    const h = state.history;
+    if (!h.length) {
+      ctx.strokeStyle = C.grid;
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = padT + ih * i / 4;
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      }
+      ctx.fillStyle = C.axis;
+      ctx.textAlign = 'center';
+      ctx.fillText('等待训练数据…（纵轴为对数刻度 loss）', padL + iw / 2, padT + ih / 2);
+      return;
+    }
+
+    const minL = Math.max(1e-4, Math.min.apply(null, h));
+    const maxL = Math.max.apply(null, h);
+    const hi = Math.log10(maxL);
+    const span = Math.max(0.5, hi - Math.log10(minL));
+    const lo = hi - span;
+    const X = (i) => padL + iw * (h.length === 1 ? 1 : i / (h.length - 1));
+    const Y = (v) => padT + ih * (1 - (Math.log10(Math.max(1e-4, v)) - lo) / span);
+
+    // 横向网格 + 纵轴刻度（对数）
+    ctx.strokeStyle = C.grid;
     ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.fillStyle = C.axis;
+    ctx.textAlign = 'right';
     for (let i = 0; i <= 4; i++) {
       const y = padT + ih * i / 4;
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      ctx.fillText(fmtTick(Math.pow(10, lo + span * i / 4)), padL - 6, y);
     }
-    const h = state.history;
-    if (!h.length) {
-      ctx.fillText('等待训练数据…', padL + 6, padT + 14);
-      return;
-    }
-    const minL = Math.max(1e-4, Math.min(...h));
-    const maxL = Math.max(...h);
-    const lo = Math.log10(minL), hi = Math.log10(maxL);
-    const span = Math.max(0.5, hi - lo);
-    const X = (i) => padL + iw * (h.length === 1 ? 1 : i / (h.length - 1));
-    const Y = (v) => padT + ih * (1 - (Math.log10(Math.max(1e-4, v)) - (hi - span)) / span);
+    ctx.setLineDash([]);
+
+    // 横轴刻度（训练步）
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.strokeStyle = C.grid;
     for (let i = 0; i <= 4; i++) {
-      const lv = Math.pow(10, hi - span + span * i / 4);
-      ctx.fillText(lv >= 0.01 ? lv.toFixed(2) : lv.toExponential(0), 4, padT + ih * i / 4 + 3);
+      const x = padL + iw * i / 4;
+      ctx.beginPath(); ctx.moveTo(x, padT + ih); ctx.lineTo(x, padT + ih + 4); ctx.stroke();
+      ctx.fillText(String(Math.round(h.length * i / 4)), x, padT + ih + 7);
     }
-    ctx.strokeStyle = '#4f46e5';
-    ctx.lineWidth = 1.6;
+    ctx.textBaseline = 'middle';
+
+    // 面积填充
+    ctx.beginPath();
+    ctx.moveTo(X(0), padT + ih);
+    for (let i = 0; i < h.length; i++) ctx.lineTo(X(i), Y(h[i]));
+    ctx.lineTo(X(h.length - 1), padT + ih);
+    ctx.closePath();
+    ctx.fillStyle = C.area;
+    ctx.fill();
+
+    // 最低 loss 基线
+    const yMin = Y(minL);
+    ctx.strokeStyle = C.line2;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(padL, yMin); ctx.lineTo(W - padR, yMin); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = C.line2;
+    ctx.textAlign = 'left';
+    ctx.fillText('min ' + fmtTick(minL), padL + 4, yMin - 8);
+
+    // loss 主线
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
     ctx.beginPath();
     for (let i = 0; i < h.length; i++) {
       const x = X(i), y = Y(h[i]);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
-    ctx.fillStyle = '#4f46e5';
+
+    // 末点标记 + 当前值
+    const lx = X(h.length - 1), ly = Y(h[h.length - 1]);
+    ctx.fillStyle = C.line;
+    ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = C.ink;
+    ctx.textAlign = 'right';
     ctx.font = '11px ui-monospace, monospace';
-    ctx.fillText(`loss ${h[h.length - 1].toFixed(4)}`, W - padR - 76, padT + 12);
+    ctx.fillText('loss ' + h[h.length - 1].toFixed(4), W - padR - 2, padT + 4);
   }
 
   /* ---------- 生成 ---------- */
@@ -337,8 +572,8 @@
         state.totalSteps = 0;
         state.history = [];
         state.stale = false;
-        $('modelInfo').textContent =
-          `词表 ${tok.vocabSize} · 参数 ${model.paramCount().toLocaleString()}（导入）`;
+        state.arch = (model.cfg && model.cfg.norm === 'rmsnorm') ? 'llama' : 'gpt2';
+        renderModelInfo(model, '导入');
         $('genBtn').disabled = false;
         $('exportBtn').disabled = false;
         drawChart();
@@ -361,8 +596,12 @@
     let i = 0, passCount = 0;
     const next = () => {
       if (i >= VF.CHECKS.length) {
-        log(`自检结束：${passCount}/${VF.CHECKS.length} 通过 ${passCount === VF.CHECKS.length ? '✅ 全绿' : '❌ 存在失败'}`, passCount === VF.CHECKS.length ? 'ok' : 'err');
-        $('checkBtn').disabled = false;
+        const all = passCount === VF.CHECKS.length;
+        log(`自检结束：${passCount}/${VF.CHECKS.length} 通过 ${all ? '✅ 全绿' : '❌ 存在失败'}`, all ? 'ok' : 'err');
+        const cb = $('checkBtn');
+        if (cb.classList) cb.classList.remove('busy');
+        cb.textContent = '运行自检';
+        cb.disabled = false;
         return;
       }
       const c = VF.CHECKS[i];
@@ -393,28 +632,450 @@
     setTimeout(next, 30);
   }
 
+  /* ==========================================================================
+   * L10 微指令浏览器
+   * --------------------------------------------------------------------------
+   * 数据源：NS.L10（注册中心真源）—— stats() 八域明细、ops 表 1024 项、TAGS 域
+   *   标签、genScalar/genVector/genMatrix/genShape 确定性生成器、check() 谓词执行器。
+   * 参数构造：与 tests/lib/op-harness.js 的 genArgs 同构（matrix→defDims/matrixDims、
+   *   vector→defLen/vecDims、shape→genShape、其余→genScalar），种子由
+   *   NS.L9.rng.mulberry32 确定性生成 —— 同一 seed 在任何机器上得到同一组参数。
+   * ========================================================================*/
+  const l10 = {
+    ready: false,
+    all: [],          // 全部已实现微指令（按 key 升序）
+    filtered: [],     // 当前筛选结果
+    shown: 0,         // 已渲染条数（分页）
+    pageSize: 60,
+    domain: 'ALL',    // 域筛选：'ALL' | 'A'..'H'
+    query: '',        // 关键字（匹配 name / key / μkey）
+    selected: null,   // 当前选中项
+    items: [],        // { op, btn } 已渲染项（用于高亮同步）
+    batching: false,
+    stopBatch: false,
+  };
+
+  const L10_DOMAIN_HINT = {
+    A: '标量算术/函数', B: '向量运算', C: '矩阵/张量', D: '注意力基元',
+    E: '形状与索引', F: '归一化', G: '激活与损失', H: '采样与量化',
+  };
+
+  /** 与 tests/lib/op-harness.js 的 genArgs 同构：按 op.domains 的域标签确定性构造参数。 */
+  function l10GenArgs(rng, op) {
+    const L = NS.L10;
+    const names = op.inputs || [];
+    const args = [];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const tag = (op.domains || {})[name];
+      const t = L.TAGS[tag];
+      if (!t) throw new Error(`op ${op.key} 引用未知道域标签 "${tag}"`);
+      if (t.kind === 'matrix') {
+        const dims = (op.matrixDims && op.matrixDims[name]) || t.defDims || [4, 4];
+        args.push(L.genMatrix(rng, dims[0], dims[1], tag));
+      } else if (t.kind === 'vector') {
+        const n = (op.vecDims && op.vecDims[name]) || t.defLen || 8;
+        args.push(L.genVector(rng, n, tag));
+      } else if (t.kind === 'shape') {
+        args.push(L.genShape(rng, tag));
+      } else {
+        args.push(L.genScalar(rng, tag));
+      }
+    }
+    return args;
+  }
+
+  /** 以某个种子对某个微指令跑一次不变量谓词（真实执行 op.predicate）。 */
+  function l10Trial(op, seed) {
+    const L = NS.L10;
+    if (!L || !L.check) return { pass: false, detail: 'L10.check 未就位', seed: seed };
+    if (!NS.L9 || !NS.L9.rng || typeof NS.L9.rng.mulberry32 !== 'function') {
+      return { pass: false, detail: 'L9.rng 未就位', seed: seed };
+    }
+    try {
+      const rng = NS.L9.rng.mulberry32(seed >>> 0);
+      const args = l10GenArgs(rng, op);
+      const r = L.check(op, args);
+      return { pass: !!r.pass, detail: r.detail || '', seed: seed };
+    } catch (e) {
+      return { pass: false, detail: '异常: ' + (e && e.message), seed: seed };
+    }
+  }
+
+  /** 种子的确定性序列：第 s 个种子（避免跨项全同，同时保持可复现）。 */
+  function l10SeedAt(s) { return (1000 + s * 7919) >>> 0; }
+  function l10SeedCount() {
+    const el = $('l10Seeds');
+    const n = el ? +el.value : 8;
+    return Math.max(1, Math.min(200, isFinite(n) && n > 0 ? Math.floor(n) : 8));
+  }
+  function l10Clock() {
+    return (typeof performance !== 'undefined' && performance && performance.now) ? performance.now() : 0;
+  }
+
+  /* ---- 列表项 / 详情 ---- */
+  function l10ItemNode(op) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.className = 'l10-item';
+    btn.setAttribute('type', 'button');
+    btn.setAttribute('aria-current', 'false');
+    const k = document.createElement('span');
+    k.className = 'k';
+    k.textContent = 'μ' + op.key;
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = op.name || '(未命名)';
+    const g = document.createElement('span');
+    g.className = 'g';
+    g.textContent = op.domain;
+    btn.appendChild(k); btn.appendChild(n); btn.appendChild(g);
+    btn.addEventListener('click', () => l10Select(op));
+    li.appendChild(btn);
+    l10.items.push({ op: op, btn: btn });
+    return li;
+  }
+
+  function l10Piece(dl, cls, label, text) {
+    const row = document.createElement('div');
+    if (cls) row.className = cls;
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.textContent = (text == null || text === '') ? '—' : String(text);
+    row.appendChild(dt); row.appendChild(dd);
+    dl.appendChild(row);
+  }
+
+  function l10Select(op) {
+    l10.selected = op;
+    for (let i = 0; i < l10.items.length; i++) {
+      const it = l10.items[i];
+      it.btn.setAttribute('aria-current', it.op === op ? 'true' : 'false');
+    }
+    const box = $('l10Detail');
+    if (!box) return;
+    box.textContent = '';
+
+    const head = document.createElement('div');
+    head.className = 'l10-d-head';
+    const key = document.createElement('span');
+    key.className = 'key';
+    key.textContent = 'μ' + op.key;
+    const h3 = document.createElement('h3');
+    h3.textContent = op.name || '(未命名)';
+    const dom = document.createElement('span');
+    dom.className = 'badge';
+    dom.textContent = `域 ${op.domain} · ${(NS.L10.domains[op.domain] || {}).name || L10_DOMAIN_HINT[op.domain] || ''}`;
+    head.appendChild(key); head.appendChild(h3); head.appendChild(dom);
+    box.appendChild(head);
+
+    const dl = document.createElement('dl');
+    dl.className = 'l10-seven';
+    l10Piece(dl, 'intuition', '直觉', op.intuition);
+    l10Piece(dl, 'math', '数学', op.math);
+    l10Piece(dl, 'pseudo', '伪代码', op.pseudocode);
+    l10Piece(dl, 'complexity', '复杂度', op.complexity);
+    l10Piece(dl, 'ref', '参考', op.ref);
+    l10Piece(dl, 'commonPitfall', '常见坑', op.commonPitfall);
+    l10Piece(dl, 'invariant', '不变量', op.invariant);
+    const inputs = (op.inputs || []).map((nm) => `${nm}:${(op.domains || {})[nm] || '?'}`).join('  ');
+    l10Piece(dl, 'inputs', '输入域', inputs || '—');
+    box.appendChild(dl);
+
+    const run = $('l10RunBtn');
+    if (run) run.disabled = false;
+    const res = $('l10RunResult');
+    if (res) { res.className = 'l10-result'; res.textContent = '就绪 · 可试运行'; }
+  }
+
+  /* ---- 渲染 ---- */
+  function l10RenderSummary(st) {
+    const box = $('l10Summary');
+    if (!box) return;
+    box.textContent = '';
+    const letters = NS.L10.DOMAINS || Object.keys(L10_DOMAIN_HINT);
+    for (let i = 0; i < letters.length; i++) {
+      const d = letters[i];
+      const s = st[d] || { impl: 0, capacity: 128 };
+      const b = document.createElement('button');
+      b.className = 'l10-dom';
+      b.setAttribute('type', 'button');
+      b.setAttribute('aria-pressed', 'false');
+      b.title = `${d} 域：${s.impl}/${s.capacity} 已实现 — 点击筛选`;
+      const k = document.createElement('span');
+      k.className = 'd-key';
+      k.textContent = `${d} · ${(NS.L10.domains[d] || {}).name || L10_DOMAIN_HINT[d] || ''}`;
+      const nm = document.createElement('span');
+      nm.className = 'd-name';
+      nm.textContent = L10_DOMAIN_HINT[d] || '';
+      const bar = document.createElement('span');
+      bar.className = 'd-bar';
+      const fill = document.createElement('i');
+      fill.style.width = (100 * s.impl / s.capacity).toFixed(1) + '%';
+      bar.appendChild(fill);
+      const num = document.createElement('span');
+      num.className = 'd-num';
+      num.textContent = `${s.impl} / ${s.capacity}`;
+      b.appendChild(k); b.appendChild(nm); b.appendChild(bar); b.appendChild(num);
+      b.addEventListener('click', () => { l10SetDomain(d === l10.domain ? 'ALL' : d); });
+      box.appendChild(b);
+      b.l10Domain = d;
+      l10.domainButtons.push(b);
+    }
+  }
+
+  function l10RenderDomainBar() {
+    const bar = $('l10DomainBar');
+    if (!bar) return;
+    bar.textContent = '';
+    const letters = NS.L10.DOMAINS || Object.keys(L10_DOMAIN_HINT);
+    const all = ['ALL'].concat(letters);
+    for (let i = 0; i < all.length; i++) {
+      const d = all[i];
+      const b = document.createElement('button');
+      b.className = 'chip-btn';
+      b.setAttribute('type', 'button');
+      b.setAttribute('aria-pressed', d === l10.domain ? 'true' : 'false');
+      b.textContent = d === 'ALL' ? '全部' : d;
+      b.title = d === 'ALL' ? '全部八域 1024 项' : `${d} 域 · ${L10_DOMAIN_HINT[d] || ''}`;
+      b.addEventListener('click', () => l10SetDomain(d));
+      bar.appendChild(b);
+      l10.chipButtons.push({ d: d, btn: b });
+    }
+  }
+
+  function l10SetDomain(d) {
+    l10.domain = d;
+    for (let i = 0; i < l10.chipButtons.length; i++) {
+      const c = l10.chipButtons[i];
+      c.btn.setAttribute('aria-pressed', c.d === d ? 'true' : 'false');
+    }
+    for (let i = 0; i < l10.domainButtons.length; i++) {
+      const b = l10.domainButtons[i];
+      b.setAttribute('aria-pressed', b.l10Domain === d ? 'true' : 'false');
+    }
+    l10ApplyFilter();
+  }
+
+  function l10ApplyFilter() {
+    const q = l10.query.trim().toLowerCase();
+    const out = [];
+    for (let i = 0; i < l10.all.length; i++) {
+      const op = l10.all[i];
+      if (l10.domain !== 'ALL' && op.domain !== l10.domain) continue;
+      if (q) {
+        const hay = ((op.name || '') + ' ' + op.key + ' μ' + op.key).toLowerCase();
+        if (hay.indexOf(q) < 0) continue;
+      }
+      out.push(op);
+    }
+    l10.filtered = out;
+    l10.shown = 0;
+    l10.items = [];
+    l10RenderList(true);
+    const c = $('l10Count');
+    if (c) c.textContent = `${l10.filtered.length} / ${l10.all.length} 项`;
+  }
+
+  /** 渲染列表。reset=true 时清空重画（筛选变化）；否则只追加下一页（加载更多）。 */
+  function l10RenderList(reset) {
+    const list = $('l10List');
+    if (!list) return;
+    if (reset) list.textContent = '';
+    const end = Math.min(l10.filtered.length, l10.shown + l10.pageSize);
+    for (; l10.shown < end; l10.shown++) list.appendChild(l10ItemNode(l10.filtered[l10.shown]));
+    const more = $('l10More');
+    if (more) {
+      const left = l10.filtered.length - l10.shown;
+      more.style.display = left > 0 ? '' : 'none';
+      more.textContent = left > 0 ? `加载更多（剩余 ${left} 项）` : '已全部加载';
+    }
+  }
+
+  function l10RenderMore() {
+    const before = l10.shown;
+    l10RenderList(false);
+    // 原列表已被清空时（首屏）无需滚动；追加场景滚到底部便于连续浏览
+    if (l10.shown > before && before > 0) {
+      const list = $('l10List');
+      if (list && list.scrollHeight) list.scrollTop = list.scrollHeight;
+    }
+  }
+
+  /* ---- 试运行 ---- */
+  function l10RunOne() {
+    const op = l10.selected;
+    if (!op) return;
+    const n = l10SeedCount();
+    const t0 = l10Clock();
+    let pass = 0, fail = 0, firstFail = null;
+    for (let s = 0; s < n; s++) {
+      const r = l10Trial(op, l10SeedAt(s));
+      if (r.pass) pass++;
+      else { fail++; if (!firstFail) firstFail = r; }
+    }
+    const ms = l10Clock() - t0;
+    const res = $('l10RunResult');
+    if (res) {
+      res.className = 'l10-result ' + (fail ? 'err-text' : 'ok-text');
+      res.textContent = `${fail ? '✗' : '✓'} μ${op.key} ${pass}/${n} 通过`
+        + (fail ? ` · 首个失败 seed=${firstFail.seed}：${firstFail.detail}` : '')
+        + ` · ${ms.toFixed(1)}ms`;
+    }
+    log(`微指令 μ${op.key} 试运行：${pass}/${n} 通过${fail ? '（存在失败）' : ''}，耗时 ${ms.toFixed(1)}ms`, fail ? 'err' : 'ok');
+  }
+
+  function l10Batch() {
+    if (l10.batching || !l10.filtered.length) return;
+    const seeds = l10SeedCount();
+    const ops = l10.filtered.slice();
+    l10.batching = true;
+    l10.stopBatch = false;
+    const bb = $('l10BatchBtn'), sb = $('l10StopBtn');
+    if (bb) { bb.disabled = true; if (bb.classList) bb.classList.add('busy'); bb.textContent = '批量试运行中…'; }
+    if (sb) sb.disabled = false;
+    let idx = 0, passOps = 0, failOps = 0, evals = 0;
+    const fails = [];
+    const t0 = l10Clock();
+    const CHUNK = 24;
+
+    function setBatchProg() {
+      const ratio = idx / ops.length;
+      const fill = $('l10BatchFill');
+      if (fill) fill.style.width = (100 * ratio).toFixed(1) + '%';
+      const bar = $('l10ProgBar');
+      if (bar && bar.classList) bar.classList.remove('ok');
+      const t = $('l10BatchText');
+      if (t) t.textContent = `${idx}/${ops.length} 项 · 通过 ${passOps} · 失败 ${failOps} · ${evals} 次谓词求值`;
+    }
+
+    function done() {
+      l10.batching = false;
+      const ms = l10Clock() - t0;
+      if (bb) {
+        if (bb.classList) bb.classList.remove('busy');
+        bb.textContent = '批量试运行当前筛选';
+        bb.disabled = false;
+      }
+      if (sb) sb.disabled = true;
+      const bar = $('l10ProgBar');
+      if (bar && bar.classList && failOps === 0) bar.classList.add('ok');
+      const fill = $('l10BatchFill');
+      if (fill) fill.style.width = '100%';
+      const t = $('l10BatchText');
+      if (t) {
+        t.textContent = `${l10.stopBatch ? '已停止：' : '完成：'}${idx}/${ops.length} 项 · 通过 ${passOps} · 失败 ${failOps}`
+          + ` · ${evals} 次谓词求值 · ${ms.toFixed(0)}ms`
+          + (fails.length ? ` · 失败项 ${fails.join(' ')}${failOps > fails.length ? ' …' : ''}` : '');
+      }
+      const res = $('l10RunResult');
+      if (res) {
+        res.className = 'l10-result ' + (failOps ? 'err-text' : 'ok-text');
+        res.textContent = `${failOps ? '✗' : '✓'} ${passOps}/${ops.length} 项通过（每项 ${seeds} 种子）`;
+      }
+      log(`L10 批量试运行：${passOps}/${ops.length} 项通过，${evals} 次谓词求值，耗时 ${ms.toFixed(0)}ms`, failOps ? 'err' : 'ok');
+    }
+
+    function tick() {
+      if (l10.stopBatch || idx >= ops.length) { done(); return; }
+      const end = Math.min(ops.length, idx + CHUNK);
+      for (; idx < end; idx++) {
+        let ok = true;
+        for (let s = 0; s < seeds; s++) {
+          evals++;
+          if (!l10Trial(ops[idx], l10SeedAt(s)).pass) { ok = false; break; }
+        }
+        if (ok) passOps++;
+        else { failOps++; if (fails.length < 10) fails.push('μ' + ops[idx].key); }
+      }
+      setBatchProg();
+      setTimeout(tick, 0);
+    }
+    setBatchProg();
+    setTimeout(tick, 0);
+  }
+
+  function l10StopBatch() {
+    if (l10.batching) l10.stopBatch = true;
+  }
+
+  /** 初始化浏览器：读 stats、建列表、渲染并绑定交互。 */
+  function l10Init() {
+    const L = NS.L10;
+    if (!L || !L.ops || typeof L.stats !== 'function') {
+      log('L10 注册中心未就位，微指令浏览器不可用', 'warn');
+      return;
+    }
+    l10.domainButtons = [];
+    l10.chipButtons = [];
+    const st = L.stats();
+    const badge = $('l10Badge');
+    if (badge) badge.textContent = `L10 微指令 ${st.total.impl}/${st.total.capacity}`;
+    const badge2 = $('l10Badge2');
+    if (badge2) badge2.textContent = `${st.total.impl}/${st.total.capacity}`;
+
+    const keys = Object.keys(L.ops);
+    keys.sort();
+    for (let i = 0; i < keys.length; i++) {
+      const op = L.ops[keys[i]];
+      if (op && op.status === 'impl') l10.all.push(op);
+    }
+    l10RenderSummary(st);
+    l10RenderDomainBar();
+    l10ApplyFilter();
+
+    const search = $('l10Search');
+    if (search) {
+      let t = null;
+      search.addEventListener('input', () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => { l10.query = search.value || ''; l10ApplyFilter(); }, 120);
+      });
+    }
+    const more = $('l10More');
+    if (more) more.addEventListener('click', l10RenderMore);
+    const run = $('l10RunBtn');
+    if (run) run.addEventListener('click', () => busy(run, '试运行中…', l10RunOne));
+    const batch = $('l10BatchBtn');
+    if (batch) batch.addEventListener('click', l10Batch);
+    const stop = $('l10StopBtn');
+    if (stop) stop.addEventListener('click', l10StopBatch);
+
+    l10.ready = true;
+    log(`L10 微指令浏览器就绪：${l10.all.length} 项已实现（八域 A–H，容量 ${st.total.capacity}）`);
+  }
+
   /* ---------- 事件绑定 ---------- */
   function markStale(msg) {
     if (state.model) {
       state.stale = true;
       $('genBtn').disabled = true;
-      if (msg) $('modelInfo').textContent = msg;
+      if (msg) placeholderInfo(msg + '（点击「构建模型」重建）');
     }
   }
 
   function bind() {
-    $('buildBtn').addEventListener('click', buildModel);
+    $('buildBtn').addEventListener('click', () => busy($('buildBtn'), '构建中…', buildModel));
     $('trainBtn').addEventListener('click', startTraining);
     $('stopBtn').addEventListener('click', () => { state.stopFlag = true; });
-    $('genBtn').addEventListener('click', doGenerate);
-    $('checkBtn').addEventListener('click', runSelfCheck);
+    $('genBtn').addEventListener('click', () => busy($('genBtn'), '生成中…', doGenerate));
+    // 自检是异步分帧执行的，禁用态由 runSelfCheck 自己收尾，故此处的 busy 只管文案与指示
+    $('checkBtn').addEventListener('click', () => {
+      const cb = $('checkBtn');
+      if (cb.classList) cb.classList.add('busy');
+      cb.textContent = '自检中…';
+      runSelfCheck();
+    });
     $('exportBtn').addEventListener('click', doExport);
     $('importBtn').addEventListener('click', () => $('importFile').click());
     $('importFile').addEventListener('change', handleImport);
+    const closeBtn = $('alertClose');
+    if (closeBtn) closeBtn.addEventListener('click', dismissNotify);
     // 语料与模型结构/分词器/架构变动都需重新构建
-    $('corpus').addEventListener('input', () => markStale('语料已修改，重新构建后生效'));
+    $('corpus').addEventListener('input', () => markStale('语料已修改'));
     ['dModel', 'nHead', 'nLayer', 'blockSize', 'tokenizer', 'arch', 'vocabSize', 'nKvHead', 'nExp', 'topK', 'window', 'windowMode', 'qkNorm', 'logitCap', 'kvQuant', 'attentionSink', 'rollingWindow', 'yarnFactor', 'yarnType'].forEach((id) => {
-      $(id).addEventListener('change', () => markStale('配置已修改，重新构建后生效'));
+      $(id).addEventListener('change', () => markStale('配置已修改'));
     });
     // 架构联动：选 swa/gemma 预设时自动切换稀疏注意力模式（gemma 预设自带 QK-norm/soft-cap，留空即跟随）
     $('arch').addEventListener('change', () => {
@@ -423,6 +1084,17 @@
       else if (a === 'swa') $('windowMode').value = 'uniform';
     });
     window.addEventListener('resize', drawChart);
+    // 主题切换（深/浅色）时重绘图表，配色从 CSS 变量实时读取
+    try {
+      if (typeof window.matchMedia === 'function') {
+        const mq = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mq && typeof mq.addEventListener === 'function') {
+          mq.addEventListener('change', drawChart);
+        }
+      }
+    } catch (e) { /* 老浏览器无 matchMedia：忽略，配色走 CSS 变量兜底 */ }
+    placeholderInfo('尚未构建模型');
+    try { l10Init(); } catch (e) { log('L10 浏览器初始化失败：' + e.message, 'err'); }
     log('旗舰 AI 引擎就绪：零依赖纯 JS · 浏览器内一键自检');
     log('默认语料已载入，点击「构建模型」开始');
   }
@@ -453,6 +1125,11 @@
     doExport: doExport,
     runSelfCheck: runSelfCheck,
     drawChart: drawChart,
+    notify: notify,
+    l10Init: l10Init,
+    l10RunOne: l10RunOne,
+    l10Batch: l10Batch,
+    l10: l10,
     state: state,
   };
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

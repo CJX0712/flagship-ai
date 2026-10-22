@@ -4,10 +4,10 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.6-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.7-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
-[![ISA](https://img.shields.io/badge/ISA-896%2F1024-blue)](#十层分解架构落地状态)
+[![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
 [![Architecture](https://img.shields.io/badge/architecture-L1%E2%86%92L10%20ten--layer-blueviolet)](#十层分解架构落地状态)
 [![Regression](https://img.shields.io/badge/regression-R1%E2%80%93R10%20%CE%94%3D0-brightgreen)](#十层分解架构落地状态)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
@@ -17,7 +17,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 896 项已实现）· 浏览器与 Node 双端同码*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 1024 项已实现）· 浏览器与 Node 双端同码*
 
 </div>
 
@@ -146,35 +146,22 @@
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
 
-### v15.2 新增（L10 微指令 D 域：注意力基元 96 项）
+### v15.7 新增（demo 视觉/交互升级 + L10 微指令浏览器）
 
-补齐八域中的 **D 域（注意力基元）**，微指令实现数 **384 → 480**，覆盖注意力计算全链路的原子操作：
+十层架构与 1024 项微指令全量落地后，把 demo 从「能用」升级为「可展示」：
 
-| 子域 | 指令 | 代表不变量 |
-|---|---|---|
-| **打分与缩放** | D001–D012 | 点积交换/齐次/分配、Cauchy–Schwarz 上界、自点积=‖q‖²、缩放除乘一致、温度单调、YaRN mscale 公式 |
-| **掩码** | D013–D024 | 因果/滑动窗口/padding 构造正确、掩码幂等、窗口单调、与有限偏置可交换、安全 softmax 全掩回退均匀 |
-| **softmax·LSE** | D025–D032 | 行和为一、平移不变、正值、安全版=朴素版、保序、lse 平移公式、softmax=exp(s−lse) |
-| **RoPE** | D033–D044 | 逆频率公式、保范数、R(−p)∘R(p)=I、相对位置不变性、旋转复合、线性、逐对不交叉、det=1 |
-| **ALiBi** | D045–D056 | 斜率几何级数、单调、偏置=−slope·|i−j|、对角为零、非正、对称、非 2 幂头数取最近幂 |
-| **温度与信息量** | D057–D064 | 温度除乘一致、熵上界 log n、熵随温度单调、均匀分布取上界、CE=−log p[t]、CE≥0、KL≥0、JS 对称 |
-| **GQA/MQA** | D065–D078 | q→kv 头映射、组大小、MQA/MHA 退化、值域合法、映射单调、覆盖性、重复 KV 逐位一致、拼接维度守恒 |
-| **KV Cache** | D079–D096 | 追加递增、行读取一致、容量截断、滚动丢弃最旧非锚点、**sink 永不淘汰**、K/V 长度同步、清空、写不覆盖、行地址、INT8 往返硬界、长位置外推有限 |
+| 能力 | 说明 |
+|---|---|
+| **设计系统** | CSS 变量驱动的配色/间距/圆角/阴影/字体栈；按钮 primary·ghost·禁用态；输入与下拉统一风格；`:focus-visible` 键盘焦点可见；hover 过渡 |
+| **信息架构** | 配置项按语义分组（① 语料与模型 ② 架构结构 ③ 训练 ④ 注意力与上下文 ⑤ 采样 ⑥ 量化与外推 ⑦ 图表与进度 ⑧ 代码/日志 ⑨ 微指令浏览器 ⑩ 响应式），每项配可见说明与默认值提示 |
+| **状态与反馈** | Header 徽章组（v15.7 / L10 微指令 1024/1024 / 十层架构 L1–L10 / zero-dependency）；模型信息升级为结构化状态卡；构建与训练按钮 loading 态；错误以内联提示呈现（不阻塞） |
+| **训练可视化** | `<canvas>` loss 图表加坐标轴、网格线、曲线配色与 legend；进度条与进度文本样式重做 |
+| **L10 微指令浏览器** | 展示注册中心全貌（八域明细 + 合计 1024/1024）；按域筛选（全部 + A–H 九按钮）；关键字搜索（匹配 op.name / op.key）；点击展开七件套（直觉/数学/伪代码/复杂度/论文/坑/不变量 + 输入域）；**「试运行」在浏览器内真实执行该 op 的 predicate**（参数由 `NS.L9.rng.mulberry32` + `NS.L10.genScalar/genVector/genMatrix/genShape` 确定性生成）；**「批量试运行」对全部 1024 项 × 8 种子跑不变量并汇报通过/失败** |
+| **响应式** | 宽屏多栏、窄屏单栏；小屏不破版 |
 
-同时为 D 域新增两个输入域标签 `vecMask`（掩码 0/1 向量）与 `vecProb`（归一化为概率单纯形）、`factor1`（外推因子 ≥1，避免 mscale 开负根）。
+**浏览器内批量试运行实测**：1024 项 × 8 种子 = 8192 次谓词求值 **全绿**（1271ms）——即 demo 页面本身成为一条独立的微指令不变量验证通路，与 `npm run test:layers` 互为交叉验证。
 
-### v15.5 新增（L10 微指令 H 域：采样与量化 128 项 + F/G 补满 128 + 三处 latent 修复）
-
-补齐八域最后一域 **H（采样与量化）** 并将 F/G 由 96 补满至 128，微指令实现数 **672 → 864**（A–E 各 96 + F/G/H 各 128）。F097–F128（logsumexp 高级/数值稳定、矩阵/批/高级归一化）、G097–G128（数值稳定交叉熵、温度缩放、Gumbel-softmax、加权 CE 等）与 H 全域由 T06 一次落地：
-
-| 子域 | 指令 | 代表不变量 |
-|---|---|---|
-| **H 确定性采样·top-k/p** | H001–H032 | argmax 唯一、categorical 采样分布一致、top-k 截断 Σ=1、nucleus 累积覆盖、Gumbel-max 重参数 |
-| **H 温度·舍入** | H033–H064 | 温度除 logits、温度后 softmax Σ=1、温度保序、低温锐化熵不增、各类舍入（四舍五入/向上/向下/截断/银行家） |
-| **H INT8 对称·仿射** | H065–H096 | 对称量化 round(x/s)、仿射量化逐通道 scale/zero、反量化误差界、饱和裁剪、per-channel 守恒 |
-| **H 量化性质·高级** | H097–H128 | 量化单调、zero-point 往返、动态/静态量化、端到端 KL 有界、混合精度 |
-
-**三处 latent predicate 失败已修复**（G087 gumbel-softmax 单调 / G093 温度缩放概率单调 / H041 温度保序）：极端温度（如 T=0.0167）或大幅值 logits（如 9232）下，多个相异 logit 经 x/T 后都坠入 softmax 浮点下溢尾部（二者均≈0），严格输出序比较对数学上应为严格大于的一对失效（双零 tie）。修复为「缩放 logit 精确序 + 可解析性守卫」——softmax(z/T)_i > softmax(z/T)_j ⇔ (z_i−m)/T > (z_j−m)/T（T>0 恒精确），仅当 si−sj>1e-6 且 si>−740（未坠入下溢尾部）时才断言严格输出序：既消除假阳性，又保留对真正乱序/常量输出回归的检测力。2500 种子确定性扫描复验 0 失败。
+**零依赖约束全程保持**：无 CDN / 外链字体 / 外链图片 / ES module，图表继续用原生 canvas 手绘，`demo.html` 仍可 file:// 直开。
 
 ### v15.6 新增（L10 微指令 A–E 五域补满：八域 1024 槽位全落实，864 → 1024）
 
@@ -203,6 +190,19 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 **QA 三件套**（交付前全过）：① 32 项 × 2500 种子确定性扫描（80,000 条断言）0 失败；② 32 个变异 twin 全部被判负（每项注入一个合理漏洞，证明断言非空转）；③ 条件守卫分支激活率统计（如 D127 淘汰路径 706/800、D102 保序守卫 800/800），证明守卫被真实行使而非摆设。
 
 **修复一处真实的数值 bug（F084）**：F-norm-002.js 的 `gnNormRef`（GroupNorm 参考路径）原用简化方差公式 `v = Σx²/n − μ²`。该式数学等价但**数值病态**——「均值大、方差小」时两个相近大数相减触发**灾难性抵消**，方差精度崩塌（本例 μ≈5、组方差极小），导致用病态参考路径去验证稳定的两遍法实现时，在 2500 种子扫描中出现假红（seed 1450）。修复：参考路径改用 **Welford 在线算法**（单遍增量更新均值与 M2），既数值稳定、又与两遍法算法结构完全不同，保留交叉验证力。修复后 1024 项 × 2500 种子扫描 0 失败。**纪律沉淀：参考路径必须独立且数值稳定——不可用病态公式（简化方差/E·[X²]−μ² 类）充当验证基准。**
+
+### v15.5 新增（L10 微指令 H 域：采样与量化 128 项 + F/G 补满 128 + 三处 latent 修复）
+
+补齐八域最后一域 **H（采样与量化）** 并将 F/G 由 96 补满至 128，微指令实现数 **672 → 864**（A–E 各 96 + F/G/H 各 128）。F097–F128（logsumexp 高级/数值稳定、矩阵/批/高级归一化）、G097–G128（数值稳定交叉熵、温度缩放、Gumbel-softmax、加权 CE 等）与 H 全域由 T06 一次落地：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **H 确定性采样·top-k/p** | H001–H032 | argmax 唯一、categorical 采样分布一致、top-k 截断 Σ=1、nucleus 累积覆盖、Gumbel-max 重参数 |
+| **H 温度·舍入** | H033–H064 | 温度除 logits、温度后 softmax Σ=1、温度保序、低温锐化熵不增、各类舍入（四舍五入/向上/向下/截断/银行家） |
+| **H INT8 对称·仿射** | H065–H096 | 对称量化 round(x/s)、仿射量化逐通道 scale/zero、反量化误差界、饱和裁剪、per-channel 守恒 |
+| **H 量化性质·高级** | H097–H128 | 量化单调、zero-point 往返、动态/静态量化、端到端 KL 有界、混合精度 |
+
+**三处 latent predicate 失败已修复**（G087 gumbel-softmax 单调 / G093 温度缩放概率单调 / H041 温度保序）：极端温度（如 T=0.0167）或大幅值 logits（如 9232）下，多个相异 logit 经 x/T 后都坠入 softmax 浮点下溢尾部（二者均≈0），严格输出序比较对数学上应为严格大于的一对失效（双零 tie）。修复为「缩放 logit 精确序 + 可解析性守卫」——softmax(z/T)_i > softmax(z/T)_j ⇔ (z_i−m)/T > (z_j−m)/T（T>0 恒精确），仅当 si−sj>1e-6 且 si>−740（未坠入下溢尾部）时才断言严格输出序：既消除假阳性，又保留对真正乱序/常量输出回归的检测力。2500 种子确定性扫描复验 0 失败。
 
 ### v15.4 新增（L10 微指令 G 域：激活与损失 96 项）
 
@@ -243,6 +243,23 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 1. **交叉验证**：每条 `predicate` 都走与 `run` 不同的参考路径（如 run 正向累加、predicate 反向累加），不搞「自证」。
 2. **前置条件式放行**：涉及头数/长度合法性的项，inputs 不合法时显式放行并在 `invariant` 文本写明前置条件——不靠放宽容差制造假绿。
 
+### v15.2 新增（L10 微指令 D 域：注意力基元 96 项）
+
+补齐八域中的 **D 域（注意力基元）**，微指令实现数 **384 → 480**，覆盖注意力计算全链路的原子操作：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **打分与缩放** | D001–D012 | 点积交换/齐次/分配、Cauchy–Schwarz 上界、自点积=‖q‖²、缩放除乘一致、温度单调、YaRN mscale 公式 |
+| **掩码** | D013–D024 | 因果/滑动窗口/padding 构造正确、掩码幂等、窗口单调、与有限偏置可交换、安全 softmax 全掩回退均匀 |
+| **softmax·LSE** | D025–D032 | 行和为一、平移不变、正值、安全版=朴素版、保序、lse 平移公式、softmax=exp(s−lse) |
+| **RoPE** | D033–D044 | 逆频率公式、保范数、R(−p)∘R(p)=I、相对位置不变性、旋转复合、线性、逐对不交叉、det=1 |
+| **ALiBi** | D045–D056 | 斜率几何级数、单调、偏置=−slope·|i−j|、对角为零、非正、对称、非 2 幂头数取最近幂 |
+| **温度与信息量** | D057–D064 | 温度除乘一致、熵上界 log n、熵随温度单调、均匀分布取上界、CE=−log p[t]、CE≥0、KL≥0、JS 对称 |
+| **GQA/MQA** | D065–D078 | q→kv 头映射、组大小、MQA/MHA 退化、值域合法、映射单调、覆盖性、重复 KV 逐位一致、拼接维度守恒 |
+| **KV Cache** | D079–D096 | 追加递增、行读取一致、容量截断、滚动丢弃最旧非锚点、**sink 永不淘汰**、K/V 长度同步、清空、写不覆盖、行地址、INT8 往返硬界、长位置外推有限 |
+
+同时为 D 域新增两个输入域标签 `vecMask`（掩码 0/1 向量）与 `vecProb`（归一化为概率单纯形）、`factor1`（外推因子 ≥1，避免 mscale 开负根）。
+
 ### v15.1 新增（十层分解架构实拆 + 浏览器双端同码）
 
 引擎从「单体」拆成十层可验证积木，并把「双端一致」从口号变成**逐位可测**的硬门禁：
@@ -256,9 +273,9 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 | **L7 张量与内存** | `src/L7-tensor/*`：tensor / shape / arena（指针碰撞分配）/ kv-cache |
 | **L8 数值内核** | `src/L8-kernel/*`：matmul / reduce / quantize —— 与 legacy **逐位一致**（Δ=0），R9 契约 |
 | **L9 数值基础** | `src/L9-numbase/*`：rng（mulberry32 与 v11 同款）/ fp-ops / special / assert |
-| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**896 项已实现**（A/B/C/E 各 96 + D/F/G/H 各 128），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
+| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**1024 项已实现**（八域各 128），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
 | **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 72 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
-| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · B 96/128 · C 96/128 · D 128/128 · E 96/128 · F 128/128 · G 128/128 · H 128/128 · 合计 896/1024），不拿桩充数 |
+| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 128/128 · B 128/128 · C 128/128 · D 128/128 · E 128/128 · F 128/128 · G 128/128 · H 128/128 · 合计 1024/1024），不拿桩充数 |
 
 > **修复（历史事故）**：v12.0–v14.0 期间 `build-demo.js` 误把 6 行 Node shim（`module.exports = require(...)`）内联进 `demo.html`，浏览器 classic script 执行到 `require` 即 `ReferenceError` —— 连续三个版本 demo 全坏却无人察觉（Node 侧测试全绿掩盖了浏览器断裂）。v15.1 三处根治：① 构建期硬校验（shim 特征检测 + `GPTModel` 存在性断言，不符即 exit 1）；② 改为内联完整十层栈，浏览器与 Node 同码；③ 新增 `scripts/probe-demo.js` 无头门禁，把该类事故变成 CI 可检测失败。
 
