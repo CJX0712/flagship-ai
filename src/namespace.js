@@ -34,20 +34,27 @@ NS.__loadOrder = [
   './L10-microisa/A-scalar-000.js',
   './L10-microisa/A-scalar-001.js',
   './L10-microisa/A-scalar-002.js',
+  './L10-microisa/A-scalar-003.js',
   './L10-microisa/C-matrix-000.js',
   './L10-microisa/C-matrix-001.js',
   './L10-microisa/C-matrix-002.js',
+  './L10-microisa/C-matrix-003.js',
   './L10-microisa/B-vector-000.js',
   './L10-microisa/B-vector-001.js',
   './L10-microisa/B-vector-002.js',
+  './L10-microisa/B-vector-003.js',
   './L10-microisa/E-shape-000.js',
   './L10-microisa/E-shape-001.js',
   './L10-microisa/E-shape-002.js',
-  // L10 · D 域（注意力基元，96 项）：打分/缩放、掩码、softmax·LSE、
-  //   RoPE、ALiBi、温度与信息量、GQA/MQA 头映射、KV Cache 基元。
+  './L10-microisa/E-shape-003.js',
+  // L10 · D 域（注意力基元，128 项）：打分/缩放、掩码、softmax·LSE、
+  //   RoPE、ALiBi、温度与信息量、GQA/MQA 头映射、KV Cache 基元、
+  //   追加/滚动/增量语义复合（D097–D128 第四批：Lipschitz 界、闭合式、
+  //   平移不变、逐位一致、守卫激活率与变异 twin 全过）。
   './L10-microisa/D-attention-000.js',
   './L10-microisa/D-attention-001.js',
   './L10-microisa/D-attention-002.js',
+  './L10-microisa/D-attention-003.js',
   // L10 · F 域（归一化，128 项）：均值/方差/L2 范数、LayerNorm/RMSNorm/
   //   BatchNorm/GroupNorm/权重标准化/LRN、min-max/z-score/L1/L∞ 归一化、
   //   logsumexp 高级/数值稳定、矩阵/批归一化（F001–F096 远端 v15.3 三批 +

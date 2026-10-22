@@ -1931,6 +1931,364 @@
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
 /* ============================================================================
+ * L10 微指令 · A 域（标量算术与初等函数）· 第 4/4 批（A097–A128）
+ * ----------------------------------------------------------------------------
+ * 涵盖：数值安全与特殊函数（A097–A110：符号函数三性 / copysign / fmod 两律 /
+ *      clamp 两律 / NaN 不定式两项 / isFinite·isNaN 判定 / ulp·nextafter）、
+ *      更多初等函数（A111–A122：exp2×2 / log2×2 / cbrt 奇性 / atan2 象限×2 /
+ *      度弧度×2 / 三参 hypot / 幂与对数换底）、比较与选择（A123–A128：
+ *      min/max 四律 / clamp 三值 / 对加法次超可加）。
+ * 类别相对任务书的微调：ulp/nextafter 纳入本批（数值安全族），比较与选择
+ * 收缩为 6 项，总数仍为 32，且与 A001–A096 无重复（cbrt 只补奇性，∛(a³)
+ * 还原已由 A035 承担；hypot 只补三参，二参版已由 A036–A038 承担）。
+ * 判据：精确恒等式 Object.is（±0 经 nz 归一）；数值恒等式 relClose 1e-9。
+ * 激活类条目归 G 域，本批无 L9.special 可复用项（exp2/log2/cbrt/atan2/hypot
+ * 均为引擎内建 Math 原语，位级 nextAfter 为本批自建 helper）。
+ * K5：本文件仅用 IIFE 注入命名空间，禁用一切模块级语法（详见全局契约 K5）。
+ * ==========================================================================*/
+;(function (NS) {
+  'use strict';
+  NS.L10 = NS.L10 || {};
+  const rc = (a, b, t) => NS.L10.relClose(a, b, t);
+  function reg(i, o) { NS.L10.register('A', i, o); }
+
+  // ±0 归一：IEEE 中 -0 与 0 数值等价，逐位比对前统一为 +0。
+  const nz = (x) => (x === 0 ? 0 : x);
+
+  // nextAfter(x, up)：沿双精度可表示值格走向 ±∞ 的下一邻接值（位级实现）。
+  // 依据 IEEE 754 符号-大小序：非负数的位模式随数值递增，负数反之；±0 邻域
+  // 有保护分支（普通分支会把 ±0 的位模式加减 1 落到 NaN 区）。调用方约定
+  // 传入有限非零 x（本批两项的域均为 nonZero）。
+  const f64one = new Float64Array(1);
+  const u32pair = new Uint32Array(f64one.buffer);
+  function nextAfter(x, up) {
+    f64one[0] = x;
+    let lo = u32pair[0], hi = u32pair[1];
+    if (hi === 0 && lo === 0) return up ? Number.MIN_VALUE : -Number.MIN_VALUE;
+    if (hi === 0x80000000 && lo === 0) return up ? 0 : -Number.MIN_VALUE;
+    const neg = (hi & 0x80000000) !== 0;
+    if (neg ? up : !up) {                       // 数值减小：位模式递减
+      if (lo === 0) hi = (hi - 1) >>> 0;
+      lo = (lo - 1) >>> 0;
+    } else {                                    // 数值增大：位模式递增
+      lo = (lo + 1) >>> 0;
+      if (lo === 0) hi = (hi + 1) >>> 0;
+    }
+    u32pair[0] = lo; u32pair[1] = hi;
+    return f64one[0];
+  }
+
+  // ── 数值安全与特殊函数（A097–A110）────────────────────────────────────
+  reg(97, {
+    name: '符号 · 奇函数', intuition: '符号函数是奇函数：反向输入得反向符号（±0 归一后逐位成立，含 a=0）。',
+    math: 'sign(−a) = −sign(a)', pseudocode: 'return Math.sign(-a)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019（符号函数）', commonPitfall: 'sign(−0)=−0，须归一后逐位比对。',
+    invariant: '对所有有限 a：nz(sign(−a)) = nz(−sign(a))（含 a=0）',
+    inputs: ['a'], domains: { a: 'finite' },
+    run: (a) => Math.sign(-a), predicate: (a) => nz(Math.sign(-a)) === nz(-Math.sign(a)),
+  });
+  reg(98, {
+    name: '符号 · 乘性', intuition: '乘积的符号等于符号的乘积；任一因子为 0 时两侧同归 0。',
+    math: 'sign(a·b) = sign(a)·sign(b)', pseudocode: 'return Math.sign(a*b)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019（符号函数）', commonPitfall: 'a·b 不得下溢为 0；small 域保证 |a·b|≥2e-17，含 0 时两侧经 nz 归零。',
+    invariant: '对所有 |a|,|b|≤10：nz(sign(a·b)) = nz(sign(a)·sign(b))',
+    inputs: ['a', 'b'], domains: { a: 'small', b: 'small' },
+    run: (a, b) => Math.sign(a * b), predicate: (a, b) => nz(Math.sign(a) * Math.sign(b)) === nz(Math.sign(a * b)),
+  });
+  reg(99, {
+    name: '符号 · 原点逐位', intuition: 'sign 在原点逐位为 +0（锚定常量，供上层引用）。',
+    math: 'sign(0) = 0', pseudocode: 'return Math.sign(0)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019（符号函数）', commonPitfall: 'Math.sign(−0)=−0 与 sign(0)=+0 不同；本项只断言 +0 输入。',
+    invariant: 'Object.is(sign(0), 0)',
+    inputs: [], domains: {},
+    run: () => Math.sign(0), predicate: () => Object.is(Math.sign(0), 0),
+  });
+  reg(100, {
+    name: '符号 · copysign 模乘符号', intuition: 'copysign 取 x 的模与 y 的符号位；±0 视作正号（与 Math.sign 的 ±0 语义不同）。',
+    math: 'copysign(x,y) = sgn₁(y)·|x|', pseudocode: 'return y<0 ? -Math.abs(x) : Math.abs(x)', complexity: 'O(1)',
+    ref: 'C99 copysign；IEEE 754-2019', commonPitfall: 'Math.sign(±0)=±0，参考路径勿直接用它推符号位；±0 输入下两侧经 nz 归一。',
+    invariant: 'copysign(x,y) = sgn₁(y)·|x|（sgn₁ 把 ±0 当作正号，±0 归一逐位）',
+    inputs: ['x', 'y'], domains: { x: 'finite', y: 'finite' },
+    run: (x, y) => (y < 0 || Object.is(y, -0)) ? -Math.abs(x) : Math.abs(x),
+    predicate: (x, y) => {
+      const s = (y < 0 || Object.is(y, -0)) ? -1 : 1;
+      const c = s < 0 ? -Math.abs(x) : Math.abs(x);
+      return Object.is(nz(c), nz(s * Math.abs(x)));
+    },
+  });
+  reg(101, {
+    name: '取模 · fmod 符号随被除数', intuition: 'fmod 余数符号跟随被除数（区别于向偶取整的 remainder），且 |余数|≤|除数|、商为整数。',
+    math: 'fmod(a,b) = a − b·trunc(a/b)，符号随 a', pseudocode: 'return a - b*Math.trunc(a/b)', complexity: 'O(1)',
+    ref: 'C99 fmod；IEEE 754-2019', commonPitfall: 'b 不可为 0；朴素公式在可生成域内无跨整数舍入（a/b 为有界整数比，已证 fl 不越过整数边界）。',
+    invariant: '对 a∈ℝ, b≠0：fmod=0 ∨ sign(fmod)=sign(a)，且 |fmod|≤|b| 且商为整数',
+    inputs: ['a', 'b'], domains: { a: 'finite', b: 'nonZero' },
+    run: (a, b) => a - b * Math.trunc(a / b),
+    predicate: (a, b) => {
+      const q = Math.trunc(a / b);
+      const r = a - b * q;
+      return (r === 0 || Math.sign(r) === Math.sign(a)) && Math.abs(r) <= Math.abs(b) && Number.isInteger(q);
+    },
+  });
+  reg(102, {
+    name: '取模 · fmod 自模为零', intuition: '任何非零数以自身为模，余数精确为 0（IEEE 下 a/a 精确为 1）。',
+    math: 'fmod(a,a) = 0', pseudocode: 'return a - a*Math.trunc(a/a)', complexity: 'O(1)',
+    ref: 'C99 fmod；IEEE 754-2019', commonPitfall: 'a 不可为 0（0/0=NaN）；a/a 精确为 1 是关键中间事实。',
+    invariant: '对 a≠0：a/a=1 且 fmod(a,a)=0',
+    inputs: ['a'], domains: { a: 'nonZero' },
+    run: (a) => a - a * Math.trunc(a / a),
+    predicate: (a) => { const q = a / a; return q === 1 && a - a * Math.trunc(q) === 0; },
+  });
+  reg(103, {
+    name: '饱和 · clamp 夹取/幂等/分段一致', intuition: 'clamp 把输入夹进 [0,1]：结果夹取、对自身幂等，且与分段定义逐位一致。',
+    math: 'clamp(a) = min(max(a,0),1) = (a<0 ? 0 : a>1 ? 1 : a)', pseudocode: 'return Math.min(Math.max(a,0),1)', complexity: 'O(1)',
+    ref: '饱和运算（DSP）；序理论', commonPitfall: '嵌套 min/max 与分段定义在 0/1 边界须逐位一致；域不产生 −0。',
+    invariant: 'clamp(a)∈[0,1] ∧ clamp(clamp(a))=clamp(a) ∧ clamp(a)=分段定义(a)',
+    inputs: ['a'], domains: { a: 'finite' },
+    run: (a) => Math.min(Math.max(a, 0), 1),
+    predicate: (a) => {
+      const c = Math.min(Math.max(a, 0), 1);
+      const p = a < 0 ? 0 : (a > 1 ? 1 : a);
+      return Object.is(c, p) && Object.is(Math.min(Math.max(c, 0), 1), c) && c >= 0 && c <= 1;
+    },
+  });
+  reg(104, {
+    name: '饱和 · clamp 保序', intuition: 'clamp 保序：输入有序则输出有序（min/max 的单调性逐位保持）。',
+    math: 'a ≤ b ⇒ clamp(a) ≤ clamp(b)', pseudocode: 'return Math.min(Math.max(a,0),1)', complexity: 'O(1)',
+    ref: '饱和运算（DSP）；单调函数', commonPitfall: '判据用蕴含式，恒真；run 只取首参（同 A055 先例）。',
+    invariant: '∀a,b：(a≤b) ⇒ clamp(a)≤clamp(b)',
+    inputs: ['a', 'b'], domains: { a: 'finite', b: 'finite' },
+    run: (a) => Math.min(Math.max(a, 0), 1),
+    predicate: (a, b) => (a <= b) ? Math.min(Math.max(a, 0), 1) <= Math.min(Math.max(b, 0), 1) : true,
+  });
+  reg(105, {
+    name: 'NaN · 零乘无穷', intuition: '0 乘无穷是 IEEE 不定式，产生 NaN（∞ 由 2^1024 溢出构造，域内无 Inf 输入）。',
+    math: '0 · ∞ = NaN', pseudocode: 'return 0 * Math.pow(10,400)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 §6.2（不定式）', commonPitfall: 'run 与谓词用不同溢出表达式（10^400 与 2^1024）互为参考路径。',
+    invariant: 'Number.isNaN(0·∞)',
+    inputs: [], domains: {},
+    run: () => 0 * Math.pow(10, 400), predicate: () => Number.isNaN(0 * Math.pow(2, 1024)),
+  });
+  reg(106, {
+    name: 'NaN · 无穷相减', intuition: '无穷减无穷是不定式产生 NaN；对照：无穷加无穷仍是无穷（非 NaN）。',
+    math: '∞ − ∞ = NaN', pseudocode: 'return Math.pow(10,400) - Math.pow(10,400)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 §6.2（不定式）', commonPitfall: '对照项 ∞+∞=∞ 用于排除「凡涉 ∞ 皆 NaN」的误判。',
+    invariant: 'Number.isNaN(∞−∞) ∧ ¬Number.isNaN(∞+∞)',
+    inputs: [], domains: {},
+    run: () => Math.pow(10, 400) - Math.pow(10, 400),
+    predicate: () => Number.isNaN(Math.pow(2, 1024) - Math.pow(2, 1024)) && !Number.isNaN(Math.pow(2, 1024) + Math.pow(2, 1024)),
+  });
+  reg(107, {
+    name: '判定 · isFinite 识别溢出', intuition: '有限数乘大常量必溢出为 ±Inf（a=0 时为 NaN），isFinite 一律判定为假。',
+    math: 'a 有限 ⇒ ¬isFinite(a·∞)', pseudocode: 'return a * Math.pow(2,1024)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019；C99 isfinite', commonPitfall: 'a=0 时 0·∞=NaN 亦非有限，判定同为假。',
+    invariant: '对所有有限 a：isFinite(a·2^1024) = false',
+    inputs: ['a'], domains: { a: 'finite' },
+    run: (a) => a * Math.pow(2, 1024),
+    predicate: (a) => Number.isFinite(a * Math.pow(2, 1024)) === false,
+  });
+  reg(108, {
+    name: '判定 · isNaN 有限运算闭合', intuition: '有限数的加/乘/平方根永不产生 NaN——NaN 只来自不定式，这是调试 NaN 的第一道筛子。',
+    math: '¬isNaN(a+a) ∧ ¬isNaN(a·a) ∧ ¬isNaN(√(a²))', pseudocode: 'return Number.isNaN(a+a)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019；C99 isnan', commonPitfall: '谓词同时覆盖 +/×/√ 三条闭合路径，避免单项碰巧为真。',
+    invariant: '对所有有限 a：a+a、a·a、√(a²) 皆非 NaN',
+    inputs: ['a'], domains: { a: 'finite' },
+    run: (a) => Number.isNaN(a + a),
+    predicate: (a) => Number.isNaN(a + a) === false && Number.isNaN(a * a) === false && Number.isNaN(Math.sqrt(a * a)) === false,
+  });
+  reg(109, {
+    name: '精度 · ulp 为 2 的幂', intuition: '相邻两双精度的间距即 ulp，必为 2 的幂：ulp(x)=2^(e−52)，其中 2^e≤|x|<2^(e+1)。',
+    math: 'ulp(x) = 2^(e−52)', pseudocode: 'return nextAfter(x,+∞) - x', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 nextAfter；Muller et al. 2010', commonPitfall: '位级 nextAfter 避免 log2 在 2 的幂边界的不确定舍入；x 不可为 0（ulp(0) 另有约定）。',
+    invariant: 'ulp(x) = 2^(e−52)：g·2^52 ≤ |x| < g·2^53（g=ulp(x)>0）',
+    inputs: ['x'], domains: { x: 'nonZero' },
+    run: (x) => nextAfter(x, true) - x,
+    predicate: (x) => {
+      const g = nextAfter(x, true) - x;
+      return g > 0 && g * Math.pow(2, 52) <= Math.abs(x) && Math.abs(x) < g * Math.pow(2, 53);
+    },
+  });
+  reg(110, {
+    name: '精度 · nextafter 方向可逆', intuition: 'nextafter 在双精度格上向 ±∞ 各严格走一步，且上下往返逐位还原（格上的双射）。',
+    math: 'nextafter(x,+∞) > x > nextafter(x,−∞)', pseudocode: 'return nextAfter(x,+∞)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 nextAfter；Muller et al. 2010', commonPitfall: '域排除 ±0/Inf/NaN 边界（位模式加减 1 在那些点会落到 NaN 区，helper 内有保护分支）。',
+    invariant: 'nextafter(x,+∞) > x ∧ nextafter(x,−∞) < x ∧ 往返逐位还原',
+    inputs: ['x'], domains: { x: 'nonZero' },
+    run: (x) => nextAfter(x, true),
+    predicate: (x) => nextAfter(x, true) > x && nextAfter(x, false) < x && nextAfter(nextAfter(x, true), false) === x,
+  });
+
+  // ── 更多初等函数（A111–A122）──────────────────────────────────────────
+  reg(111, {
+    name: '指数 · exp2 加法转乘法', intuition: '以 2 为底的指数把加法转乘法（指数律）。',
+    math: '2^(a+b) = 2^a · 2^b', pseudocode: 'return Math.pow(2,a+b)', complexity: 'O(1)',
+    ref: '指数律；Abramowitz & Stegun 1964', commonPitfall: '两条路径舍入不同，需容差；small 域保证 2^(a+b) 不溢出。',
+    invariant: 'relClose(2^(a+b), 2^a·2^b, 1e-9)',
+    inputs: ['a', 'b'], domains: { a: 'small', b: 'small' },
+    run: (a, b) => Math.pow(2, a + b),
+    predicate: (a, b) => rc(Math.pow(2, a + b), Math.pow(2, a) * Math.pow(2, b), 1e-9),
+  });
+  reg(112, {
+    name: '指数 · exp2 对数还原', intuition: 'log2 与 2 的幂互为反函数（近似还原）。',
+    math: 'log2(2^a) = a', pseudocode: 'return Math.log2(Math.pow(2,a))', complexity: 'O(1)',
+    ref: '反函数关系；A&S 1964', commonPitfall: 'pow 与 log2 双重舍入，需容差；small 域避免 exp 端溢出。',
+    invariant: 'relClose(log2(2^a), a, 1e-9)',
+    inputs: ['a'], domains: { a: 'small' },
+    run: (a) => Math.log2(Math.pow(2, a)),
+    predicate: (a) => rc(Math.log2(Math.pow(2, a)), a, 1e-9),
+  });
+  reg(113, {
+    name: '对数 · log2 乘积转求和', intuition: '以 2 为底的对数把乘法转加法。',
+    math: 'log2(a·b) = log2 a + log2 b', pseudocode: 'return Math.log2(a*b)', complexity: 'O(1)',
+    ref: '对数律；A&S 1964', commonPitfall: 'a,b 须 >0；先乘后取对数与分别取对数再相加舍入不同，需容差。',
+    invariant: '对 a,b>0：relClose(log2(ab), log2 a+log2 b, 1e-9)',
+    inputs: ['a', 'b'], domains: { a: 'pos', b: 'pos' },
+    run: (a, b) => Math.log2(a * b),
+    predicate: (a, b) => rc(Math.log2(a * b), Math.log2(a) + Math.log2(b), 1e-9),
+  });
+  reg(114, {
+    name: '对数 · log2 的 2 幂精确', intuition: 'log2 对 2 的整数次幂逐位精确（引擎已证实），可作上层锚点。',
+    math: 'log2(2^k) = k', pseudocode: 'return Math.log2(1)', complexity: 'O(1)',
+    ref: 'A&S 1964；对数定义', commonPitfall: '仅断言 2 的幂输入（k=0,1,10,−10），非幂输入不保证逐位。',
+    invariant: 'Object.is(log2(2^k), k)（k=0,1,10,−10）',
+    inputs: [], domains: {},
+    run: () => Math.log2(1),
+    predicate: () => Object.is(Math.log2(1), 0) && Object.is(Math.log2(2), 1) && Object.is(Math.log2(1024), 10) && Object.is(Math.log2(1 / 1024), -10),
+  });
+  reg(115, {
+    name: '根式 · cbrt 奇函数', intuition: '立方根是奇函数：奇次根对负数同样成立（与 A035 的立方还原互补）。',
+    math: 'cbrt(−a) = −cbrt(a)', pseudocode: 'return Math.cbrt(-a)', complexity: 'O(1)',
+    ref: 'IEEE 754 cbrt（奇函数性）', commonPitfall: '∛(a³)≈a 已由 A035 承担，本项只补奇性；small 域远离大数相消。',
+    invariant: 'relClose(cbrt(−a), −cbrt(a), 1e-9)',
+    inputs: ['a'], domains: { a: 'small' },
+    run: (a) => Math.cbrt(-a), predicate: (a) => rc(Math.cbrt(-a), -Math.cbrt(a), 1e-9),
+  });
+  reg(116, {
+    name: '三角 · atan2 右半平面', intuition: 'x>0 时四象限反正切退化为普通 atan(y/x)（右半平面无极角跳变）。',
+    math: 'atan2(y,x) = atan(y/x)（x>0）', pseudocode: 'return Math.atan2(y,x)', complexity: 'O(1)',
+    ref: 'atan2 定义（C99/IEEE 754-2019）', commonPitfall: 'x 须 >0；y/x 不得溢出（域保证 |y/x|≤1e10）；y=0 时两侧同为 0。',
+    invariant: '对 x>0：relClose(atan2(y,x), atan(y/x), 1e-9)',
+    inputs: ['y', 'x'], domains: { y: 'finite', x: 'pos' },
+    run: (y, x) => Math.atan2(y, x),
+    predicate: (y, x) => rc(Math.atan2(y, x), Math.atan(y / x), 1e-9),
+  });
+  reg(117, {
+    name: '三角 · atan2 对跖点', intuition: '对跖点 (−y,−x) 与 (y,x) 的方向相差 π，正负由 y 的符号决定。',
+    math: 'atan2(−y,−x) = atan2(y,x) − sign(y)·π', pseudocode: 'return Math.atan2(-y,-x)', complexity: 'O(1)',
+    ref: 'atan2 定义（C99/IEEE 754-2019）', commonPitfall: 'y=0 时关系退化为 ±π 边界（atan2(±0,负)=±π），故 y 取 nonZero。',
+    invariant: '对 x>0, y≠0：relClose(atan2(−y,−x), atan2(y,x)−sign(y)·π, 1e-9)',
+    inputs: ['y', 'x'], domains: { y: 'nonZero', x: 'pos' },
+    run: (y, x) => Math.atan2(-y, -x),
+    predicate: (y, x) => rc(Math.atan2(-y, -x), Math.atan2(y, x) - Math.sign(y) * Math.PI, 1e-9),
+  });
+  reg(118, {
+    name: '角度 · 度弧度往返重建', intuition: '度转弧度后经 sin/cos 重建可还原角度——独立校验 π/180 换算常数。',
+    math: 'atan2(sin θ, cos θ) = θ，θ = d·π/180', pseudocode: 'return d * Math.PI / 180', complexity: 'O(1)',
+    ref: '弧度定义（弧长/半径）', commonPitfall: 'small 域保证 θ∈(−π/18,π/18]⊂(−π,π]，atan2 才能还原主值；该路径能抓出错的换算常数。',
+    invariant: 'relClose(d·π/180, atan2(sin(d·π/180), cos(d·π/180)), 1e-9)',
+    inputs: ['d'], domains: { d: 'small' },
+    run: (d) => d * Math.PI / 180,
+    predicate: (d) => { const t = d * Math.PI / 180; return rc(t, Math.atan2(Math.sin(t), Math.cos(t)), 1e-9); },
+  });
+  reg(119, {
+    name: '角度 · 度弧度特殊角', intuition: '30°/60°/45° 的正、余弦、切是精确已知值，同时校验度表达式与弧度表达式两条路径。',
+    math: 'sin 30° = cos 60° = ½；tan 45° = 1', pseudocode: 'return Math.sin(30*Math.PI/180)', complexity: 'O(1)',
+    ref: 'A&S 1964（特殊角）', commonPitfall: '30·π/180 与 π/6 的舍入路径不同，两侧都须落入 1e-9。',
+    invariant: 'sin30°=½ ∧ sin(π/6)=½ ∧ cos60°=½ ∧ tan45°=1',
+    inputs: [], domains: {},
+    run: () => Math.sin(30 * Math.PI / 180),
+    predicate: () => rc(Math.sin(30 * Math.PI / 180), 0.5, 1e-9) && rc(Math.sin(Math.PI / 6), 0.5, 1e-9) && rc(Math.cos(60 * Math.PI / 180), 0.5, 1e-9) && rc(Math.tan(45 * Math.PI / 180), 1, 1e-9),
+  });
+  reg(120, {
+    name: '范数 · 三参 hypot 等价定义', intuition: '三参 hypot 是 √(a²+b²+c²) 的稳定实现（A036–A038 二参版的三参推广）。',
+    math: 'hypot(a,b,c) = √(a²+b²+c²)', pseudocode: 'return Math.hypot(a,b,c)', complexity: 'O(1)',
+    ref: 'C99 hypot；Goldberg 1991', commonPitfall: '两条路径舍入不同，需容差；small 域保证平方和不过大。',
+    invariant: 'relClose(hypot(a,b,c), √(a²+b²+c²), 1e-9)',
+    inputs: ['a', 'b', 'c'], domains: { a: 'small', b: 'small', c: 'small' },
+    run: (a, b, c) => Math.hypot(a, b, c),
+    predicate: (a, b, c) => rc(Math.hypot(a, b, c), Math.sqrt(a * a + b * b + c * c), 1e-9),
+  });
+  reg(121, {
+    name: '幂 · 换底为自然指数', intuition: '幂运算可换底为自然指数：a^b = exp(b·ln a)。',
+    math: 'a^b = exp(b·ln a)', pseudocode: 'return Math.pow(a,b)', complexity: 'O(1)',
+    ref: '换底公式；A&S 1964', commonPitfall: 'a 须 >0；两条路径双重舍入需容差；域保证 |b·ln a|≤92 不溢出。',
+    invariant: '对 a>0：relClose(pow(a,b), exp(b·ln a), 1e-9)',
+    inputs: ['a', 'b'], domains: { a: 'pos', b: 'small' },
+    run: (a, b) => Math.pow(a, b),
+    predicate: (a, b) => rc(Math.pow(a, b), Math.exp(b * Math.log(a)), 1e-9),
+  });
+  reg(122, {
+    name: '对数 · 换底还原', intuition: '以 b 为底取对数后再幂运算必须还原 a：b^(ln a/ln b)=a。',
+    math: 'b^(log_b a) = a', pseudocode: 'return Math.log(a)/Math.log(b)', complexity: 'O(1)',
+    ref: '换底公式；A&S 1964', commonPitfall: 'b=1 时 ln b=0 不可取（pos 连续域不会精确取到 1）；指数与 ln b 的乘积由 |ln a| 定界，不溢出。',
+    invariant: '对 a,b>0：relClose(pow(b, ln a/ln b), a, 1e-9)',
+    inputs: ['a', 'b'], domains: { a: 'pos', b: 'pos' },
+    run: (a, b) => Math.log(a) / Math.log(b),
+    predicate: (a, b) => rc(Math.pow(b, Math.log(a) / Math.log(b)), a, 1e-9),
+  });
+
+  // ── 比较与选择（A123–A128）────────────────────────────────────────────
+  reg(123, {
+    name: '比较 · min/max 交换律', intuition: 'min/max 是精确选择运算，交换参数逐位不变。',
+    math: 'min(a,b)=min(b,a) ∧ max(a,b)=max(b,a)', pseudocode: 'return Math.min(a,b)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 min/max；格论', commonPitfall: 'min/max 不做算术只做选择，故无舍入；±0 视作相等（域不产生 −0）。',
+    invariant: 'Object.is(min(a,b), min(b,a)) ∧ Object.is(max(a,b), max(b,a))',
+    inputs: ['a', 'b'], domains: { a: 'finite', b: 'finite' },
+    run: (a, b) => Math.min(a, b),
+    predicate: (a, b) => Object.is(Math.min(a, b), Math.min(b, a)) && Object.is(Math.max(a, b), Math.max(b, a)),
+  });
+  reg(124, {
+    name: '比较 · min/max 结合律', intuition: 'min/max 满足格结合律，嵌套顺序无关。',
+    math: 'min(min(a,b),c)=min(a,min(b,c))', pseudocode: 'return Math.min(Math.min(a,b),c)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 min/max；格论（Birkhoff 1948）', commonPitfall: '逐位成立（选择运算无舍入）；与浮点加法的不可结合性对照。',
+    invariant: 'min/max 结合律逐位成立',
+    inputs: ['a', 'b', 'c'], domains: { a: 'finite', b: 'finite', c: 'finite' },
+    run: (a, b, c) => Math.min(Math.min(a, b), c),
+    predicate: (a, b, c) => Object.is(Math.min(Math.min(a, b), c), Math.min(a, Math.min(b, c))) && Object.is(Math.max(Math.max(a, b), c), Math.max(a, Math.max(b, c))),
+  });
+  reg(125, {
+    name: '比较 · min/max 幂等', intuition: 'min/max 对同一输入幂等，逐位还原。',
+    math: 'min(a,a)=a ∧ max(a,a)=a', pseudocode: 'return Math.min(a,a)', complexity: 'O(1)',
+    ref: 'IEEE 754-2019 min/max；格论', commonPitfall: 'NaN 输入会传播（min(NaN,a)=NaN），但域限定有限。',
+    invariant: 'Object.is(min(a,a), a) ∧ Object.is(max(a,a), a)',
+    inputs: ['a'], domains: { a: 'finite' },
+    run: (a) => Math.min(a, a),
+    predicate: (a) => Object.is(Math.min(a, a), a) && Object.is(Math.max(a, a), a),
+  });
+  reg(126, {
+    name: '比较 · min/max 对偶', intuition: 'min 与 max 经取反对偶：min(a,b)=−max(−a,−b)。',
+    math: 'min(a,b)=−max(−a,−b) ∧ max(a,b)=−min(−a,−b)', pseudocode: 'return Math.min(a,b)', complexity: 'O(1)',
+    ref: '格论（序对偶）；IEEE 754-2019', commonPitfall: '取反与选择皆精确，故逐位；±0 经 nz 归一（−0 与 0 等价）。',
+    invariant: 'nz(min(a,b))=nz(−max(−a,−b)) ∧ nz(max(a,b))=nz(−min(−a,−b))',
+    inputs: ['a', 'b'], domains: { a: 'finite', b: 'finite' },
+    run: (a, b) => Math.min(a, b),
+    predicate: (a, b) => Object.is(nz(Math.min(a, b)), nz(-Math.max(-a, -b))) && Object.is(nz(Math.max(a, b)), nz(-Math.min(-a, -b))),
+  });
+  reg(127, {
+    name: '饱和 · clamp 三值两定义一致', intuition: '三值夹取的两种格定义（先夹上界再夹下界 / 先夹下界再夹上界）必须逐位一致。',
+    math: 'min(max(a,lo),hi) = max(lo,min(a,hi))（lo≤hi）', pseudocode: 'return Math.min(Math.max(a,lo),lo+d)', complexity: 'O(1)',
+    ref: '序理论（格分配性）；饱和运算', commonPitfall: '上界由 lo+d 构造以保证 lo≤hi（TAGS 无有序二元域，直接给 lo/hi 会有 lo>hi 的反例）。',
+    invariant: '两定义 nz 归一逐位一致 ∧ 结果 ∈ [lo, lo+d]',
+    inputs: ['a', 'lo', 'd'], domains: { a: 'finite', lo: 'finite', d: 'nonNeg' },
+    run: (a, lo, d) => Math.min(Math.max(a, lo), lo + d),
+    predicate: (a, lo, d) => {
+      const hi = lo + d;
+      const c1 = Math.min(Math.max(a, lo), hi);
+      const c2 = Math.max(lo, Math.min(a, hi));
+      return Object.is(nz(c1), nz(c2)) && c1 >= lo && c1 <= hi;
+    },
+  });
+  reg(128, {
+    name: '比较 · min/max 对加法次/超可加', intuition: 'min 对加法次可加、max 超可加；FP 下因正确舍入的单调性仍严格成立，无需容差。',
+    math: 'min(a,b)+min(c,d) ≤ min(a+c,b+d)；max 反向', pseudocode: 'return Math.min(a,b)+Math.min(c,d)', complexity: 'O(1)',
+    ref: '不等式理论；IEEE 754-2019（舍入单调性）', commonPitfall: '证明关键：m+n≤a+c（实数）⇒ fl(m+n)≤fl(a+c)（舍入单调），故 FP 下不退化。',
+    invariant: 'min(a,b)+min(c,d) ≤ min(a+c,b+d) ∧ max(a,b)+max(c,d) ≥ max(a+c,b+d)',
+    inputs: ['a', 'b', 'c', 'd'], domains: { a: 'finite', b: 'finite', c: 'finite', d: 'finite' },
+    run: (a, b, c, d) => Math.min(a, b) + Math.min(c, d),
+    predicate: (a, b, c, d) => Math.min(a, b) + Math.min(c, d) <= Math.min(a + c, b + d) && Math.max(a, b) + Math.max(c, d) >= Math.max(a + c, b + d),
+  });
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* ============================================================================
  * L10 微指令 · C 域（矩阵/张量运算）· 第 1/3 批（C001–C032）
  * ----------------------------------------------------------------------------
  * 所属层：L10-microIsa  域：C（矩阵/张量）
@@ -2721,6 +3079,521 @@
     ref: 'Nair & Hinton 2010', commonPitfall: '无', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4,4] },
     run: (A) => mrelu(mabs(A, 16), 16), predicate: (A) => meq(mrelu(mabs(A, 16), 16), mabs(A, 16)),
+  });
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* ============================================================================
+ * L10 微指令 · C 域（矩阵/张量运算）· 第 4/4 批（C097–C128）
+ * ----------------------------------------------------------------------------
+ * 所属层：L10-microIsa  域：C（矩阵/张量）
+ * 允许依赖的层：L8（matmul/reduce）、L9（special）、L10（registry/invariant/mh）；
+ *              C124 行切片在调用期惰性复用 NS.L7.tensor.slice/contiguous
+ *              （本文件先于 L7 求值，故不在模块顶层捕获，同 E 域先例）。
+ * 主要 @ref：Horn & Johnson (1985)（行列式/特征值/三角结构）；Vieta（根和
+ *           定理）；Bridle (1990)（softmax）；NumPy（拼接/切片/pad 语义）。
+ *
+ * 涵盖：矩阵结构与行列式（C097–C108）、归约进阶（C109–C120）、
+ *       张量操作（C121–C128）。至此 C 域 128 槽位满额（T07）。
+ * 矩阵以 Float64Array 行优先（K1），输入维度由 op.matrixDims 精确声明。
+ * 整数域（matInt）下的恒等逐位精确（±0 归一 Object.is，r=4 时除以 4 为
+ * 幂二故方差/均值路径亦精确）；含 exp/log/开方的数值断言用 relClose(1e-9)。
+ * 复用清单（零重写）：matmul → NS.L8.matmul；softmaxRows → NS.L8.reduce；
+ *   logsumexp2 → NS.L9.special；转置/缩放/全1等 → NS.L10.mh；
+ *   行切片 → NS.L7.tensor.slice+contiguous。det/拼接/pad/对角提取在 L7/L8
+ *   无裸矩阵内核，于本文件本地实现（谓词走独立参考路径）。
+ * ==========================================================================*/
+;(function (NS) {
+  'use strict';
+  NS.L10 = NS.L10 || {};
+  const M = NS.L8.matmul, R = NS.L8.reduce, SP = NS.L9.special, L10 = NS.L10;
+  const mh = L10.mh;
+  function reg(i, o) { NS.L10.register('C', i, o); }
+  const { Z, madd, msub, mscale, mneg, mabs, mrelu, mclamp, emp, msq, trans, id, ones, allIn, sumAll, fro, colSum, meq } = mh;
+  const rc = (a, b, t) => NS.L10.relClose(a, b, t);
+  const z0 = (v) => v === 0 || v === -0; // ±0 归一判零（IEEE 中 −0 与 0 数值等价）
+
+  // ── 本地助手（L7/L8 无对应裸矩阵内核）─────────────────────────────────
+  // 行列式：2×2 公式；3×3 沿首行余子式展开（固定规模 O(1)）。
+  function det2(A) { return A[0] * A[3] - A[1] * A[2]; }
+  function det3(A) {
+    return A[0] * (A[4] * A[8] - A[5] * A[7]) - A[1] * (A[3] * A[8] - A[5] * A[6]) + A[2] * (A[3] * A[7] - A[4] * A[6]);
+  }
+  // 结构投影：取对角/上三角/下三角部分（另一侧写 +0）。
+  function diagPart(A, n) { const o = Z(n, n); for (let i = 0; i < n; i++) o[i * n + i] = A[i * n + i]; return o; }
+  function triuPart(A, n) { const o = Float64Array.from(A); for (let i = 0; i < n; i++) for (let j = 0; j < i; j++) o[i * n + j] = 0; return o; }
+  function trilPart(A, n) { const o = Float64Array.from(A); for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) o[i * n + j] = 0; return o; }
+  // 结构判定（±0 归一后与定义逐位比对）。
+  function isSym(A, n) {
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      let x = A[i * n + j], y = A[j * n + i];
+      if (x === 0) x = 0; if (y === 0) y = 0;
+      if (x !== y) return false;
+    }
+    return true;
+  }
+  function isAnti(A, n) {
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      let x = A[i * n + j], y = -A[j * n + i];
+      if (x === 0) x = 0; if (y === 0) y = 0;
+      if (x !== y) return false;
+    }
+    return true;
+  }
+  function isUpperTri(A, n) { for (let i = 0; i < n; i++) for (let j = 0; j < i; j++) if (!z0(A[i * n + j])) return false; return true; }
+  function isLowerTri(A, n) { for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (!z0(A[i * n + j])) return false; return true; }
+  // 张量结构操作。
+  function vcat(A, B, r, c) { const o = new Float64Array(2 * r * c); o.set(A, 0); o.set(B, r * c); return o; }
+  function hcat(A, B, r, c1, c2) {
+    const o = new Float64Array(r * (c1 + c2));
+    for (let i = 0; i < r; i++) {
+      const s = i * (c1 + c2);
+      o.set(A.subarray(i * c1, i * c1 + c1), s);
+      o.set(B.subarray(i * c2, i * c2 + c2), s + c1);
+    }
+    return o;
+  }
+  function rowSlice(A, r, c, s, e) {
+    const t = NS.L7.tensor.fromFlat(A, [r, c]);          // 惰性引用：调用期 L7 已加载
+    return NS.L7.tensor.contiguous(NS.L7.tensor.slice(t, 0, s, e)).data;
+  }
+  function diagOf(A, n) { const o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = A[i * n + i]; return o; }
+  function padTo(A, r, c, R2, C2) {
+    const o = new Float64Array(R2 * C2);
+    for (let i = 0; i < r; i++) o.set(A.subarray(i * c, i * c + c), i * C2);
+    return o;
+  }
+  // 归约助手：perColSum 跨行累加（各列和，复用 L8 rowSum）；perRowSum 跨列累加（各行和，复用 mh.colSum）。
+  const perColSum = (A, r, c) => R.rowSum(A, r, c);
+  const perRowSum = (A, r, c) => mh.colSum(A, r, c);
+  function cumsumRows(A, r, c) {
+    const o = new Float64Array(r * c);
+    for (let i = 0; i < r; i++) { const b = i * c; let s = 0; for (let j = 0; j < c; j++) { s += A[b + j]; o[b + j] = s; } }
+    return o;
+  }
+  // 列 softmax = 转置的行 softmax 再转置（复用 L8 softmaxRows）。
+  function colSoftmax(A, r, c) { return trans(R.softmaxRows(trans(A, r, c), c, r), c, r); }
+  // argmax：并列取第一个最大位置。
+  function argmaxRow(A, r, c) {
+    const idx = new Int32Array(r);
+    for (let i = 0; i < r; i++) { const o = i * c; let m = 0; for (let j = 1; j < c; j++) if (A[o + j] > A[o + m]) m = j; idx[i] = m; }
+    return idx;
+  }
+  function argmaxCol(A, r, c) {
+    const idx = new Int32Array(c);
+    for (let j = 0; j < c; j++) { let m = 0; for (let i = 1; i < r; i++) if (A[i * c + j] > A[m * c + j]) m = i; idx[j] = m; }
+    return idx;
+  }
+  // 行 log-sum-exp：折叠 L9 logsumexp2（数值稳定）。
+  function rowLSE(A, r, c) {
+    const o = new Float64Array(r);
+    for (let i = 0; i < r; i++) { const b = i * c; let acc = A[b]; for (let j = 1; j < c; j++) acc = SP.logsumexp2(acc, A[b + j]); o[i] = acc; }
+    return o;
+  }
+  function colMinMax(A, r, c) {
+    const mn = new Float64Array(c), mx = new Float64Array(c);
+    for (let j = 0; j < c; j++) {
+      let lo = A[j], hi = A[j];
+      for (let i = 1; i < r; i++) { const v = A[i * c + j]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      mn[j] = lo; mx[j] = hi;
+    }
+    return { min: mn, max: mx };
+  }
+  // 总体方差（除以个数）。本批一律 r=4（幂二），整数域下均值/偏差/平方/求和全程精确。
+  function colVar(A, r, c) {
+    const mu = perColSum(A, r, c);
+    const o = new Float64Array(c);
+    for (let j = 0; j < c; j++) {
+      const m = mu[j] / r;
+      let s = 0;
+      for (let i = 0; i < r; i++) { const d = A[i * c + j] - m; s += d * d; }
+      o[j] = s / r;
+    }
+    return o;
+  }
+  function rowVar(X, r, c) {
+    const o = new Float64Array(r);
+    for (let i = 0; i < r; i++) {
+      const b = i * c;
+      let s = 0;
+      for (let j = 0; j < c; j++) s += X[b + j];
+      const m = s / c;
+      let v = 0;
+      for (let j = 0; j < c; j++) { const d = X[b + j] - m; v += d * d; }
+      o[i] = v / c;
+    }
+    return o;
+  }
+  const THREES = mscale(3, ones(4, 5), 20); // 全 3 矩阵（4×5），供平移不变性对照
+  const DIAG235 = (() => { const o = Z(3, 3); o[0] = 2; o[4] = 3; o[8] = 5; return o; })(); // diag(2,3,5)
+
+  // ── 矩阵结构与行列式（C097–C108）──────────────────────────────────────
+  reg(97, {
+    name: 'det 2×2 · 公式定义', intuition: '2×2 行列式等于主对角线积减副对角线积（ad−bc）。',
+    math: 'det([[a,b],[c,d]]) = ad − bc', pseudocode: 'return det2(A)', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '副对角线项符号为负。', invariant: '逐位 Object.is（整数域）',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
+    run: (A) => det2(A),
+    predicate: (A) => { let acc = 0; acc += A[0] * A[3]; acc -= A[1] * A[2]; return meq(det2(A), acc); },
+  });
+  reg(98, {
+    name: 'det · 转置不变', intuition: '行列式对转置不变：det(Aᵀ) = det(A)（逐位）。',
+    math: 'det(Aᵀ) = det(A)', pseudocode: 'return det2(Aᵀ)', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '无。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
+    run: (A) => det2(trans(A, 2, 2)), predicate: (A) => meq(det2(trans(A, 2, 2)), det2(A)),
+  });
+  reg(99, {
+    name: 'det · 单位阵等于 1', intuition: '单位阵行列式为 1（矩阵乘的单位元）。',
+    math: 'det(I₂) = 1', pseudocode: 'return det2(I)', complexity: 'O(1)',
+    ref: '线性代数', commonPitfall: '无。', invariant: 'Object.is(det(I₂), 1)',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
+    run: () => det2(id(2)), predicate: () => Object.is(det2(id(2)), 1),
+  });
+  reg(100, {
+    name: 'det · 对角阵等于对角线积', intuition: '对角阵行列式等于对角线元素之积（3×3，从输入提取对角块验证）。',
+    math: 'det(diag(d₀,d₁,d₂)) = d₀d₁d₂', pseudocode: 'return det3(diagPart(A))', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '非对角项必须精确为 0。', invariant: '逐位 Object.is（整数域）',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
+    run: (A) => det3(diagPart(A, 3)),
+    predicate: (A) => { const D = diagPart(A, 3); return meq(det3(D), D[0] * D[4] * D[8]); },
+  });
+  reg(101, {
+    name: 'det · 乘积性（2×2 精确）', intuition: 'det(AB) = det(A)·det(B)；整数域两侧皆为精确整数（≤8e12 < 2⁵³），逐位相等。',
+    math: 'det(AB) = det(A)det(B)', pseudocode: 'return det2(A·B)', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '更大规模会溢出精确整数区，故限 2×2。', invariant: '逐位 Object.is',
+    inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 2], B: [2, 2] },
+    run: (A, B) => det2(M.matmul(A, B, 2, 2, 2)),
+    predicate: (A, B) => meq(det2(M.matmul(A, B, 2, 2, 2)), det2(A) * det2(B)),
+  });
+  reg(102, {
+    name: 'det · 乘积性（3×3 对角因子）', intuition: 'B 取对角阵 diag(2,3,5) 时 det(AB) = det(A)·30，即列缩放定理；3×3 全程整数精确（≤4e11 < 2⁵³）。',
+    math: 'det(A·D) = det(A)·det(D), D = diag(2,3,5)', pseudocode: 'return det3(A·D)', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '一般 3×3 双矩阵乘积有大数抵消，故选固定对角因子保精确。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
+    run: (A) => det3(M.matmul(A, DIAG235, 3, 3, 3)),
+    predicate: (A) => meq(det3(M.matmul(A, DIAG235, 3, 3, 3)), det3(A) * 30),
+  });
+  reg(103, {
+    name: '2×2 · 迹等于特征值之和', intuition: '特征方程 λ²−tr·λ+det=0 的两根之和等于迹（Vieta）；实根还验证积等于 det 且根满足方程，复共轭根验证多项式在根处消失。',
+    math: 'λ₁+λ₂ = tr(A), λ₁λ₂ = det(A)', pseudocode: 'return 根之和', complexity: 'O(1)',
+    ref: 'Cayley–Hamilton / Vieta', commonPitfall: '判别式为负时根为共轭复数，须按复根验证（实部和为迹）。', invariant: 'relClose(根和, tr, 1e-9) 且各根满足特征方程',
+    inputs: ['A'], domains: { A: 'matSmall' }, matrixDims: { A: [2, 2] },
+    run: (A) => {
+      const t = A[0] + A[3], d = A[0] * A[3] - A[1] * A[2], disc = t * t - 4 * d;
+      if (disc >= 0) { const s = Math.sqrt(disc); return (t + s) / 2 + (t - s) / 2; }
+      return t; // 共轭复根 a±ih 之和（实部和）为 t
+    },
+    predicate: (A) => {
+      const t = A[0] + A[3], d = A[0] * A[3] - A[1] * A[2], disc = t * t - 4 * d;
+      if (disc >= 0) {
+        const s = Math.sqrt(disc), l1 = (t + s) / 2, l2 = (t - s) / 2;
+        return rc(l1 + l2, t, 1e-9) && rc(l1 * l2, d, 1e-9) &&
+          rc(l1 * l1 - t * l1 + d, 0, 1e-9) && rc(l2 * l2 - t * l2 + d, 0, 1e-9);
+      }
+      const h = Math.sqrt(-disc) / 2, a = t / 2; // 根为 a ± i·h
+      return rc(a + a, t, 1e-9) &&
+        rc(a * a - h * h - t * a + d, 0, 1e-9) &&   // Re p(a+ih) = 0
+        rc(2 * a * h - t * h, 0, 1e-9);             // Im p(a+ih) = 0
+    },
+  });
+  reg(104, {
+    name: '对称判定 · 与定义一致', intuition: 'isSym(A) 当且仅当 A = Aᵀ；且对称化 A+Aᵀ 必为对称阵（正向构造恒真）。',
+    math: 'isSym(A) ⟺ A = Aᵀ', pseudocode: 'return isSym(A)', complexity: 'O(n²)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '±0 须视为相等（IEEE 中 Object.is(−0,0) 为假）。', invariant: 'isSym(A) === (A=Aᵀ) 且 isSym(A+Aᵀ) 恒真',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
+    run: (A) => isSym(A, 4),
+    predicate: (A) => isSym(A, 4) === meq(A, trans(A, 4, 4)) && isSym(madd(A, trans(A, 4, 4), 16), 4) === true,
+  });
+  reg(105, {
+    name: '反对称判定 · 与定义一致', intuition: 'isAnti(A) 当且仅当 A = −Aᵀ（对角线必为 0）；且反对称化 A−Aᵀ 必为反对称阵。',
+    math: 'isAnti(A) ⟺ A = −Aᵀ', pseudocode: 'return isAnti(A)', complexity: 'O(n²)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '对角线元素必须为 0（x = −x ⇒ x = 0）。', invariant: 'isAnti(A) === (A=−Aᵀ)、isAnti(A) ⇒ 对角线为 0、isAnti(A−Aᵀ) 恒真',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
+    run: (A) => isAnti(A, 4),
+    predicate: (A) => {
+      const anti = isAnti(A, 4);
+      if (anti !== meq(A, mneg(trans(A, 4, 4), 16))) return false;
+      if (anti) { for (let i = 0; i < 4; i++) if (!z0(A[i * 4 + i])) return false; }
+      return isAnti(msub(A, trans(A, 4, 4), 16), 4) === true;
+    },
+  });
+  reg(106, {
+    name: '三角阵判定 · 上与下', intuition: 'isUpper(A) 当且仅当 A 等于其上三角投影，isLower 同理；投影结果必为三角阵（正向构造恒真）。',
+    math: 'isUpper(A) ⟺ A = triu(A)；isLower(A) ⟺ A = tril(A)', pseudocode: 'return {up, lo}', complexity: 'O(n²)',
+    ref: '线性代数', commonPitfall: '判定与投影互为充要，整数零用严格比对而非容差。', invariant: '双向等价 + triu/tril 投影恒为三角阵',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
+    run: (A) => ({ up: isUpperTri(A, 4), lo: isLowerTri(A, 4) }),
+    predicate: (A) => {
+      const U = triuPart(A, 4), L = trilPart(A, 4);
+      return isUpperTri(A, 4) === meq(A, U) && isLowerTri(A, 4) === meq(A, L) &&
+        isUpperTri(U, 4) === true && isLowerTri(L, 4) === true;
+    },
+  });
+  reg(107, {
+    name: 'det · 三角阵等于对角线积', intuition: '上三角阵（3×3）行列式等于对角线之积；一般矩阵先取上三角投影再验证。',
+    math: 'det(triu(A)) = ∏ᵢ Uᵢᵢ', pseudocode: 'return det3(triu(A))', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '仅对三角阵成立，一般矩阵须先投影。', invariant: '逐位 Object.is（整数域）',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
+    run: (A) => det3(triuPart(A, 3)),
+    predicate: (A) => { const U = triuPart(A, 3); return meq(det3(U), U[0] * U[4] * U[8]); },
+  });
+  reg(108, {
+    name: 'det · 数乘齐次性', intuition: 'n 阶矩阵数乘 s 后行列式乘 sⁿ；2×2 时 det(2A) = 4·det(A)（整数域逐位精确）。',
+    math: 'det(sA) = sⁿ·det(A)', pseudocode: 'return det2(2A)', complexity: 'O(1)',
+    ref: 'Horn & Johnson 1985', commonPitfall: '指数是阶数 n 而非 1。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
+    run: (A) => det2(mscale(2, A, 4)),
+    predicate: (A) => meq(det2(mscale(2, A, 4)), 4 * det2(A)),
+  });
+
+  // ── 归约进阶（C109–C120）──────────────────────────────────────────────
+  reg(109, {
+    name: '列均值 · 等于列和除以行数', intuition: '每列均值 = 该列元素和 / 行数；r=4 时除以 4 为幂二，整数域逐位精确。',
+    math: 'μⱼ = (Σᵢ Aᵢⱼ) / r', pseudocode: 'return colSum(A)/r', complexity: 'O(rc)',
+    ref: '统计量', commonPitfall: '除以行数而非列数。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => mscale(0.25, perColSum(A, 4, 5), 5),
+    predicate: (A) => {
+      const m = mscale(0.25, perColSum(A, 4, 5), 5);
+      for (let j = 0; j < 5; j++) { let acc = 0; for (let i = 0; i < 4; i++) acc += A[i * 5 + j]; if (!meq(m[j], acc * 0.25)) return false; }
+      return true;
+    },
+  });
+  reg(110, {
+    name: '列 softmax · 每列和为 1', intuition: '对每列做 softmax（复用 L8 softmaxRows 作用于转置），各列概率和趋近 1。',
+    math: 'Σᵢ colSoftmax(A)ᵢⱼ = 1（每列）', pseudocode: 'return colSoftmax(A)', complexity: 'O(rc)',
+    ref: 'Bridle 1990', commonPitfall: '需容差；沿列而非行归一。', invariant: 'relClose(列和, 1, 1e-9)',
+    inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
+    run: (A) => colSoftmax(A, 4, 5),
+    predicate: (A) => {
+      const P = colSoftmax(A, 4, 5);
+      for (let j = 0; j < 5; j++) { let s = 0; for (let i = 0; i < 4; i++) s += P[i * 5 + j]; if (!rc(s, 1, 1e-9)) return false; }
+      return true;
+    },
+  });
+  reg(111, {
+    name: '列 softmax · 输出非负', intuition: 'softmax 输出为概率，列 softmax 的每个元素恒非负。',
+    math: 'colSoftmax(A)ᵢⱼ ≥ 0', pseudocode: 'return colSoftmax(A)', complexity: 'O(rc)',
+    ref: 'Bridle 1990', commonPitfall: '无。', invariant: '∀i,j: Pᵢⱼ ≥ 0',
+    inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
+    run: (A) => colSoftmax(A, 4, 5), predicate: (A) => allIn(colSoftmax(A, 4, 5), (x) => x >= 0),
+  });
+  reg(112, {
+    name: '行 argmax · 取值等于行最大', intuition: '每行 argmax 下标处的取值等于该行最大值（并列取首处），且下标合法。',
+    math: 'A[i, argmaxᵢ] = maxⱼ Aᵢⱼ', pseudocode: 'return argmaxRow(A)', complexity: 'O(rc)',
+    ref: '归约', commonPitfall: '并列时取第一个最大位置。', invariant: '取值=行最大 且为首个最大位置',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => argmaxRow(A, 4, 5),
+    predicate: (A) => {
+      const idx = argmaxRow(A, 4, 5);
+      for (let i = 0; i < 4; i++) {
+        const o = i * 5;
+        let mx = A[o];
+        for (let j = 1; j < 5; j++) if (A[o + j] > mx) mx = A[o + j];
+        if (idx[i] < 0 || idx[i] >= 5) return false;
+        if (!Object.is(A[o + idx[i]], mx)) return false;
+        for (let j = 0; j < idx[i]; j++) if (!(A[o + j] < mx)) return false;
+      }
+      return true;
+    },
+  });
+  reg(113, {
+    name: '列 argmax · 取值等于列最大', intuition: '每列 argmax 行下标处的取值等于该列最大值（并列取首处），且下标合法。',
+    math: 'A[argmaxⱼ, j] = maxᵢ Aᵢⱼ', pseudocode: 'return argmaxCol(A)', complexity: 'O(rc)',
+    ref: '归约', commonPitfall: '并列时取第一个最大位置。', invariant: '取值=列最大 且为首个最大位置',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => argmaxCol(A, 4, 5),
+    predicate: (A) => {
+      const idx = argmaxCol(A, 4, 5);
+      for (let j = 0; j < 5; j++) {
+        let mx = A[j];
+        for (let i = 1; i < 4; i++) if (A[i * 5 + j] > mx) mx = A[i * 5 + j];
+        if (idx[j] < 0 || idx[j] >= 4) return false;
+        if (!Object.is(A[idx[j] * 5 + j], mx)) return false;
+        for (let i = 0; i < idx[j]; i++) if (!(A[i * 5 + j] < mx)) return false;
+      }
+      return true;
+    },
+  });
+  reg(114, {
+    name: '行 LSE · 上下界', intuition: '每行 log-sum-exp 满足 max ≤ LSE ≤ max + ln c（折叠 L9 logsumexp2，数值稳定）。',
+    math: 'maxⱼAᵢⱼ ≤ log Σⱼe^{Aᵢⱼ} ≤ maxⱼAᵢⱼ + ln c', pseudocode: 'return rowLSE(A)', complexity: 'O(rc)',
+    ref: '数值稳定 / logsumexp', commonPitfall: '直接 exp 会溢出，须先减行最大再折叠。', invariant: 'max ≤ LSE ≤ max + ln c（±1e-9 松弛）',
+    inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
+    run: (A) => rowLSE(A, 4, 5),
+    predicate: (A) => {
+      const lse = rowLSE(A, 4, 5);
+      for (let i = 0; i < 4; i++) {
+        const o = i * 5;
+        let mx = A[o];
+        for (let j = 1; j < 5; j++) if (A[o + j] > mx) mx = A[o + j];
+        if (!(lse[i] >= mx - 1e-9 && lse[i] <= mx + Math.log(5) + 1e-9)) return false;
+      }
+      return true;
+    },
+  });
+  reg(115, {
+    name: '列 min/max · 逐列正确', intuition: '逐列最小值与最大值等于独立扫描结果（整数域逐位精确）。',
+    math: 'colMinⱼ = minᵢ Aᵢⱼ；colMaxⱼ = maxᵢ Aᵢⱼ', pseudocode: 'return colMinMax(A)', complexity: 'O(rc)',
+    ref: '归约', commonPitfall: '无。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => colMinMax(A, 4, 5),
+    predicate: (A) => {
+      const mm = colMinMax(A, 4, 5);
+      for (let j = 0; j < 5; j++) {
+        let lo = A[j], hi = A[j];
+        for (let i = 1; i < 4; i++) { const v = A[i * 5 + j]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        if (!Object.is(mm.min[j], lo) || !Object.is(mm.max[j], hi)) return false;
+      }
+      return true;
+    },
+  });
+  reg(116, {
+    name: '全元素和 · 等于各列和之和', intuition: '矩阵全部元素之和等于各列和向量之和（整数域精确，与累加顺序无关）。',
+    math: 'ΣᵢⱼAᵢⱼ = Σⱼ(ΣᵢAᵢⱼ)', pseudocode: 'return sumAll(colSums(A))', complexity: 'O(rc)',
+    ref: '归约', commonPitfall: '无。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => sumAll(perColSum(A, 4, 5)),
+    predicate: (A) => meq(sumAll(perColSum(A, 4, 5)), sumAll(A)),
+  });
+  reg(117, {
+    name: '行 cumsum · 末列等于行和', intuition: '按行前缀和到最后一列即该行元素和（整数域逐位精确）。',
+    math: 'cumsum(A)ᵢ,c₋₁ = Σⱼ Aᵢⱼ', pseudocode: 'return cumsumRows(A)', complexity: 'O(rc)',
+    ref: '归约', commonPitfall: '前缀和沿行内列方向累加。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => cumsumRows(A, 4, 5),
+    predicate: (A) => {
+      const cs = cumsumRows(A, 4, 5), rs = perRowSum(A, 4, 5);
+      for (let i = 0; i < 4; i++) if (!meq(cs[i * 5 + 4], rs[i])) return false;
+      return true;
+    },
+  });
+  reg(118, {
+    name: '列方差 · 非负', intuition: '每列总体方差为偏差平方的均值，恒非负（r=4 幂二除法，整数域精确）。',
+    math: 'Varⱼ = (Σᵢ(Aᵢⱼ−μⱼ)²)/r ≥ 0', pseudocode: 'return colVar(A)', complexity: 'O(rc)',
+    ref: '统计量', commonPitfall: '无。', invariant: '∀j: Varⱼ ≥ 0',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => colVar(A, 4, 5), predicate: (A) => allIn(colVar(A, 4, 5), (x) => x >= 0),
+  });
+  reg(119, {
+    name: '列方差 · 等于转置的行方差', intuition: 'A 的列方差等于 Aᵀ 的行方差（r=4 时两种路径累加顺序一致，逐位相等）。',
+    math: 'Var_col(A)ⱼ = Var_row(Aᵀ)ⱼ', pseudocode: 'return colVar(A)', complexity: 'O(rc)',
+    ref: '统计量', commonPitfall: '总体方差（除以个数）而非样本方差（除以 n−1）。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => colVar(A, 4, 5),
+    predicate: (A) => meq(colVar(A, 4, 5), rowVar(trans(A, 4, 5), 5, 4)),
+  });
+  reg(120, {
+    name: '列方差 · 平移不变', intuition: '每列加同一常数不改变方差（整数域下偏移在均值中精确抵消，逐位相等）。',
+    math: 'Var(A + c·J) = Var(A)', pseudocode: 'return colVar(A+3J)', complexity: 'O(rc)',
+    ref: '统计量', commonPitfall: '常数须加到每一个元素（全矩阵同常量）。', invariant: '逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => colVar(madd(A, THREES, 20), 4, 5),
+    predicate: (A) => meq(colVar(madd(A, THREES, 20), 4, 5), colVar(A, 4, 5)),
+  });
+
+  // ── 张量操作（C121–C128）──────────────────────────────────────────────
+  reg(121, {
+    name: '垂直拼接 · 形状守恒', intuition: '两块同行宽矩阵垂直拼接，行数相加、元素数 = (r₁+r₂)·c。',
+    math: 'vcat(A(r₁×c), B(r₂×c)) ∈ ℝ^{(r₁+r₂)×c}', pseudocode: 'return vcat(A,B)', complexity: 'O((r₁+r₂)c)',
+    ref: 'NumPy vstack', commonPitfall: '两块列宽须相等。', invariant: 'length = (r₁+r₂)·c',
+    inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 3] },
+    run: (A, B) => vcat(A, B, 2, 3),
+    predicate: (A, B) => vcat(A, B, 2, 3).length === 12,
+  });
+  reg(122, {
+    name: '垂直拼接 · 内容定位', intuition: '拼接结果上块逐位等于 A、下块逐位等于 B。',
+    math: 'vcat(A,B)[0:r₁·c] = A；[r₁·c:] = B', pseudocode: 'return vcat(A,B)', complexity: 'O((r₁+r₂)c)',
+    ref: 'NumPy vstack', commonPitfall: '行主序下块偏移为 r₁·c。', invariant: '逐位 Object.is',
+    inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 3] },
+    run: (A, B) => vcat(A, B, 2, 3),
+    predicate: (A, B) => { const o = vcat(A, B, 2, 3); return meq(o.subarray(0, 6), A) && meq(o.subarray(6, 12), B); },
+  });
+  reg(123, {
+    name: '水平拼接 · 形状与内容', intuition: '两块同高矩阵水平拼接，列数相加；左块为 A、右块为 B（逐位）。',
+    math: 'hcat(A(r×c₁), B(r×c₂))ᵢⱼ = Aᵢⱼ (j<c₁)；= Bᵢ,ⱼ₋c₁ (j≥c₁)', pseudocode: 'return hcat(A,B)', complexity: 'O(r(c₁+c₂))',
+    ref: 'NumPy hstack', commonPitfall: '行数须相等；块内偏移按行计算。', invariant: 'length = r·(c₁+c₂) 且逐位 Object.is',
+    inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 4] },
+    run: (A, B) => hcat(A, B, 2, 3, 4),
+    predicate: (A, B) => {
+      const o = hcat(A, B, 2, 3, 4);
+      if (o.length !== 14) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) if (!meq(o[i * 7 + j], A[i * 3 + j])) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 4; j++) if (!meq(o[i * 7 + 3 + j], B[i * 4 + j])) return false;
+      return true;
+    },
+  });
+  reg(124, {
+    name: '行切片 · 区间形状与内容', intuition: '取行区间 [1,3) 得 2×5 子矩阵（复用 L7 slice+contiguous），内容逐位等于原矩阵对应两行。',
+    math: 'A[1:3, :] ∈ ℝ^{2×5}', pseudocode: 'return rowSlice(A,1,3)', complexity: 'O((e−s)c)',
+    ref: 'L7.tensor.slice / NumPy', commonPitfall: '区间左闭右开；L7 后于本文件加载故调用期惰性引用。', invariant: 'length=10 且逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
+    run: (A) => rowSlice(A, 4, 5, 1, 3),
+    predicate: (A) => {
+      const o = rowSlice(A, 4, 5, 1, 3);
+      if (o.length !== 10) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 5; j++) if (!meq(o[i * 5 + j], A[(1 + i) * 5 + j])) return false;
+      return true;
+    },
+  });
+  reg(125, {
+    name: '矩形双转置 · 还原与元素定位', intuition: '2×6 矩形矩阵双转置还原；并全位置验证元素定位律 (Aᵀ)ᵢⱼ = Aⱼᵢ。',
+    math: '(Aᵀ)ᵀ = A；(Aᵀ)ᵢⱼ = Aⱼᵢ', pseudocode: 'return Aᵀᵀ', complexity: 'O(rc)',
+    ref: '线性代数', commonPitfall: '矩形转置交换维度（2×6 ↔ 6×2）。', invariant: '双转置逐位 Object.is + 元素定位逐位',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 6] },
+    run: (A) => trans(trans(A, 2, 6), 6, 2),
+    predicate: (A) => {
+      if (!meq(trans(trans(A, 2, 6), 6, 2), A)) return false;
+      const T = trans(A, 2, 6);
+      for (let i = 0; i < 6; i++) for (let j = 0; j < 2; j++) if (!meq(T[i * 2 + j], A[j * 6 + i])) return false;
+      return true;
+    },
+  });
+  reg(126, {
+    name: '对角提取 · 方阵对角线', intuition: '提取 4×4 方阵对角线得 4 个元素，逐位等于 Aᵢᵢ。',
+    math: 'diag(A)ᵢ = Aᵢᵢ', pseudocode: 'return diagOf(A)', complexity: 'O(n)',
+    ref: '线性代数', commonPitfall: '仅方阵有对角线；结果长度为阶数 n。', invariant: 'length=n 且逐位 Object.is',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
+    run: (A) => diagOf(A, 4),
+    predicate: (A) => {
+      const d = diagOf(A, 4);
+      if (d.length !== 4) return false;
+      for (let i = 0; i < 4; i++) if (!meq(d[i], A[i * 4 + i])) return false;
+      return true;
+    },
+  });
+  reg(127, {
+    name: '矩阵 pad · 补零行列', intuition: '2×3 矩阵补零到 4×5：原内容居左上，新增行列精确为 0。',
+    math: 'pad(A)ᵢⱼ = Aᵢⱼ (i<r, j<c)；否则 0', pseudocode: 'return padTo(A,4,5)', complexity: 'O(RC)',
+    ref: 'NumPy pad', commonPitfall: '补零区域必须精确 0（非未初始化内存）。', invariant: 'length=20、原内容逐位、新区域为 0',
+    inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 3] },
+    run: (A) => padTo(A, 2, 3, 4, 5),
+    predicate: (A) => {
+      const o = padTo(A, 2, 3, 4, 5);
+      if (o.length !== 20) return false;
+      for (let i = 0; i < 4; i++) for (let j = 0; j < 5; j++) {
+        const want = (i < 2 && j < 3) ? A[i * 3 + j] : 0;
+        if (!meq(o[i * 5 + j], want)) return false;
+      }
+      return true;
+    },
+  });
+  reg(128, {
+    name: '拼接复合 · 形状公式', intuition: '先垂直拼再接水平拼接：最终形状 (r₁+r₂)×(c₁+c₂)，四块内容各归其位。',
+    math: 'hcat(vcat(A,B), vcat(C,D)) ∈ ℝ^{(r₁+r₂)×(c₁+c₂)}', pseudocode: 'return hcat(vcat(A,B), vcat(C,D))', complexity: 'O((r₁+r₂)(c₁+c₂))',
+    ref: 'NumPy vstack/hstack', commonPitfall: '两对的行数须分别相等；块定位按象限。', invariant: 'length=28 且四块逐位 Object.is',
+    inputs: ['A', 'B', 'C', 'D'], domains: { A: 'matInt', B: 'matInt', C: 'matInt', D: 'matInt' },
+    matrixDims: { A: [2, 3], B: [2, 3], C: [2, 4], D: [2, 4] },
+    run: (A, B, C, D) => hcat(vcat(A, B, 2, 3), vcat(C, D, 2, 4), 4, 3, 4),
+    predicate: (A, B, C, D) => {
+      const o = hcat(vcat(A, B, 2, 3), vcat(C, D, 2, 4), 4, 3, 4);
+      if (o.length !== 28) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) if (!meq(o[i * 7 + j], A[i * 3 + j])) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 4; j++) if (!meq(o[i * 7 + 3 + j], C[i * 4 + j])) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) if (!meq(o[(2 + i) * 7 + j], B[i * 3 + j])) return false;
+      for (let i = 0; i < 2; i++) for (let j = 0; j < 4; j++) if (!meq(o[(2 + i) * 7 + 3 + j], D[i * 4 + j])) return false;
+      return true;
+    },
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
@@ -3776,6 +4649,431 @@
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => reluVec(reluVec(x)),
     predicate: (x) => exactVec(reluVec(reluVec(x)), reluVec(x)),
+  });
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* ============================================================================
+ * L10 微指令 · B 域（向量运算）· 第 4/4 批（B097–B128）
+ * ----------------------------------------------------------------------------
+ * 所属层：L10-microIsa  域：B（向量）
+ * 允许依赖的层：L9（rng/assert/special）、L10（registry/invariant）
+ * 主要 @ref：Strang (2016) Lp 范数与距离函数；Hamming (1950)；
+ *           NumPy cumprod/cummax/cummin/one-hot/gather/pad/truncate/rotate
+ *           语义；Goodfellow 2016 §6.2 softmax 单纯形结构
+ *
+ * 涵盖：范数与距离家族（B097–B108：L3 范数齐次/非负/三角、加权 L2 齐次、
+ *       余弦距离有界与自零、切比雪夫/汉明/L1 距离的对称与三角）、
+ *       向量进阶运算（B109–B120：cumprod 总积与递推、cummax/cummin 单调
+ *       与末项、argmax 选中与索引结构、one-hot 构造、gather 寻址、
+ *       softmax 和为 1）、切片与组合（B121–B128：concat 长度可加与偏移
+ *       还原、slice 半开区间、pad 前补零、truncate 前 n 项、rotate 复合
+ *       还原、reverse 与 rotate 复合）。
+ * 判据：整数向量域 exactVec/exactNum 逐位精确（±0 归一）；数值族
+ *       relClose(1e-9)；不等式族加 1e-9 相对 epsilon 吸收舍入
+ *       （保持真实数学性质，不放宽容差）。
+ * K5：本文件禁用模块级语法（详见全局契约 K5）。
+ * ==========================================================================*/
+;(function (NS) {
+  'use strict';
+  NS.L10 = NS.L10 || {};
+  function reg(i, o) { NS.L10.register('B', i, o); }
+  const rc = (a, b, t) => NS.L10.relClose(a, b, t);
+
+  // ── 向量小工具（纯函数）────────────────────────────────────────────────
+  function vAdd(x, y) { const n = x.length, o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[i] + y[i]; return o; }
+  function vScale(c, x) { const n = x.length, o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = c * x[i]; return o; }
+  function vRev(x) { const n = x.length, o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[n - 1 - i]; return o; }
+  function dot(x, y) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; }
+  function norm(x) { return Math.sqrt(dot(x, x)); }
+  function sumv(x) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i]; return s; }
+  function maxv(x) { let m = x[0]; for (let i = 1; i < x.length; i++) if (x[i] > m) m = x[i]; return m; }
+  function minv(x) { let m = x[0]; for (let i = 1; i < x.length; i++) if (x[i] < m) m = x[i]; return m; }
+  // 范数与距离家族
+  function lp3(x) { let s = 0; for (let i = 0; i < x.length; i++) { const a = Math.abs(x[i]); s += a * a * a; } return Math.cbrt(s); }
+  function wl2(w, x) { let s = 0; for (let i = 0; i < x.length; i++) s += w[i] * x[i] * x[i]; return Math.sqrt(s); }
+  function cosdist(x, y) { return 1 - dot(x, y) / (norm(x) * norm(y)); }
+  function cheb(x, y) { let m = Math.abs(x[0] - y[0]); for (let i = 1; i < x.length; i++) { const d = Math.abs(x[i] - y[i]); if (d > m) m = d; } return m; }
+  function ham(x, y) { let c = 0; for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) c++; return c; }
+  function l1d(x, y) { let s = 0; for (let i = 0; i < x.length; i++) s += Math.abs(x[i] - y[i]); return s; }
+  // 前缀积 / 极值扫描 / argmax / one-hot / gather / softmax
+  function cumprod(x) { const n = x.length, o = new Float64Array(n); o[0] = x[0]; for (let i = 1; i < n; i++) o[i] = o[i - 1] * x[i]; return o; }
+  function cummax(x) { const n = x.length, o = new Float64Array(n); o[0] = x[0]; for (let i = 1; i < n; i++) o[i] = o[i - 1] > x[i] ? o[i - 1] : x[i]; return o; }
+  function cummin(x) { const n = x.length, o = new Float64Array(n); o[0] = x[0]; for (let i = 1; i < n; i++) o[i] = o[i - 1] < x[i] ? o[i - 1] : x[i]; return o; }
+  function argmaxVec(x) { let a = 0; for (let i = 1; i < x.length; i++) if (x[i] > x[a]) a = i; return a; }
+  function onehot(n, k) { const o = new Float64Array(n); o[((k % n) + n) % n] = 1; return o; }
+  function gather(v, i) { return v[((i % v.length) + v.length) % v.length]; }
+  function softmaxVec(x) {
+    const n = x.length; let m = x[0];
+    for (let i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    const e = new Float64Array(n); let s = 0;
+    for (let i = 0; i < n; i++) { e[i] = Math.exp(x[i] - m); s += e[i]; }
+    for (let i = 0; i < n; i++) e[i] /= s;
+    return e;
+  }
+  // 切片与组合
+  function vConcat(x, y) { const o = new Float64Array(x.length + y.length); o.set(x, 0); o.set(y, x.length); return o; }
+  function vSlice(x, s, e) { const o = new Float64Array(e - s); for (let i = s; i < e; i++) o[i - s] = x[i]; return o; }
+  function padFront(x, m) { const o = new Float64Array(m); o.set(x, m - x.length); return o; }
+  function vTruncate(x, m) { return vSlice(x, 0, m); }
+  function vRotate(x, k) { const n = x.length, kw = ((k % n) + n) % n, o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = x[(i + kw) % n]; return o; }
+  // 二分树形乘积：cumprod 末项的独立参考路径（结合顺序与线性扫描不同）。
+  function treeProd(x, lo, hi) { if (hi - lo === 1) return x[lo]; const mid = (lo + hi) >> 1; return treeProd(x, lo, mid) * treeProd(x, mid, hi); }
+  // 索引归约：两个 nat 索引压入 [0,n] 并排序（TAGS 无索引域，mod 归约覆盖全边界）。
+  function idx2(a, b, n) { const u = a % (n + 1), v = b % (n + 1); return u <= v ? [u, v] : [v, u]; }
+  // 逐位相等（-0 与 +0 归一为相等；IEEE 中 Object.is(-0,0) 为假但数值等价）。
+  // 标量不变量的唯一判据：乘法/取负可产生 -0（如 0·(−792896) === −0），
+  // 裸 Object.is 会把数值等价的 ±0 判为不等 → 伪红。向量版复用它。
+  function exactNum(p, q) {
+    if (p === 0) p = 0;
+    if (q === 0) q = 0;
+    return Object.is(p, q);
+  }
+  function exactVec(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!exactNum(a[i], b[i])) return false;
+    return true;
+  }
+
+  // ── 范数与距离家族（B097–B108）────────────────────────────────────────
+  reg(97, {
+    name: 'lp3 · 齐次缩放', intuition: 'L3 范数整体缩放 c 倍，模长缩放 |c| 倍。',
+    math: '‖c·x‖₃ = |c|·‖x‖₃', pseudocode: 'return lp3(vScale(c,x))', complexity: 'O(n)',
+    ref: 'Strang (2016) Lp 范数齐次性', commonPitfall: 'vecSmall 控幅：|c·xᵢ|≤1e4，立方和 ≤8e12 不溢出；tol 1e-9。',
+    invariant: '对 smallInt c, vecSmall x：relClose(‖cx‖₃, |c|‖x‖₃, 1e-9)',
+    inputs: ['c', 'x'], domains: { c: 'smallInt', x: 'vecSmall' },
+    run: (c, x) => lp3(vScale(c, x)),
+    predicate: (c, x) => rc(lp3(vScale(c, x)), Math.abs(c) * lp3(x), 1e-9),
+  });
+  reg(98, {
+    name: 'lp3 · 非负且定性', intuition: 'L3 范数是立方和的立方根，恒非负；且为零当且仅当零向量。',
+    math: '‖x‖₃ ≥ 0；‖x‖₃ = 0 ⇔ x = 0', pseudocode: 'return lp3(x)', complexity: 'O(n)',
+    ref: 'Strang (2016) 范数正定性', commonPitfall: '立方和非负且无相消，故 =0 当且仅当逐分量为 0（浮点同样精确）。',
+    invariant: '对 vecFinite：‖x‖₃ ≥ 0 且 (‖x‖₃ = 0 ⇒ ∀i xᵢ = 0)',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => lp3(x),
+    predicate: (x) => {
+      const L = lp3(x);
+      if (L < 0) return false;
+      if (L === 0) for (let i = 0; i < x.length; i++) if (x[i] !== 0) return false;
+      return true;
+    },
+  });
+  reg(99, {
+    name: 'lp3 · 三角不等式', intuition: 'L3 是范数（p≥1）：两边之和大于第三边。',
+    math: '‖x + y‖₃ ≤ ‖x‖₃ + ‖y‖₃', pseudocode: 'return lp3(vAdd(x,y))', complexity: 'O(n)',
+    ref: 'Strang (2016) 范数三角不等式', commonPitfall: '立方与开方有舍入，加 1e-9 相对 epsilon。',
+    invariant: '对 vecSmall：‖x+y‖₃ ≤ ‖x‖₃+‖y‖₃+ε，ε=1e-9·max(1,‖x‖₃+‖y‖₃)',
+    inputs: ['x', 'y'], domains: { x: 'vecSmall', y: 'vecSmall' },
+    run: (x, y) => lp3(vAdd(x, y)),
+    predicate: (x, y) => lp3(vAdd(x, y)) <= lp3(x) + lp3(y) + 1e-9 * Math.max(1, lp3(x) + lp3(y)),
+  });
+  reg(100, {
+    name: 'wl2 · 加权齐次缩放', intuition: '正权重 L2 范数同样齐次：整体缩放提出 |c|。',
+    math: '‖c·x‖_{w,2} = |c|·‖x‖_{w,2}（w>0）', pseudocode: 'return wl2(w, vScale(c,x))', complexity: 'O(n)',
+    ref: 'Strang (2016) 加权范数', commonPitfall: 'vecPos 保证权重严格正；幅值 ≤1e9 不溢出；tol 1e-9。',
+    invariant: '对 smallInt c, vecPos w, vecSmall x：relClose(‖cx‖_{w,2}, |c|‖x‖_{w,2}, 1e-9)',
+    inputs: ['c', 'w', 'x'], domains: { c: 'smallInt', w: 'vecPos', x: 'vecSmall' },
+    run: (c, w, x) => wl2(w, vScale(c, x)),
+    predicate: (c, w, x) => rc(wl2(w, vScale(c, x)), Math.abs(c) * wl2(w, x), 1e-9),
+  });
+  reg(101, {
+    name: 'cosdist · 有界 [0,2]', intuition: '余弦距离 1−cos 落在 [0,2]：同向为 0、反向为 2。',
+    math: '0 ≤ 1 − x·y/(‖x‖‖y‖) ≤ 2', pseudocode: 'return cosdist(x,y)', complexity: 'O(n)',
+    ref: '余弦距离；Cauchy–Schwarz 给出 |cos|≤1', commonPitfall: 'cos 可越界 1 ulp（如 1+1e-16），两端各放 1e-9 相对 epsilon。',
+    invariant: '对 vecPos x,y：−ε ≤ cosdist(x,y) ≤ 2+2ε，ε=1e-9',
+    inputs: ['x', 'y'], domains: { x: 'vecPos', y: 'vecPos' },
+    run: (x, y) => cosdist(x, y),
+    predicate: (x, y) => { const d = cosdist(x, y); return d >= -1e-9 && d <= 2 + 2e-9; },
+  });
+  reg(102, {
+    name: 'cosdist · 自为 0', intuition: '向量与自身的余弦距离为 0（距离函数对角线性质）。',
+    math: '1 − cos(x,x) = 0', pseudocode: 'return cosdist(x,x)', complexity: 'O(n)',
+    ref: '余弦相似度自相似为 1 的距离视角', commonPitfall: 'vecPos 保证分母非零；tol 1e-9。',
+    invariant: '对 vecPos：relClose(cosdist(x,x), 0, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecPos' },
+    run: (x) => cosdist(x, x),
+    predicate: (x) => rc(cosdist(x, x), 0, 1e-9),
+  });
+  reg(103, {
+    name: 'cheb · 对称', intuition: '切比雪夫距离（L∞ 距离）对两个端点对称。',
+    math: 'd∞(x,y) = d∞(y,x)，d∞(x,y) = maxᵢ|xᵢ−yᵢ|', pseudocode: 'return cheb(x,y)', complexity: 'O(n)',
+    ref: 'Strang (2016) L∞ 距离', commonPitfall: 'IEEE 减法符号对称（b−a 与 −(a−b) 逐位相同），取绝对值后逐位相等 → exactNum 精确。',
+    invariant: '对 vecFinite：exactNum(d∞(x,y), d∞(y,x))',
+    inputs: ['x', 'y'], domains: { x: 'vecFinite', y: 'vecFinite' },
+    run: (x, y) => cheb(x, y),
+    predicate: (x, y) => exactNum(cheb(x, y), cheb(y, x)),
+  });
+  reg(104, {
+    name: 'cheb · 三角不等式', intuition: 'L∞ 距离满足三角不等式（度量公理）。',
+    math: 'd∞(x,z) ≤ d∞(x,y) + d∞(y,z)', pseudocode: 'return cheb(x,z)', complexity: 'O(n)',
+    ref: 'Strang (2016) 距离函数', commonPitfall: '逐位三角不等式经 max 传递；浮点差数个 ulp，加 1e-9 相对 epsilon。',
+    invariant: '对 vecFinite：d∞(x,z) ≤ d∞(x,y)+d∞(y,z)+ε，ε=1e-9·max(1, 和)',
+    inputs: ['x', 'y', 'z'], domains: { x: 'vecFinite', y: 'vecFinite', z: 'vecFinite' },
+    run: (x, y, z) => cheb(x, z),
+    predicate: (x, y, z) => cheb(x, z) <= cheb(x, y) + cheb(y, z) + 1e-9 * Math.max(1, cheb(x, y) + cheb(y, z)),
+  });
+  reg(105, {
+    name: 'ham · 对称', intuition: '汉明距离统计不同分量个数，与比较方向无关。',
+    math: 'h(x,y) = h(y,x)，h(x,y) = #{i : xᵢ ≠ yᵢ}', pseudocode: 'return ham(x,y)', complexity: 'O(n)',
+    ref: 'Hamming (1950)', commonPitfall: '计数为整数，无舍入路径，精确判等。',
+    invariant: '对 vecInt：exactNum(h(x,y), h(y,x))',
+    inputs: ['x', 'y'], domains: { x: 'vecInt', y: 'vecInt' },
+    run: (x, y) => ham(x, y),
+    predicate: (x, y) => exactNum(ham(x, y), ham(y, x)),
+  });
+  reg(106, {
+    name: 'ham · 自为 0 与三角', intuition: '自距离为 0；经第三点迂回不缩短（计数版三角不等式）。',
+    math: 'h(x,x) = 0；h(x,z) ≤ h(x,y) + h(y,z)', pseudocode: 'return ham(x,z)', complexity: 'O(n)',
+    ref: 'Hamming (1950) 度量性质', commonPitfall: '若 xᵢ≠zᵢ 则 xᵢ≠yᵢ 或 yᵢ≠zᵢ，逐位计数使三角不等式精确成立（整数计数无 epsilon）。',
+    invariant: '对 vecInt：exactNum(h(x,x),0) 且 h(x,z) ≤ h(x,y)+h(y,z)',
+    inputs: ['x', 'y', 'z'], domains: { x: 'vecInt', y: 'vecInt', z: 'vecInt' },
+    run: (x, y, z) => ham(x, z),
+    predicate: (x, y, z) => exactNum(ham(x, x), 0) && ham(x, z) <= ham(x, y) + ham(y, z),
+  });
+  reg(107, {
+    name: 'l1dist · 对称', intuition: 'L1 距离对两个端点对称（绝对值差求和）。',
+    math: 'd₁(x,y) = d₁(y,x)，d₁(x,y) = Σ|xᵢ−yᵢ|', pseudocode: 'return l1d(x,y)', complexity: 'O(n)',
+    ref: 'Strang (2016) L1 距离', commonPitfall: '逐项 |a−b| 与 |b−a| 逐位相同，同序累加 → exactNum 精确。',
+    invariant: '对 vecFinite：exactNum(d₁(x,y), d₁(y,x))',
+    inputs: ['x', 'y'], domains: { x: 'vecFinite', y: 'vecFinite' },
+    run: (x, y) => l1d(x, y),
+    predicate: (x, y) => exactNum(l1d(x, y), l1d(y, x)),
+  });
+  reg(108, {
+    name: 'l1dist · 三角与对角线', intuition: '自距离精确为 0；经第三点不缩短（L1 度量公理）。',
+    math: 'd₁(x,x) = 0；d₁(x,z) ≤ d₁(x,y) + d₁(y,z)', pseudocode: 'return l1d(x,z)', complexity: 'O(n)',
+    ref: 'Strang (2016) 距离函数', commonPitfall: '自减为 +0 故对角线精确；三角不等式加 1e-9 相对 epsilon。',
+    invariant: '对 vecFinite：exactNum(d₁(x,x),0) 且 d₁(x,z) ≤ d₁(x,y)+d₁(y,z)+ε',
+    inputs: ['x', 'y', 'z'], domains: { x: 'vecFinite', y: 'vecFinite', z: 'vecFinite' },
+    run: (x, y, z) => l1d(x, z),
+    predicate: (x, y, z) => exactNum(l1d(x, x), 0)
+      && l1d(x, z) <= l1d(x, y) + l1d(y, z) + 1e-9 * Math.max(1, l1d(x, y) + l1d(y, z)),
+  });
+
+  // ── 前缀积 / 极值扫描 / argmax / one-hot / gather / softmax（B109–B120）─
+  reg(109, {
+    name: 'cumprod · 末项即总积', intuition: '前缀积最后一个分量就是全量积。',
+    math: 'cumprod(x)[n−1] = Πᵢ xᵢ', pseudocode: 'return cumprod(x)', complexity: 'O(n)',
+    ref: '前缀积（扫描）；NumPy cumprod', commonPitfall: '参考路径用二分树形乘积（结合顺序不同），相对误差 ~1e-15；vecSmall 控幅 ≤1e8 不溢出。',
+    invariant: '对 vecSmall：relClose(cumprod(x)[n−1], treeProd(x), 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => cumprod(x),
+    predicate: (x) => rc(cumprod(x)[x.length - 1], treeProd(x, 0, x.length), 1e-9),
+  });
+  reg(110, {
+    name: 'cumprod · 逐项递推（商桥接）', intuition: '相邻前缀积之商恰为原分量（递推关系的除法验证）。',
+    math: 'p[i] = p[i−1]·x[i] ⟺ p[i]/p[i−1] = x[i]', pseudocode: 'return cumprod(x)', complexity: 'O(n)',
+    ref: '前缀积递推；数值分析除法桥接', commonPitfall: 'vecPos 保证前缀积 > 0（无零除）；除法是独立于乘法的参考路径；tol 1e-9。',
+    invariant: '对 vecPos：exactNum(p[0],x[0]) 且 ∀i≥1 relClose(p[i]/p[i−1], x[i], 1e-9)',
+    inputs: ['x'], domains: { x: 'vecPos' },
+    run: (x) => cumprod(x),
+    predicate: (x) => {
+      const p = cumprod(x);
+      if (!exactNum(p[0], x[0])) return false;
+      for (let i = 1; i < p.length; i++) if (!rc(p[i] / p[i - 1], x[i], 1e-9)) return false;
+      return true;
+    },
+  });
+  reg(111, {
+    name: 'cummax · 单调不减', intuition: '前缀最大值只增不减（滚动上界）。',
+    math: 'cm[i] ≥ cm[i−1] ∀i≥1', pseudocode: 'return cummax(x)', complexity: 'O(n)',
+    ref: 'NumPy maximum.accumulate', commonPitfall: '纯比较无舍入，逐位成立。',
+    invariant: '对 vecFinite：∀i≥1, cummax(x)[i] ≥ cummax(x)[i−1]',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => cummax(x),
+    predicate: (x) => { const c = cummax(x); for (let i = 1; i < c.length; i++) if (!(c[i] >= c[i - 1])) return false; return true; },
+  });
+  reg(112, {
+    name: 'cummax · 末项即最大值', intuition: '滚动到末尾即收获全局最大值。',
+    math: 'cummax(x)[n−1] = max(x)', pseudocode: 'return cummax(x)', complexity: 'O(n)',
+    ref: '序统计；扫描等价性', commonPitfall: '两侧皆为同一最大值的精确选取（并列时取值相同），exactNum 判等。',
+    invariant: '对 vecFinite：exactNum(cummax(x)[n−1], max(x))',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => cummax(x),
+    predicate: (x) => exactNum(cummax(x)[x.length - 1], maxv(x)),
+  });
+  reg(113, {
+    name: 'cummin · 单调不增', intuition: '前缀最小值只减不增（滚动下界）。',
+    math: 'cm[i] ≤ cm[i−1] ∀i≥1', pseudocode: 'return cummin(x)', complexity: 'O(n)',
+    ref: 'NumPy minimum.accumulate', commonPitfall: '纯比较无舍入，逐位成立。',
+    invariant: '对 vecFinite：∀i≥1, cummin(x)[i] ≤ cummin(x)[i−1]',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => cummin(x),
+    predicate: (x) => { const c = cummin(x); for (let i = 1; i < c.length; i++) if (!(c[i] <= c[i - 1])) return false; return true; },
+  });
+  reg(114, {
+    name: 'cummin · 末项即最小值', intuition: '滚动到末尾即收获全局最小值。',
+    math: 'cummin(x)[n−1] = min(x)', pseudocode: 'return cummin(x)', complexity: 'O(n)',
+    ref: '序统计；扫描等价性', commonPitfall: '两侧皆为同一最小值的精确选取，exactNum 判等。',
+    invariant: '对 vecFinite：exactNum(cummin(x)[n−1], min(x))',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => cummin(x),
+    predicate: (x) => exactNum(cummin(x)[x.length - 1], minv(x)),
+  });
+  reg(115, {
+    name: 'argmax · 选中最大值', intuition: 'argmax 下标处的分量就是全局最大值（扫描选元）。',
+    math: 'x[argmax(x)] = max(x)', pseudocode: 'return argmaxVec(x)', complexity: 'O(n)',
+    ref: '序统计；NumPy argmax（首个最大）', commonPitfall: 'argmax 取首个最大下标；maxv 独立扫描，选中值精确一致。',
+    invariant: '对 vecFinite：exactNum(x[argmax(x)], max(x))',
+    inputs: ['x'], domains: { x: 'vecFinite' },
+    run: (x) => argmaxVec(x),
+    predicate: (x) => exactNum(x[argmaxVec(x)], maxv(x)),
+  });
+  reg(116, {
+    name: 'argmax · 单热命中', intuition: '单热向量的 argmax 恰为置 1 的下标（索引结构视角）。',
+    math: 'argmax(onehot(k)) = k mod n ∈ [0,n)', pseudocode: 'return argmaxVec(onehot(n,k))', complexity: 'O(n)',
+    ref: '索引代数；one-hot 与 argmax 互逆', commonPitfall: 'x 仅提供长度语境（值不参与）；k 经 mod n 归约覆盖满域索引；返回值恒落在 [0,n)。',
+    invariant: '对 vecInt x, nat k：exactNum(argmax(onehot(k)), k mod n) 且 argmax ∈ [0,n)',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => argmaxVec(onehot(x.length, k)),
+    predicate: (x, k) => {
+      const a = argmaxVec(onehot(x.length, k));
+      return exactNum(a, k % x.length) && a >= 0 && a < x.length;
+    },
+  });
+  reg(117, {
+    name: 'onehot · 恰一个 1', intuition: '单热向量恰一个分量为 1、其余为 0。',
+    math: 'onehot(k) = e_{k mod n}：|{i : eᵢ = 1}| = 1', pseudocode: 'return onehot(n,k)', complexity: 'O(n)',
+    ref: 'NumPy eye/one-hot 语义', commonPitfall: 'x 仅提供长度语境；k 归约后必落域，故恒恰一个 1（整数判等，无浮点歧义）。',
+    invariant: '对 vecInt x, nat k：onehot(k) 恰一个 1 且其余分量均为 0',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => onehot(x.length, k),
+    predicate: (x, k) => {
+      const e = onehot(x.length, k);
+      let ones = 0;
+      for (let i = 0; i < e.length; i++) {
+        if (e[i] === 1) ones++;
+        else if (e[i] !== 0) return false;
+      }
+      return ones === 1;
+    },
+  });
+  reg(118, {
+    name: 'onehot · 和为 1', intuition: '单热向量各分量之和为 1（单纯形顶点）。',
+    math: 'Σᵢ onehot(k)ᵢ = 1', pseudocode: 'return sumv(onehot(n,k))', complexity: 'O(n)',
+    ref: '单纯形结构', commonPitfall: '整数计数无舍入，exactNum 精确。',
+    invariant: '对 vecInt x, nat k：exactNum(Σ onehot(k)ᵢ, 1)',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => sumv(onehot(x.length, k)),
+    predicate: (x, k) => exactNum(sumv(onehot(x.length, k)), 1),
+  });
+  reg(119, {
+    name: 'gather · 单热桥接', intuition: '按下标取址等价于与单热向量点积（选元的两种路径）。',
+    math: 'gather(v,i) = v[i mod n] = v · onehot(i)', pseudocode: 'return gather(v,i)', complexity: 'O(n)',
+    ref: 'Strang (2016) 标准基选元；gather/embedding 查表', commonPitfall: 'one-hot 点积是独立参考路径（线性组合 vs 直接寻址）；vecInt 下精确（其余项乘 0 不影响和）。',
+    invariant: '对 vecInt x, nat i：exactNum(gather(x,i), x·onehot(i))',
+    inputs: ['x', 'i'], domains: { x: 'vecInt', i: 'nat' },
+    run: (x, i) => gather(x, i),
+    predicate: (x, i) => exactNum(gather(x, i), dot(x, onehot(x.length, i))),
+  });
+  reg(120, {
+    name: 'softmax · 和为 1', intuition: 'softmax 输出落在概率单纯形上（结构和为 1）。',
+    math: 'Σᵢ softmax(x)ᵢ = 1', pseudocode: 'return softmaxVec(x)', complexity: 'O(n)',
+    ref: 'Goodfellow 2016 §6.2', commonPitfall: 'max 移位保证 exp 不溢出（vecSmall |x|≤10）；tol 1e-9。F 域已覆盖 0<p<1 与 Σp²≤1，此处补单纯形归一性，不重复同一性质。',
+    invariant: '对 vecSmall：relClose(Σ softmax(x)ᵢ, 1, 1e-9)',
+    inputs: ['x'], domains: { x: 'vecSmall' },
+    run: (x) => softmaxVec(x),
+    predicate: (x) => rc(sumv(softmaxVec(x)), 1, 1e-9),
+  });
+
+  // ── 切片与组合（B121–B128）────────────────────────────────────────────
+  reg(121, {
+    name: 'concat · 长度可加', intuition: '拼接后的长度等于两段长度之和。',
+    math: '|concat(x,y)| = |x| + |y|', pseudocode: 'return vConcat(x,y)', complexity: 'O(n+m)',
+    ref: 'NumPy concatenate 语义', commonPitfall: 'vecDims 取异长（5/3），验证长度可加而非等长巧合。',
+    invariant: '对 vecInt x,y：exactNum(|concat(x,y)|, |x|+|y|)',
+    inputs: ['x', 'y'], domains: { x: 'vecInt', y: 'vecInt' }, vecDims: { x: 5, y: 3 },
+    run: (x, y) => vConcat(x, y),
+    predicate: (x, y) => exactNum(vConcat(x, y).length, x.length + y.length),
+  });
+  reg(122, {
+    name: 'concat · 偏移切片还原', intuition: '按偏移量半开切片可完整还原两段原向量。',
+    math: 'slice(concat(x,y),0,|x|) = x；slice(concat(x,y),|x|,|x|+|y|) = y', pseudocode: 'return vConcat(x,y)', complexity: 'O(n+m)',
+    ref: '索引代数；半开区间边界', commonPitfall: '偏移 |x| 处归属后半（[0,|x|) 与 [|x|,|x|+|y|) 不重不漏）。',
+    invariant: '对 vecInt x,y：exactVec(两段还原切片, 原向量)',
+    inputs: ['x', 'y'], domains: { x: 'vecInt', y: 'vecInt' }, vecDims: { x: 5, y: 3 },
+    run: (x, y) => vConcat(x, y),
+    predicate: (x, y) => {
+      const c = vConcat(x, y);
+      return exactVec(vSlice(c, 0, x.length), x) && exactVec(vSlice(c, x.length, c.length), y);
+    },
+  });
+  reg(123, {
+    name: 'slice · 长度即差', intuition: '半开区间切片的长度恰为终点减起点。',
+    math: '|slice(x,s,e)| = e − s（0 ≤ s ≤ e ≤ n）', pseudocode: 'return vSlice(x, lo, hi)', complexity: 'O(e−s)',
+    ref: 'Python/NumPy 半开区间切片语义', commonPitfall: 'TAGS 无索引域：nat 索引经 mod (n+1) 归约到 [0,n] 并排序，覆盖空切片与满切片边界；若实现成 [s,e] 则长度多 1 即红。',
+    invariant: '对 vecInt x, nat s,e：exactNum(|slice|, hi−lo)，lo=min(s,e) 归约, hi=max(s,e) 归约',
+    inputs: ['x', 's', 'e'], domains: { x: 'vecInt', s: 'nat', e: 'nat' },
+    run: (x, s, e) => { const r = idx2(s, e, x.length); return vSlice(x, r[0], r[1]); },
+    predicate: (x, s, e) => { const r = idx2(s, e, x.length); return exactNum(vSlice(x, r[0], r[1]).length, r[1] - r[0]); },
+  });
+  reg(124, {
+    name: 'slice · 内容逐位一致', intuition: '切片第 i 个分量就是原向量第 s+i 个分量（半开区间选元）。',
+    math: 'slice(x,s,e)[i] = x[s+i] ∀i∈[0,e−s)', pseudocode: 'return vSlice(x, lo, hi)', complexity: 'O(e−s)',
+    ref: 'Python/NumPy 半开区间切片语义', commonPitfall: '内容经 one-hot 点积独立寻址验证（线性组合路径），非简单复抄；归约方式同 B123。',
+    invariant: '对 vecInt x, nat s,e：∀i, exactNum(slice[i], x·onehot(lo+i))',
+    inputs: ['x', 's', 'e'], domains: { x: 'vecInt', s: 'nat', e: 'nat' },
+    run: (x, s, e) => { const r = idx2(s, e, x.length); return vSlice(x, r[0], r[1]); },
+    predicate: (x, s, e) => {
+      const r = idx2(s, e, x.length);
+      const sl = vSlice(x, r[0], r[1]);
+      if (sl.length !== r[1] - r[0]) return false;
+      for (let i = 0; i < sl.length; i++) if (!exactNum(sl[i], dot(x, onehot(x.length, r[0] + i)))) return false;
+      return true;
+    },
+  });
+  reg(125, {
+    name: 'pad · 前补零保原值', intuition: '前面补零到目标长度，原值整体后移保持逐位不变。',
+    math: 'pad(x,m) = [0^(m−n), x]，m = n + (k mod 5)', pseudocode: 'return padFront(x, m)', complexity: 'O(m)',
+    ref: 'NumPy pad（前补零）语义', commonPitfall: 'k mod 5 覆盖 0..4 个补零（含零补零边界）；尾部经 one-hot 点积独立寻址验证。',
+    invariant: '对 vecInt x, nat k：|pad|=m，前 m−n 个为 0，尾部逐位还原 x',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => padFront(x, x.length + (k % 5)),
+    predicate: (x, k) => {
+      const n = x.length, m = n + (k % 5), p = padFront(x, m);
+      if (p.length !== m) return false;
+      for (let i = 0; i < m - n; i++) if (p[i] !== 0) return false;
+      for (let i = 0; i < n; i++) if (!exactNum(p[m - n + i], dot(x, onehot(n, i)))) return false;
+      return true;
+    },
+  });
+  reg(126, {
+    name: 'truncate · 前 n 项', intuition: '截取前 m 个分量，内容逐位保持。',
+    math: 'truncate(x,m) = x[0..m)，m = k mod (n+1)', pseudocode: 'return vTruncate(x, m)', complexity: 'O(m)',
+    ref: 'NumPy/PyTorch 截断语义', commonPitfall: 'm 经 mod (n+1) 归约覆盖 m=0（空）与 m=n（恒等）边界；内容经 one-hot 点积独立验证。',
+    invariant: '对 vecInt x, nat k：exactNum(|truncate|, m) 且 ∀i<m exactNum(t[i], x·onehot(i))',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => vTruncate(x, k % (x.length + 1)),
+    predicate: (x, k) => {
+      const m = k % (x.length + 1), t = vTruncate(x, m);
+      if (t.length !== m) return false;
+      for (let i = 0; i < m; i++) if (!exactNum(t[i], dot(x, onehot(x.length, i)))) return false;
+      return true;
+    },
+  });
+  reg(127, {
+    name: 'rotate · 复合还原', intuition: '循环移位 k 位再移位 n−k 位回到原向量（群结构）。',
+    math: 'rotate(rotate(v,k), n−k) = v（模 n 意义下）', pseudocode: 'return vRotate(v,k)', complexity: 'O(n)',
+    ref: '循环群索引代数', commonPitfall: '纯索引置换无数值舍入，vecInt 下逐位精确；k=0 时复合为恒等。',
+    invariant: '对 vecInt x, nat k：exactVec(rotate(rotate(x,k),n−k mod n), x)',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => vRotate(x, k),
+    predicate: (x, k) => {
+      const n = x.length, kw = k % n;
+      return exactVec(vRotate(vRotate(x, kw), (n - kw) % n), x);
+    },
+  });
+  reg(128, {
+    name: 'reverse · 与 rotate 复合', intuition: '先反转再循环移位，等于先循环移位（反方向）再反转。',
+    math: 'reverse(rotate(v,k)) = rotate(reverse(v), n−k)', pseudocode: 'return vRev(vRotate(v,k))', complexity: 'O(n)',
+    ref: '索引代数（反转与循环移位的交换关系）', commonPitfall: '两侧均为索引置换，逐位精确；n−k 取模 n。',
+    invariant: '对 vecInt x, nat k：exactVec(reverse(rotate(x,k)), rotate(reverse(x),n−k mod n))',
+    inputs: ['x', 'k'], domains: { x: 'vecInt', k: 'nat' },
+    run: (x, k) => vRev(vRotate(x, k)),
+    predicate: (x, k) => {
+      const n = x.length, kw = k % n;
+      return exactVec(vRev(vRotate(x, kw)), vRotate(vRev(x), (n - kw) % n));
+    },
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
@@ -5248,6 +6546,784 @@
       let pre = 0;
       for (let i = 0; i < n - 1; i++) pre += mid[i] * st[i];
       return NS.L7.shape.linearize(mid, shape, st) === pre + mid[n - 1];
+    },
+  });
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* ============================================================================
+ * L10 微指令 · E 域（形状与索引）· 第 4/4 批（E097–E128，T07 补齐）
+ * ----------------------------------------------------------------------------
+ * 所属层：L10-microIsa  域：E（形状与索引）
+ * 允许依赖的层：L7（shape 代数）、L9（rng）、L10（registry/invariant）
+ * 主要 @ref：numpy ndarray strides；numpy.squeeze/expand_dims/broadcast_to/
+ *           flatten/reshape/moveaxis；numpy 负下标与切片视图语义；
+ *           unravel_index（混合 radix 分解）；置换群共轭类
+ *
+ * 每项含七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ run + predicate。
+ * 判据：整数与结构精确，一律 === 与逐元素深比（eqArr）；无数值容差路径。
+ * 结构：E097–E108 形状变换（squeeze 结构/幂等、unsqueeze 指定轴、
+ *       expand 广播复制与 0 步长视图、flatten 任意轴区间、split 互逆、
+ *       moveaxis 归约 permute）；E109–E120 索引高级（ravel/unravel 往返、
+ *       sub2ind/ind2sub 2D 往返与越界抛、负索引归一、slice 偏移/长度/分段
+ *       公式、翻转轴镜像恒等与对合、contiguous 后缀积判定）；
+ *       E121–E128 形状代数进阶（三形状结合律、共轭置换、广播-reshape
+ *       复合、空维指定轴往返、形状相等判定、展平-置换可交换、flatten
+ *       分步结合、广播同伙伴幂等）。
+ * 与已落地项的分界：E001–E096 已覆盖连续步长/size/linearize/广播全套/
+ *       置换全套/重塑 size 层（含滤 1 保 size、合并尾维保 size、合并拆分
+ *       size 互证）——本批一律升级到「结构结果 / 一般化区间 / 视图步长 /
+ *       真正互逆往返」层，逐项在 commonPitfall 注明与最近邻项的差异。
+ * 加载顺序注意：本文件先于 L7 求值，NS.L7.shape 一律惰性引用（仅在
+ *       run/predicate/助手函数体内求值）。
+ * ==========================================================================*/
+;(function (NS) {
+  'use strict';
+  NS.L10 = NS.L10 || {};
+  const rc=(a,b,t)=>NS.L10.relClose(a,b,t);
+  function reg(i,o){ NS.L10.register('E', i, o); }
+
+  // ── 本地第一性原理助手 ──────────────────────────────────────────────
+  function eqArr(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  function prodRange(a, lo, hi) { let n = 1; for (let i = lo; i <= hi; i++) n *= a[i]; return n; }
+  function zerosOf(n) { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = 0; return a; }
+  function midOf(shape) { const a = new Array(shape.length); for (let i = 0; i < shape.length; i++) a[i] = shape[i] >> 1; return a; }
+  function identAxes(n) { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = i; return a; }
+  function reverseAxes(n) { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = n - 1 - i; return a; }
+  function rotateAxes(n) { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = (i + 1) % n; return a; }
+  // 后缀积：suffix[i] = ∏_{j>i} s[j]（末位为空积 1）——与 L7 连续步长同构（E065）。
+  function suffixProds(shape) {
+    const n = shape.length; const out = new Array(n); let acc = 1;
+    for (let i = n - 1; i >= 0; i--) { out[i] = acc; acc *= shape[i]; }
+    return out;
+  }
+  function throws(fn) { try { fn(); return false; } catch (e) { return true; } }
+
+  // ── 形状变换助手 ────────────────────────────────────────────────────
+  // squeeze：去掉所有长度为 1 的维（numpy.squeeze 全轴版）。
+  function squeezeAll(shape) { return shape.filter((d) => d > 1); }
+  // unsqueeze：在指定轴位置插入长度 1 的维（numpy.expand_dims，a ∈ [0,n]）。
+  function unsqueezeAt(shape, axis) {
+    if (!Number.isInteger(axis) || axis < 0 || axis > shape.length) {
+      throw new Error('[E] unsqueeze 轴非法: ' + String(axis));
+    }
+    const out = shape.slice(0, axis);
+    out.push(1);
+    for (let i = axis; i < shape.length; i++) out.push(shape[i]);
+    return out;
+  }
+  // flatten：把闭区间 [a,b] 的轴合并为一维（numpy 轴区间展平的一般化）。
+  function flattenRange(shape, a, b) {
+    const n = shape.length;
+    if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || a > b || b >= n) {
+      throw new Error('[E] flatten 轴区间非法: [' + String(a) + ',' + String(b) + ']');
+    }
+    const out = shape.slice(0, a);
+    out.push(prodRange(shape, a, b));
+    for (let i = b + 1; i < n; i++) out.push(shape[i]);
+    return out;
+  }
+  // split：flatten 的逆——把 axis 轴按 dims 拆开（维度之积必须等于该轴）。
+  function splitAxis(shape, axis, dims) {
+    const n = shape.length;
+    if (!Number.isInteger(axis) || axis < 0 || axis >= n) {
+      throw new Error('[E] split 轴非法: ' + String(axis));
+    }
+    if (prodRange(dims, 0, dims.length - 1) !== shape[axis]) {
+      throw new Error('[E] split 维度之积与目标轴大小不等');
+    }
+    const out = shape.slice(0, axis);
+    for (let i = 0; i < dims.length; i++) out.push(dims[i]);
+    for (let i = axis + 1; i < n; i++) out.push(shape[i]);
+    return out;
+  }
+  // moveaxis 的置换向量：把 src 轴搬到 dst 位置（numpy.moveaxis 的置换刻画）。
+  function moveAxesOf(n, src, dst) {
+    if (!Number.isInteger(src) || !Number.isInteger(dst) || src < 0 || src >= n || dst < 0 || dst >= n) {
+      throw new Error('[E] moveaxis 轴非法: ' + String(src) + '→' + String(dst));
+    }
+    const axes = [];
+    for (let i = 0; i < n; i++) if (i !== src) axes.push(i);
+    axes.splice(dst, 0, src);
+    return axes;
+  }
+  function moveAxis(shape, src, dst) {
+    const axes = moveAxesOf(shape.length, src, dst);
+    const out = new Array(shape.length);
+    for (let i = 0; i < axes.length; i++) out[i] = shape[axes[i]];
+    return out;
+  }
+  // 广播视图步长：源为 1 且目标 >1 的被扩展轴步长为 0（单元素复制语义），
+  // 其余轴沿用源连续步长。前提：src 与 dst 同长（尾对齐后）。
+  function bcastStrides(src, dst) {
+    const st = NS.L7.shape.contiguousStrides(src);
+    const out = new Array(src.length);
+    for (let i = 0; i < src.length; i++) out[i] = (src[i] === 1 && dst[i] > 1) ? 0 : st[i];
+    return out;
+  }
+
+  // ── 索引助手（行主序 C order）───────────────────────────────────────
+  // 下标归一：负索引 −a → n−a（numpy 语义）；归一后仍越界即抛。
+  function normIdx(k, n) {
+    if (!Number.isInteger(k)) throw new Error('[E] 下标必须为整数: ' + String(k));
+    const t = k < 0 ? n + k : k;
+    if (t < 0 || t >= n) throw new Error('[E] 下标越界: ' + String(k) + ' 对维度 ' + String(n));
+    return t;
+  }
+  // 多维下标 → 扁平偏移：Σ idx[i]·strides[i]；逐维边界检查，负下标先归一。
+  function sub2ind(idx, shape, strides) {
+    const n = shape.length;
+    if (!Array.isArray(idx) || idx.length !== n) throw new Error('[E] 下标个数与维数不一致');
+    const st = strides || NS.L7.shape.contiguousStrides(shape);
+    let off = 0;
+    for (let i = 0; i < n; i++) off += normIdx(idx[i], shape[i]) * st[i];
+    return off;
+  }
+  // 扁平偏移 → 多维下标：混合 radix 分解（逐维除后缀积取商、余数续传）。
+  function ind2sub(flat, shape) {
+    if (!Number.isInteger(flat) || flat < 0 || flat >= NS.L7.shape.size(shape)) {
+      throw new Error('[E] 扁平下标越界: ' + String(flat));
+    }
+    const suf = suffixProds(shape);
+    const out = new Array(shape.length);
+    let f = flat;
+    for (let i = 0; i < shape.length; i++) { out[i] = Math.floor(f / suf[i]); f -= out[i] * suf[i]; }
+    return out;
+  }
+  // 半开切片 [s,e) 步长 step≥1 的长度公式：⌈(e−s)/step⌉ 的整数写法。
+  function sliceLen(s, e, step) {
+    if (!Number.isInteger(step) || step < 1) throw new Error('[E] 切片步长必须 ≥1: ' + String(step));
+    return Math.floor((e - s + step - 1) / step);
+  }
+  // 循环计数参考路径：数 [s,e) 内 s+i·step 的个数（与公式互为独立验证）。
+  function sliceLenCount(s, e, step) {
+    let c = 0;
+    for (let i = 0; s + i * step < e; i++) c++;
+    return c;
+  }
+  // 轴 j 上的确定性切片参数（起/步/长/半开终点），全部落在维内。
+  function axisSlice(shape, k, j) {
+    const d = shape[j];
+    const step = (k % 4) + 1;
+    const start = (k >> 2) % d;
+    const lenMax = Math.floor((d - 1 - start) / step) + 1;
+    const len = ((k >> 6) % lenMax) + 1;
+    return { start: start, step: step, len: len, end: start + (len - 1) * step + 1 };
+  }
+  // 翻转指定轴的视图：形状不变、该轴步长取负、基偏移平移到该轴末端。
+  function flipAxisView(shape, strides, j) {
+    const st = strides.slice();
+    st[j] = -st[j];
+    return { stride: st, offset: (shape[j] - 1) * strides[j] };
+  }
+  // C 连续判定：维大小 >1 的轴步长必须等于后缀积；大小为 1 的轴步长任意
+  // （numpy flags.c_contiguous 语义：size-1 轴的步长不参与判定）。
+  function isContiguous(shape, strides) {
+    const suf = suffixProds(shape);
+    for (let i = 0; i < shape.length; i++) {
+      if (shape[i] > 1 && strides[i] !== suf[i]) return false;
+    }
+    return true;
+  }
+  // 形状相等判定：逐维相等（结构判定，不与 size 比较混同）。
+  function shapeEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  // ── 形状变换（E097–E108）────────────────────────────────────────────
+  reg(97, {
+    name: 'squeeze · 去 1 维后无 1 残留', intuition: '把所有长度 1 的维挤掉，结果里不该再出现 1 维。',
+    math: 'squeeze(s) = filter(s, d>1); ∀ d ∈ result: d > 1', pseudocode: 'loop assert all >1 && eqArr(result, independentFilter)', complexity: 'O(n)',
+    ref: 'numpy.squeeze（全轴版）', commonPitfall: 'E088 只断言 size 守恒；本项断言结构结果——无 1 残留且是原形状的保序子序列。',
+    invariant: '对任意正整型 shape：squeeze 结果无 1 维且逐项等于原形状非 1 维子序列',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => squeezeAll(shape),
+    predicate: (shape) => {
+      const r = squeezeAll(shape);
+      for (let i = 0; i < r.length; i++) if (r[i] <= 1) return false;
+      const ref = [];
+      for (let i = 0; i < shape.length; i++) if (shape[i] > 1) ref.push(shape[i]);
+      return eqArr(r, ref);
+    },
+  });
+  reg(98, {
+    name: 'squeeze · 幂等（再榨不变）', intuition: '挤过一次就没有 1 维了，再挤一遍还是它自己。',
+    math: 'squeeze(squeeze(s)) = squeeze(s)', pseudocode: 'assert eqArr', complexity: 'O(n)',
+    ref: 'numpy.squeeze（幂等性）', commonPitfall: '幂等性依赖「结果无 1 维」（E097）；两项合起来才是完整刻画，只测一半会漏掉递归错误。',
+    invariant: '对任意正整型 shape：squeeze 二次作用等于一次作用',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => squeezeAll(squeezeAll(shape)),
+    predicate: (shape) => eqArr(squeezeAll(squeezeAll(shape)), squeezeAll(shape)),
+  });
+  reg(99, {
+    name: 'unsqueeze · 指定轴插 1 保 size', intuition: '在任意轴位置插一个长度 1 的维，元素总数不变。',
+    math: 'size(unsqueeze(s,a)) = size(s), a ∈ [0,n]', pseudocode: 'a = k%(n+1); t = s[:a]+[1]+s[a:]; assert size & 结构', complexity: 'O(n)',
+    ref: 'numpy.expand_dims / unsqueeze', commonPitfall: '插入位 a 可取到 n（追加到末维之后）；漏掉端点会少测一种合法位。',
+    invariant: '对任意正整型 shape 与 nat k：unsqueeze 保 size 且插入位结构正确',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => unsqueezeAt(shape, k % (shape.length + 1)),
+    predicate: (shape, k) => {
+      const a = k % (shape.length + 1);
+      const t = unsqueezeAt(shape, a);
+      return t.length === shape.length + 1 && t[a] === 1
+        && NS.L7.shape.size(t) === NS.L7.shape.size(shape)
+        && eqArr(t.slice(0, a).concat(t.slice(a + 1)), shape);
+    },
+  });
+  reg(100, {
+    name: 'unsqueeze · 与 squeeze 互逆（无 1 基形）', intuition: '在没有任何 1 维的形状上插一个 1 再挤掉，回到原形。',
+    math: 'squeeze(unsqueeze(squeeze(s), a)) = squeeze(s)', pseudocode: 'base = squeeze(s); a = k%(len+1); assert 往返', complexity: 'O(n)',
+    ref: 'numpy.squeeze / expand_dims 互逆', commonPitfall: '基形若含 1 维，squeeze 会连它们一起去掉，往返不成立——故先榨一次取无 1 基形。',
+    invariant: '对任意正整型 shape 与 nat k：无 1 基形上 unsqueeze 与 squeeze 互为逆',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => { const base = squeezeAll(shape); const a = k % (base.length + 1); return squeezeAll(unsqueezeAt(base, a)); },
+    predicate: (shape, k) => {
+      const base = squeezeAll(shape);
+      const a = k % (base.length + 1);
+      const t = unsqueezeAt(base, a);
+      return t.length === base.length + 1 && t[a] === 1 && eqArr(squeezeAll(t), base);
+    },
+  });
+  reg(101, {
+    name: 'expand · 尾形广播复制 size', intuition: '尾维为 1 的形状被广播复制到目标尾维，size 恰好放大对应倍数。',
+    math: 'size(bcast(b,s)) = size(b)·s[n−1]，b = s 且 b[n−1]=1', pseudocode: 'b = copy(s); b[last]=1; assert eqArr(bc,s) && size 比', complexity: 'O(n)',
+    ref: 'numpy.broadcast_to（复制语义）', commonPitfall: '扩展比是目标尾维 s[n−1]；为 1 时是退化复制（比 1），仍合法，勿判失败。',
+    invariant: '对任意正整型 shape：尾维制 1 后广播复制的 size === 原 size × 扩展比',
+    inputs: ['shape'], domains: { shape: 'shape3' },
+    run: (shape) => { const b = shape.slice(); b[b.length - 1] = 1; return NS.L7.shape.broadcastShapes(b, shape); },
+    predicate: (shape) => {
+      const n = shape.length;
+      const b = shape.slice(); b[n - 1] = 1;
+      const bc = NS.L7.shape.broadcastShapes(b, shape);
+      return eqArr(bc, shape) && NS.L7.shape.size(bc) === NS.L7.shape.size(b) * shape[n - 1];
+    },
+  });
+  reg(102, {
+    name: 'expand · 单元素复制语义（0 步长视图）', intuition: '广播视图不复制存储：被扩展轴的步长为 0，整条轴共享同一个元素。',
+    math: 'stV[j]=0 ∧ lin(idx,s,stV) = lin(idx|_{j=0}, b)', pseudocode: 'stV = bcastStrides(b,s); assert 0 步长 & 共享偏移 & 源缓冲一致', complexity: 'O(n)',
+    ref: 'numpy.broadcast_to（0 步长视图）', commonPitfall: '目标尾维为 1 时没有发生扩展，该轴步长保持 1 而非 0——判据须含此分支，否则退化输入假阳性。',
+    invariant: '对任意正整型 shape：广播视图在被扩展尾轴上步长为 0、复制方向偏移共享且与源缓冲偏移一致',
+    inputs: ['shape'], domains: { shape: 'shape3' },
+    run: (shape) => { const n = shape.length; const b = shape.slice(); b[n - 1] = 1; return bcastStrides(b, shape); },
+    predicate: (shape) => {
+      const n = shape.length;
+      const b = shape.slice(); b[n - 1] = 1;
+      const stV = bcastStrides(b, shape);
+      const stB = NS.L7.shape.contiguousStrides(b);
+      if ((stV[n - 1] === 0) !== (shape[n - 1] > 1)) return false;   // 扩展 ⇔ 0 步长
+      const i1 = midOf(shape);
+      const i2 = i1.slice(); i2[n - 1] = shape[n - 1] - 1;           // 仅尾坐标不同
+      const i0 = i1.slice(); i0[n - 1] = 0;                          // 源侧坐标
+      const o1 = NS.L7.shape.linearize(i1, shape, stV);
+      return o1 === NS.L7.shape.linearize(i2, shape, stV)            // 复制语义：同偏移
+        && o1 === NS.L7.shape.linearize(i0, b, stB)                  // 视图偏移即源偏移
+        && o1 >= 0 && o1 < NS.L7.shape.size(b);                      // 落在源缓冲内
+    },
+  });
+  reg(103, {
+    name: 'flatten · 指定轴区间保 size', intuition: '把任意闭区间 [a,b] 的轴合并成一维，元素总数不变。',
+    math: 'size(flatten(s,a,b)) = size(s), 0≤a≤b<n', pseudocode: 'a=k%n, b=(k>>5)%n, 逆序则交换; assert size & 维数', complexity: 'O(n)',
+    ref: 'numpy.flatten / reshape（轴区间一般化）', commonPitfall: 'E056 只合并尾段；本项覆盖任意起止轴（含中段），维数恰减少 (b−a)。',
+    invariant: '对任意正整型 shape 与 nat k：指定轴区间合并后 size 不变、维数减少 (b−a)',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => { const n = shape.length; let a = k % n, b = (k >> 5) % n; if (a > b) { const t = a; a = b; b = t; } return flattenRange(shape, a, b); },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      let a = k % n, b = (k >> 5) % n;
+      if (a > b) { const t = a; a = b; b = t; }
+      const flat = flattenRange(shape, a, b);
+      return NS.L7.shape.size(flat) === NS.L7.shape.size(shape) && flat.length === n - (b - a);
+    },
+  });
+  reg(104, {
+    name: 'flatten · 区间外维保序', intuition: '合并只吃掉 [a,b] 之间的轴，区间外的维按原相对次序留在原地。',
+    math: 't = s[:a] + [∏_{i=a..b} s[i]] + s[b+1:]', pseudocode: 'assert 头段 eq & 尾段 eq & t[a] = 区间积', complexity: 'O(n)',
+    ref: 'numpy.reshape（保序块合并）', commonPitfall: '尾段在结果中的下标要整体左移 (b−a) 位；逐项比对时错位是最常见的错。',
+    invariant: '对任意正整型 shape 与 nat k：flatten 结果头段、尾段与原形状对应段逐项相等',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => { const n = shape.length; let a = k % n, b = (k >> 5) % n; if (a > b) { const t = a; a = b; b = t; } return flattenRange(shape, a, b); },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      let a = k % n, b = (k >> 5) % n;
+      if (a > b) { const t = a; a = b; b = t; }
+      const flat = flattenRange(shape, a, b);
+      for (let i = 0; i < a; i++) if (flat[i] !== shape[i]) return false;
+      if (flat[a] !== prodRange(shape, a, b)) return false;
+      for (let i = 0; i < n - 1 - b; i++) if (flat[a + 1 + i] !== shape[b + 1 + i]) return false;
+      return flat.length === a + 1 + (n - 1 - b);
+    },
+  });
+  reg(105, {
+    name: 'flatten · 端点即全展平', intuition: '区间取遍全部轴时，合并结果就是单维 [size]。',
+    math: 'flatten(s,0,n−1) = [size(s)]', pseudocode: 'assert 长度 1 且唯一维 === L7 size', complexity: 'O(n)',
+    ref: 'numpy.ravel（C 序）', commonPitfall: '与 E055 的 size 层断言不同：本项是形状结构逐项相等（长度 1 且唯一维为 size）。',
+    invariant: '对任意正整型 shape：全轴区间 flatten 结果逐项等于 [size]',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => flattenRange(shape, 0, shape.length - 1),
+    predicate: (shape) => {
+      const t = flattenRange(shape, 0, shape.length - 1);
+      return t.length === 1 && t[0] === NS.L7.shape.size(shape);
+    },
+  });
+  reg(106, {
+    name: 'split · flatten 互逆', intuition: '按原维度序列拆回合并轴，得到原形状——flatten 与 split 互为逆操作。',
+    math: 'split(flatten(s,a,b), a, s[a:b+1]) = s', pseudocode: 't = flatten; back = split(t,a,原维度); assert eqArr', complexity: 'O(n)',
+    ref: 'numpy.reshape（互逆拆分）', commonPitfall: 'E062 只比对两种拆法的 size；本项是真正的结构往返，且 split 内部校验维度之积相等。',
+    invariant: '对任意正整型 shape 与 nat k：split 是 flatten 在指定轴区间上的逆',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => { const n = shape.length; let a = k % n, b = (k >> 5) % n; if (a > b) { const t = a; a = b; b = t; } return splitAxis(flattenRange(shape, a, b), a, shape.slice(a, b + 1)); },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      let a = k % n, b = (k >> 5) % n;
+      if (a > b) { const t = a; a = b; b = t; }
+      const flat = flattenRange(shape, a, b);
+      return eqArr(splitAxis(flat, a, shape.slice(a, b + 1)), shape);
+    },
+  });
+  reg(107, {
+    name: 'moveaxis · 指定轴迁移保 size', intuition: '把一个轴搬到另一个位置，只是重新解释维度次序，元素总数不变。',
+    math: 'size(moveaxis(s,src,dst)) = size(s)', pseudocode: 'src=k%n, dst=(k>>5)%n; assert size', complexity: 'O(n)',
+    ref: 'numpy.moveaxis / transpose', commonPitfall: 'src=dst 时是恒等迁移，仍须成立——勿在谓词里特判掉这种退化。',
+    invariant: '对任意正整型 shape 与 nat k：moveaxis 保 size',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => moveAxis(shape, k % shape.length, (k >> 5) % shape.length),
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const src = k % n, dst = (k >> 5) % n;
+      return NS.L7.shape.size(moveAxis(shape, src, dst)) === NS.L7.shape.size(shape);
+    },
+  });
+  reg(108, {
+    name: 'moveaxis · 与 permute 复合', intuition: 'moveaxis 就是一次置换：与 L7 permute 结果一致，且搬过去再搬回来是原形。',
+    math: 'moveaxis(s,src,dst) = permute(s,σ) ∧ moveaxis(moveaxis(s,src,dst),dst,src) = s', pseudocode: 'σ = moveAxesOf(n,src,dst); assert eqArr & 往返', complexity: 'O(n)',
+    ref: 'numpy.moveaxis ≡ transpose（零重写：复用 L7 permute）', commonPitfall: '往返的第二跳要把「当前在 dst 的轴」搬回 src——src/dst 参数写反会得到另一个置换。',
+    invariant: '对任意正整型 shape 与 nat k：moveaxis 归约为 L7 permute 且往返还原',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => {
+      const n = shape.length;
+      const src = k % n, dst = (k >> 5) % n;
+      return NS.L7.shape.permute(shape, NS.L7.shape.contiguousStrides(shape), moveAxesOf(n, src, dst)).shape;
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const src = k % n, dst = (k >> 5) % n;
+      const axes = moveAxesOf(n, src, dst);
+      const viaPermute = NS.L7.shape.permute(shape, NS.L7.shape.contiguousStrides(shape), axes).shape;
+      const moved = moveAxis(shape, src, dst);
+      return eqArr(moved, viaPermute) && eqArr(moveAxis(moved, dst, src), shape);
+    },
+  });
+
+  // ── 索引高级（E109–E120）────────────────────────────────────────────
+  reg(109, {
+    name: 'ravel/unravel · 多维往返', intuition: '多维下标压成扁平偏移再解回来，还是原来那个下标。',
+    math: 'ind2sub(sub2ind(idx,s,st),s) = idx（混合 radix 分解互逆）', pseudocode: 'idx 由 k 派生; f = sub2ind; assert eqArr(back, idx)', complexity: 'O(n)',
+    ref: 'numpy.ravel_multi_index / unravel_index', commonPitfall: 'unravel 必须用后缀积逐维取商；改用前缀积会得到列主序分解，往返必挂。',
+    invariant: '对任意正整型 shape 与 nat k：构造下标经 ravel/unravel 往返后逐项还原',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const n = shape.length;
+      const idx = new Array(n);
+      for (let i = 0; i < n; i++) idx[i] = (k + i * 7919) % shape[i];
+      return ind2sub(sub2ind(idx, shape), shape);
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const idx = new Array(n);
+      for (let i = 0; i < n; i++) idx[i] = (k + i * 7919) % shape[i];
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const f = sub2ind(idx, shape, st);
+      const back = ind2sub(f, shape);
+      return eqArr(back, idx) && sub2ind(back, shape, st) === f
+        && f >= 0 && f < NS.L7.shape.size(shape);
+    },
+  });
+  reg(110, {
+    name: 'sub2ind · 负下标归一后与 L7 一致', intuition: '负下标先按 numpy 规则归一成正下标，再走同一条点积，与 L7 linearize 逐位相同。',
+    math: 'sub2ind(idx−s, s, st) = lin(idx, s, st)（逐维 −s[i] 归一回 +idx[i]）', pseudocode: 'neg[i] = idx[i]−s[i]; assert sub2ind(neg) === linearize(idx)', complexity: 'O(n)',
+    ref: 'numpy 负下标语义 + ndarray strides', commonPitfall: '归一必须在边界检查之前；先查后归会把合法负下标误判越界而误抛。',
+    invariant: '对任意正整型 shape 与 nat k：负下标归一后的 sub2ind === L7 linearize',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const n = shape.length;
+      const idx = new Array(n); const neg = new Array(n);
+      for (let i = 0; i < n; i++) { idx[i] = (k + i * 104729) % shape[i]; neg[i] = idx[i] - shape[i]; }
+      return sub2ind(neg, shape);
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const idx = new Array(n); const neg = new Array(n);
+      for (let i = 0; i < n; i++) { idx[i] = (k + i * 104729) % shape[i]; neg[i] = idx[i] - shape[i]; }
+      const st = NS.L7.shape.contiguousStrides(shape);
+      return sub2ind(neg, shape, st) === NS.L7.shape.linearize(idx, shape, st);
+    },
+  });
+  reg(111, {
+    name: 'sub2ind/ind2sub · 2D 行主序往返', intuition: '二维上扁平下标 = 行·列数 + 列，解回来再编回去还是它。',
+    math: 'f ∈ [0,r·c); sub = [⌊f/c⌋, f%c]; sub2ind(sub) = f', pseudocode: 'f = k%(r*c); assert 行列公式 & 往返 & 界', complexity: 'O(1)',
+    ref: 'numpy.unravel_index（C 序）', commonPitfall: '行主序是 ⌊f/c⌋ 在前；写成 ⌊f/r⌋ 是列主序，往返立即挂。',
+    invariant: '对任意二阶正整型 shape 与 nat k：ind2sub/sub2ind 在行主序下往返且行列公式正确',
+    inputs: ['shape', 'k'], domains: { shape: 'shape2', k: 'nat' },
+    run: (shape, k) => ind2sub(k % (shape[0] * shape[1]), shape),
+    predicate: (shape, k) => {
+      const r = shape[0], c = shape[1];
+      const f = k % (r * c);
+      const sub = ind2sub(f, shape);
+      return sub.length === 2 && sub[0] === Math.floor(f / c) && sub[1] === f % c
+        && sub2ind(sub, shape) === f
+        && sub[0] >= 0 && sub[0] < r && sub[1] >= 0 && sub[1] < c;
+    },
+  });
+  reg(112, {
+    name: 'sub2ind/ind2sub · 越界即抛', intuition: '扁平下标到顶、行越界、列越界，都必须抛错而不是静默绕回。',
+    math: 'f ≥ r·c ∨ f < 0 ∨ row ≥ r ∨ col ≥ c ⇒ throw', pseudocode: '四类越界构造; 全部必须抛', complexity: 'O(1)',
+    ref: 'numpy IndexError 语义', commonPitfall: '只测上界不够；负扁平下标同样要抛（归一只对「分量为负但归一后仍在域内」生效）。',
+    invariant: '对任意二阶正整型 shape：sub2ind/ind2sub 对四类越界构造均抛错',
+    inputs: ['shape'], domains: { shape: 'shape2' },
+    run: (shape) => {
+      const r = shape[0], c = shape[1];
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const all = throws(() => ind2sub(r * c, shape)) && throws(() => ind2sub(-1, shape))
+        && throws(() => sub2ind([r, 0], shape, st)) && throws(() => sub2ind([0, c], shape, st));
+      return all ? 'threw' : 'no-throw';
+    },
+    predicate: (shape) => {
+      const r = shape[0], c = shape[1];
+      const st = NS.L7.shape.contiguousStrides(shape);
+      return throws(() => ind2sub(r * c, shape))
+        && throws(() => ind2sub(-1, shape))
+        && throws(() => sub2ind([r, 0], shape, st))
+        && throws(() => sub2ind([0, c], shape, st));
+    },
+  });
+  reg(113, {
+    name: '负索引 · 归一合法域', intuition: '−1 指最后一维、−n 指第 0 维，负索引整体平移到正域。',
+    math: 'norm(−1,n)=n−1 ∧ norm(−n,n)=0 ∧ norm(−a,n)=n−a', pseudocode: 'a = k%n+1; assert 三个等式', complexity: 'O(1)',
+    ref: 'numpy 负下标归一', commonPitfall: '−a 的合法域是 a ∈ [1,n]；写成 [0,n) 会把 −0（即 0）误当负索引，多算一种情形。',
+    invariant: '对任意正整型 shape 与 nat k：负索引归一满足端点与一般式',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => { const n = shape.length; const a = (k % n) + 1; return [normIdx(-1, n), normIdx(-n, n), normIdx(-a, n)]; },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const a = (k % n) + 1;
+      return normIdx(-1, n) === n - 1 && normIdx(-n, n) === 0 && normIdx(-a, n) === n - a;
+    },
+  });
+  reg(114, {
+    name: '负索引 · 越界仍抛', intuition: '负过头（−n−1）或正到顶（n），归一后依然越界，必须抛。',
+    math: 'norm(−n−1,n) throw ∧ norm(n,n) throw', pseudocode: '两类构造; 均须抛', complexity: 'O(1)',
+    ref: 'numpy IndexError 语义', commonPitfall: '归一式 n+k 对 k=−n−1 得 −1，仍 <0——不能因为「减过头」就放行。',
+    invariant: '对任意正整型 shape：负索引归一对双向越界均抛错',
+    inputs: ['shape'], domains: { shape: 'shape2' },
+    run: (shape) => (throws(() => normIdx(-shape.length - 1, shape.length)) && throws(() => normIdx(shape.length, shape.length))) ? 'threw' : 'no-throw',
+    predicate: (shape) => {
+      const n = shape.length;
+      return throws(() => normIdx(-n - 1, n)) && throws(() => normIdx(n, n));
+    },
+  });
+  reg(115, {
+    name: 'slice · 偏移公式', intuition: '半开切片视图的基偏移就是起点坐标与步长的点积。',
+    math: 'offset(s) = Σ s[i]·st[i] = lin(s) ∧ off(last) = off + (len−1)·step·st[j]', pseudocode: 'j = k%n; sl = axisSlice; assert 点积 === L7 lin & 末元素可加', complexity: 'O(n)',
+    ref: 'numpy 切片视图（base offset）', commonPitfall: '末元素偏移 = 基偏移 + (len−1)·step·st[j]；只查基偏移不查末元素，等于没验证切片长度。',
+    invariant: '对任意正整型 shape 与 nat k：切片视图基偏移等于起点点积且末元素偏移可加',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const j = k % shape.length;
+      const sl = axisSlice(shape, k, j);
+      const idx = midOf(shape); idx[j] = sl.start;
+      return NS.L7.shape.linearize(idx, shape);
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const j = k % n;
+      const sl = axisSlice(shape, k, j);
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const idx = midOf(shape); idx[j] = sl.start;
+      const last = sl.start + (sl.len - 1) * sl.step;
+      const idxLast = midOf(shape); idxLast[j] = last;
+      let dot = 0;
+      for (let i = 0; i < n; i++) dot += idx[i] * st[i];
+      const base = NS.L7.shape.linearize(idx, shape, st);
+      return base === dot && base === sub2ind(idx, shape, st)
+        && NS.L7.shape.linearize(idxLast, shape, st) === base + (sl.len - 1) * sl.step * st[j]
+        && last < shape[j];
+    },
+  });
+  reg(116, {
+    name: 'slice · 半开长度公式', intuition: '[s,e) 里按 step 跳跃能取几个数，ceil 除法一次算对。',
+    math: 'len = ⌈(e−s)/step⌉ = ⌊(e−s+step−1)/step⌋', pseudocode: 'assert 公式 === 循环计数 && 末元素在界 && 再一步出界', complexity: 'O(1)',
+    ref: 'numpy 切片长度语义', commonPitfall: '整数除法向下取整，(e−s+step−1) 的 +step−1 补偿不能省；省略会少算一个元素。',
+    invariant: '对任意正整型 shape 与 nat k：切片长度公式与循环计数参考路径一致且末元素刻画正确',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => { const j = k % shape.length; const sl = axisSlice(shape, k, j); return sliceLen(sl.start, sl.end, sl.step); },
+    predicate: (shape, k) => {
+      const j = k % shape.length;
+      const sl = axisSlice(shape, k, j);
+      return sliceLen(sl.start, sl.end, sl.step) === sl.len
+        && sliceLenCount(sl.start, sl.end, sl.step) === sl.len
+        && sl.start + (sl.len - 1) * sl.step < sl.end
+        && sl.start + sl.len * sl.step >= sl.end;
+    },
+  });
+  reg(117, {
+    name: 'slice · 分段偏移可加', intuition: '把一段切片从中间切开，两段的偏移差之和等于整段的偏移差。',
+    math: '(off(m)−off(s)) + (off(e)−off(m)) = off(e)−off(s) = (e−s)·st[j]', pseudocode: 'm ∈ [s,e); assert 长度可加 & Δoff = Δcoord·st[j]', complexity: 'O(n)',
+    ref: '仿射视图复合（切片拼接）', commonPitfall: '偏移可加只在「仅同一轴变化」时成立；跨轴拼接还要叠加其它轴的固定贡献。',
+    invariant: '对任意正整型 shape 与 nat k：切片分段后长度与偏移均可加',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const j = k % shape.length;
+      const sl = axisSlice(shape, k, j);
+      const m = sl.start + (k % (sl.end - sl.start));
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const iS = midOf(shape); iS[j] = sl.start;
+      const iM = midOf(shape); iM[j] = m;
+      return NS.L7.shape.linearize(iM, shape, st) - NS.L7.shape.linearize(iS, shape, st);
+    },
+    predicate: (shape, k) => {
+      const j = k % shape.length;
+      const sl = axisSlice(shape, k, j);
+      const m = sl.start + (k % (sl.end - sl.start));
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const iS = midOf(shape); iS[j] = sl.start;
+      const iM = midOf(shape); iM[j] = m;
+      return (m - sl.start) + (sl.end - m) === sl.end - sl.start
+        && NS.L7.shape.linearize(iM, shape, st) - NS.L7.shape.linearize(iS, shape, st) === (m - sl.start) * st[j];
+    },
+  });
+  reg(118, {
+    name: '翻转轴 · 步长取负镜像恒等式', intuition: '把一根轴翻过来看：该轴步长取负、基偏移平移到末端，读到的正是镜像位置的元素。',
+    math: 'lin(idx,s,−st,off) = lin(mirror(idx),s,st), off = (s[j]−1)·st[j]', pseudocode: 'v = flipAxisView; assert 取负 & 偏移式 & 镜像 & 值域', complexity: 'O(n)',
+    ref: 'numpy 负步长视图（a[::-1]）', commonPitfall: '只把步长取负而不平移基偏移，视图会整体读出缓冲区左侧的垃圾。',
+    invariant: '对任意正整型 shape 与 nat k：翻转视图满足镜像恒等式且所有探测偏移保持在 [0,size)',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const j = k % shape.length;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const v = flipAxisView(shape, st, j);
+      return NS.L7.shape.linearize(midOf(shape), shape, v.stride, v.offset);
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const j = k % n;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const v = flipAxisView(shape, st, j);
+      const mid = midOf(shape);
+      const mir = mid.slice(); mir[j] = shape[j] - 1 - mid[j];
+      if (v.stride[j] !== -st[j] || v.offset !== (shape[j] - 1) * st[j]) return false;
+      if (NS.L7.shape.linearize(mid, shape, v.stride, v.offset) !== NS.L7.shape.linearize(mir, shape, st)) return false;
+      const sz = NS.L7.shape.size(shape);
+      const probes = [zerosOf(n), mid, shape.map((d) => d - 1)];
+      for (let p = 0; p < probes.length; p++) {
+        const o = NS.L7.shape.linearize(probes[p], shape, v.stride, v.offset);
+        if (o < 0 || o >= sz) return false;
+      }
+      return true;
+    },
+  });
+  reg(119, {
+    name: '翻转 · 二次对合', intuition: '同一根轴连翻两次，步长负负得正、偏移抵消，视图回到原状。',
+    math: 'flip(flip(v)) = v（stride 还原、offset 归零）', pseudocode: 'v2 = flip(v1); assert eqArr(stride) && offset 和 === 0', complexity: 'O(n)',
+    ref: '对合（involution）', commonPitfall: '两次翻转必须沿同一轴；翻完 j 再翻 k≠j 得到的是双负步长，不是还原。',
+    invariant: '对任意正整型 shape 与 nat k：同轴二次翻转步长与偏移均还原',
+    inputs: ['shape', 'k'], domains: { shape: 'shape4', k: 'nat' },
+    run: (shape, k) => {
+      const j = k % shape.length;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const v1 = flipAxisView(shape, st, j);
+      return flipAxisView(shape, v1.stride, j).stride;
+    },
+    predicate: (shape, k) => {
+      const j = k % shape.length;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const v1 = flipAxisView(shape, st, j);
+      const v2 = flipAxisView(shape, v1.stride, j);
+      const mid = midOf(shape);
+      return eqArr(v2.stride, st) && v1.offset + v2.offset === 0
+        && NS.L7.shape.linearize(mid, shape, v2.stride, v1.offset + v2.offset) === NS.L7.shape.linearize(mid, shape, st);
+    },
+  });
+  reg(120, {
+    name: 'contiguous 判定 · 后缀积准则', intuition: 'C 连续的充要条件是非 1 维步长都等于后缀积；1 维轴的步长无所谓。',
+    math: 'contig(s,st) ⟺ ∀i: s[i]>1 ⇒ st[i]=∏_{j>i}s[j]', pseudocode: 'assert L7 步长判连续; 可探测扰动脉冲判不连续; 全 1 形状任意步长皆连续', complexity: 'O(n)',
+    ref: 'numpy flags.c_contiguous（size-1 轴步长不计）', commonPitfall: '「首不确定」是误读：不确定的只是大小为 1 的轴（含首维为 1 的情形），非 1 维一步长都不能差。',
+    invariant: '对任意正整型 shape：连续步长判定为连续、可探测扰动脉冲为不连续、全 1 形状任意步长皆连续',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => isContiguous(shape, NS.L7.shape.contiguousStrides(shape)),
+    predicate: (shape) => {
+      const st = NS.L7.shape.contiguousStrides(shape);
+      if (!isContiguous(shape, st)) return false;
+      let j = -1;
+      for (let i = 0; i < shape.length; i++) if (shape[i] > 1) { j = i; break; }
+      if (j < 0) return isContiguous(shape, zerosOf(shape.length));   // 全 1 形状：任意步长
+      const bad = st.slice(); bad[j] += 1;                            // 可探测扰动
+      return !isContiguous(shape, bad);
+    },
+  });
+
+  // ── 形状代数进阶（E121–E128）────────────────────────────────────────
+  reg(121, {
+    name: '广播 · 三形状结合律（奇偶 1 型）', intuition: '三种兼容形状按不同顺序两两广播再复合，结果相同。',
+    math: '(s⊕e)⊕o = s⊕(e⊕o)，e = 偶维置 1，o = 奇维置 1', pseudocode: 'assert eqArr(lhs, rhs) && 长度不变', complexity: 'O(n)',
+    ref: 'numpy broadcasting 结合律', commonPitfall: '结合律前提是每一对中间结果都兼容；E081 用切片构造覆盖缺长链，本项用等长奇偶 1 型覆盖全维兼容面，两者互补。',
+    invariant: '对任意正整型 shape：L7 广播对等长奇偶 1 型三形状链满足结合律',
+    inputs: ['shape'], domains: { shape: 'shape3' },
+    run: (shape) => {
+      const e = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      const o = shape.map((d, i) => (i % 2 === 1 ? 1 : d));
+      return NS.L7.shape.broadcastShapes(NS.L7.shape.broadcastShapes(shape, e), o);
+    },
+    predicate: (shape) => {
+      const e = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      const o = shape.map((d, i) => (i % 2 === 1 ? 1 : d));
+      const lhs = NS.L7.shape.broadcastShapes(NS.L7.shape.broadcastShapes(shape, e), o);
+      const rhs = NS.L7.shape.broadcastShapes(shape, NS.L7.shape.broadcastShapes(e, o));
+      return eqArr(lhs, rhs) && lhs.length === shape.length;
+    },
+  });
+  reg(122, {
+    name: '共轭置换仍是置换', intuition: '置换群里共轭一个置换，得到的还是合法排列，且保 size、可逆。',
+    math: 'σ∘τ∘σ⁻¹ ∈ S_n ∧ size 守恒 ∧ 逆置换还原', pseudocode: 'σ=reverse, τ=rotate; assert L7 接受 & size & 往返', complexity: 'O(n)',
+    ref: '置换群共轭类（Cayley 定理视角）', commonPitfall: '共轭复合顺序容易写反（σ∘τ∘σ⁻¹ ≠ σ⁻¹∘τ∘σ 一般情形）；按 comp(p,q)[i]=p[q[i]] 从右往左应用。',
+    invariant: '对任意正整型 shape：构造共轭置换被 L7 接受、保 size 且可逆',
+    inputs: ['shape'], domains: { shape: 'shape3' },
+    run: (shape) => {
+      const n = shape.length;
+      const sig = reverseAxes(n); const tau = rotateAxes(n); const invSig = NS.L7.shape.invertPerm(sig);
+      const conj = new Array(n);
+      for (let i = 0; i < n; i++) conj[i] = sig[tau[invSig[i]]];
+      return conj;
+    },
+    predicate: (shape) => {
+      const n = shape.length;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const sig = reverseAxes(n); const tau = rotateAxes(n); const invSig = NS.L7.shape.invertPerm(sig);
+      const conj = new Array(n);
+      for (let i = 0; i < n; i++) conj[i] = sig[tau[invSig[i]]];
+      let p1;
+      try { p1 = NS.L7.shape.permute(shape, st, conj); } catch (e) { return false; }  // 合法性硬门禁
+      if (NS.L7.shape.size(p1.shape) !== NS.L7.shape.size(shape)) return false;
+      const p2 = NS.L7.shape.permute(p1.shape, p1.stride, NS.L7.shape.invertPerm(conj));
+      return eqArr(p2.shape, shape);
+    },
+  });
+  reg(123, {
+    name: '广播后 reshape · size 不减', intuition: '广播把 1 放大之后整体展平，元素数不比任何输入少。',
+    math: 'size([size(bcast(s,b))]) = size(bcast(s,b)) ≥ size(s), size(b)', pseudocode: 'b = 偶维 1; bc = bcast(s,b); t = [size(bc)]; assert 链', complexity: 'O(n)',
+    ref: 'numpy broadcasting + reshape', commonPitfall: '「不减」含取等（对手全是 1 的维时）；断言成严格大于会在退化输入上假阳性。',
+    invariant: '对任意正整型 shape：广播结果展平后 size 与广播 size 一致且不小于双方输入 size',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => {
+      const b = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      return [NS.L7.shape.size(NS.L7.shape.broadcastShapes(shape, b))];
+    },
+    predicate: (shape) => {
+      const b = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      const bc = NS.L7.shape.broadcastShapes(shape, b);
+      const t = [NS.L7.shape.size(bc)];
+      const sz = NS.L7.shape.size(shape);
+      return NS.L7.shape.size(t) === NS.L7.shape.size(bc)
+        && NS.L7.shape.size(bc) >= sz && NS.L7.shape.size(bc) >= NS.L7.shape.size(b)
+        && NS.L7.shape.linearize([t[0] - 1], t) === sz - 1;
+    },
+  });
+  reg(124, {
+    name: '空维 · 指定轴移除与插回互逆', intuition: '把一个大小为 1 的轴拿掉再插回原位，形状还原、size 不变。',
+    math: 'unsqueeze(remove(s,j), j) = s|_{s[j]=1} ∧ size 守恒', pseudocode: 'j = k%n; s1 = s 且 s1[j]=1; assert 互逆 & size', complexity: 'O(n)',
+    ref: 'numpy.squeeze(axis) / expand_dims 互逆', commonPitfall: 'E088 是「滤全部 1 维保 size」；本项是「指定单轴」的结构往返，二者互为补充。',
+    invariant: '对任意正整型 shape 与 nat k：指定轴置 1 后移除与插回互为逆且 size 不变',
+    inputs: ['shape', 'k'], domains: { shape: 'shape3', k: 'nat' },
+    run: (shape, k) => {
+      const j = k % shape.length;
+      const s1 = shape.slice(); s1[j] = 1;
+      return s1.slice(0, j).concat(s1.slice(j + 1));
+    },
+    predicate: (shape, k) => {
+      const n = shape.length;
+      const j = k % n;
+      const s1 = shape.slice(); s1[j] = 1;
+      const removed = s1.slice(0, j).concat(s1.slice(j + 1));
+      return removed.length === n - 1
+        && NS.L7.shape.size(removed) === NS.L7.shape.size(s1)
+        && eqArr(unsqueezeAt(removed, j), s1);
+    },
+  });
+  reg(125, {
+    name: '形状相等 · 判定与 size 一致', intuition: '形状相等就是逐维相等；判定必须看结构，不能只看 size。',
+    math: 'shapeEqual(a,b) ⟺ len(a)=len(b) ∧ ∀i a[i]=b[i]', pseudocode: 'assert 自反 & 拷贝等 & 逐维差即不等 & 与深比较一致', complexity: 'O(n)',
+    ref: '结构相等（structural equality）', commonPitfall: 'size 相同不蕴涵形状相同（逆序对即反例）；判定退化成长为 size 比较会放过真差异。',
+    invariant: '对任意正整型 shape：shapeEqual 自反、拷贝相等、逐维差即不等、且与逐维深比较完全一致',
+    inputs: ['shape'], domains: { shape: 'shape2' },
+    run: (shape) => [shapeEqual(shape, shape.slice()), shapeEqual(shape, shape.map((d) => d + 1))],
+    predicate: (shape) => {
+      const rev = shape.slice().reverse();
+      const plus1 = shape.map((d) => d + 1);
+      return shapeEqual(shape, shape) && shapeEqual(shape, shape.slice())
+        && NS.L7.shape.size(shape.slice()) === NS.L7.shape.size(shape)
+        && !shapeEqual(shape, plus1) && !shapeEqual(shape, shape.concat([1]))
+        && shapeEqual(shape, rev) === eqArr(shape, rev);
+    },
+  });
+  reg(126, {
+    name: 'reshape 与 permute · 先展平可交换', intuition: '先展平再置换，一维上置换是恒等；两条路线都落到同一个 [size]。',
+    math: 'perm([size]) = [size] = [size(perm(s))]', pseudocode: 'assert eqArr(路线一, 路线二) && 最大偏移守恒', complexity: 'O(n)',
+    ref: 'numpy.ravel + transpose（一维情形）', commonPitfall: '多维情形 reshape 与 permute 一般不可交换；可交换性只在展平后的一维上成立。',
+    invariant: '对任意正整型 shape：展平路线与置换展平路线得到同一形状且最大偏移守恒',
+    inputs: ['shape'], domains: { shape: 'shape3' },
+    run: (shape) => [NS.L7.shape.size(shape)],
+    predicate: (shape) => {
+      const n = shape.length;
+      const st = NS.L7.shape.contiguousStrides(shape);
+      const sz = NS.L7.shape.size(shape);
+      const flat = [sz];
+      const pFlat = NS.L7.shape.permute(flat, [1], [0]).shape;      // 路线一：先展平再置换
+      const perm = NS.L7.shape.permute(shape, st, reverseAxes(n));
+      const flat2 = [NS.L7.shape.size(perm.shape)];                 // 路线二：先置换再展平
+      return eqArr(pFlat, flat2) && flat2[0] === sz
+        && NS.L7.shape.linearize([sz - 1], flat) === sz - 1
+        && NS.L7.shape.linearize(shape.map((d) => d - 1), shape) === sz - 1;
+    },
+  });
+  reg(127, {
+    name: 'flatten · 分步合并等价一次合并', intuition: '先合并尾段再合并前两轴，与一口气合并全部轴，结果相同。',
+    math: 'flatten(flatten(s,1,n−1),0,1) = flatten(s,0,n−1) = [size(s)]', pseudocode: 'assert eqArr(两步, 一步) && size 链', complexity: 'O(n)',
+    ref: 'reshape 结合律（块合并）', commonPitfall: '分步合并的第二次区间要按第一步的结果重新取轴——直接照抄原区间会错位。',
+    invariant: '对任意正整型 shape：分步 flatten 与一次全轴 flatten 结果逐项相同',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => {
+      const tail = flattenRange(shape, 1, shape.length - 1);
+      return flattenRange(tail, 0, 1);
+    },
+    predicate: (shape) => {
+      const n = shape.length;
+      const oneShot = flattenRange(shape, 0, n - 1);
+      const tail = flattenRange(shape, 1, n - 1);
+      const twoShot = flattenRange(tail, 0, 1);
+      return eqArr(twoShot, oneShot) && oneShot.length === 1
+        && oneShot[0] === NS.L7.shape.size(shape)
+        && NS.L7.shape.size(twoShot) === NS.L7.shape.size(shape);
+    },
+  });
+  reg(128, {
+    name: '广播 · 同伙伴复合幂等', intuition: '和同一个兼容伙伴广播两次，第二次什么也不改变。',
+    math: 'bcast(bcast(s,b),b) = bcast(s,b)', pseudocode: 'b = 偶维 1; assert eqArr(bc2, bc1) && eqArr(bc1, s)', complexity: 'O(n)',
+    ref: 'numpy broadcasting（吸收律）', commonPitfall: '与 E034 自身幂等不同：本项的伙伴是异形兼容对；幂等性对「已被吸收过的结果」成立。',
+    invariant: '对任意正整型 shape：L7 广播对同一兼容伙伴二次复合结果不变',
+    inputs: ['shape'], domains: { shape: 'shape4' },
+    run: (shape) => {
+      const b = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      return NS.L7.shape.broadcastShapes(NS.L7.shape.broadcastShapes(shape, b), b);
+    },
+    predicate: (shape) => {
+      const b = shape.map((d, i) => (i % 2 === 0 ? 1 : d));
+      const bc1 = NS.L7.shape.broadcastShapes(shape, b);
+      const bc2 = NS.L7.shape.broadcastShapes(bc1, b);
+      return eqArr(bc2, bc1) && eqArr(bc1, shape);
     },
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
@@ -7055,6 +9131,1114 @@
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
 /* ============================================================================
+ * L10 微指令 · D 域（注意力基元）· 第 4/4 批（D097–D128）
+ * ----------------------------------------------------------------------------
+ * 所属层：L10-microIsa  域：D（注意力基元）
+ * 允许依赖的层：L9（rng/assert/special）、L10（registry/invariant）
+ * 主要 @ref：Vaswani et al. 2017（缩放点积注意力组装）；
+ *           Su et al. 2021 (RoPE)；Press et al. 2022 (ALiBi)；
+ *           Ainslie et al. 2023 (GQA)；Xiao et al. 2024 (StreamingLLM)；
+ *           Milakov & Gimelshein 2018（在线 softmax）
+ *
+ * 子域划分（32 项；D 域至此补满 128 槽）：
+ *   D097–D108 缩放点积注意力组装（12）：CS 复合界 / 权重值域 / 凸组合夹取 /
+ *              因果支撑 / 等分退化 / 低温 one-hot / V 平移·V 缩放·query 局部性 /
+ *              常列保持 / 端到端 lse 一致 / 首行逐位
+ *   D109–D120 位置编码进阶（12）：RoPE 单侧相对性 / 步进角严格序 / 基向量旋转 /
+ *              ALiBi 几何衰减 / RoPE×ALiBi 联合平移 / 斜率累积积 / 尾维恒等 /
+ *              频率公比 / 行距离和 / 相邻位置 Lipschitz 界 / 行极小偏置 /
+ *              行分布平移不变
+ *   D121–D128 GQA×Cache 复合（8）：头间写入隔离 / 打分前缀逐位 / 组内共享一致 /
+ *              滚动长度守恒 / 在线 softmax 等比缩放 / 输出递推式 /
+ *              锚点打分保持 / 增量=全量逐位一致
+ *
+ * 与前三批的分工：D001–D096 覆盖「原子」（打分/掩码/softmax/RoPE/ALiBi/
+ * GQA 映射/cache 机制）；本批全部是「组装与复合」层不变量——每条断言都
+ * 组合已验证的原子，并在 ref / commonPitfall 中注明与哪些原子复合、与哪些
+ * 相邻项分工（避免重复断言同一事实）。
+ *
+ * 组装语义说明：缩放打分 / 因果 / softmax / 加权和的组装数学与
+ * src/L4-ops/attention.js 的 attnFwd 同源；因 __loadOrder 中 L10 文件早于
+ * L4-ops 加载（模块求值期捕获不到 NS.L4），按 D001–D003 的既定约定在本文件
+ * 内自包含复刻同一组 helper，数学逐字一致、不跨层捕获。
+ *
+ * 数值判据约定（沿用前三批，并按历史教训收紧）：
+ *   - 数值恒等用 rc(a,b,1e-9)（缩放/三角/闭式类 1e-12）；
+ *   - 精确恒等用 ±0 归一后的 Object.is（bitEq）：凸组合、掩位归零、
+ *     增量=全量等位级判据一律逐位，不放宽容差；
+ *   - 涉及 softmax 输出序/集中性的断言一律带守卫：仅当缩放间距 ≥40
+ *     （全部 exp 操作数落在正规浮点区）才断言严格序或 one-hot；守卫相对
+ *     历史教训的「si>−740」进一步收紧——e^−708 以下进入次正规带、相对粒度
+ *     退化，−740 附近的 exp 已不可靠；本批不断言任何符号极限，只用有限
+ *     参数下的紧界（见 D102 的论证）；
+ *   - 前置条件式不变量：输入尺寸不满足数学前提时直接放行（返回 true），
+ *     并在 invariant 文本中显式写出前置条件——不靠「放宽容差」制造假绿。
+ * ==========================================================================*/
+;(function (NS) {
+  'use strict';
+  NS.L10 = NS.L10 || {};
+  const rc = NS.L10.relClose;
+  function reg(i, o) { NS.L10.register('D', i, o); }
+
+  /* ---------- 共享常量与基础工具（本文件自包含，不跨文件/跨层捕获） ---------- */
+  const D8 = 8, THETA = 10000;
+  const sq = (M) => Math.round(Math.sqrt(M.length));
+
+  function dot(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+  function dotRev(a, b) { let s = 0; for (let i = a.length - 1; i >= 0; i--) s += a[i] * b[i]; return s; }
+  // 独立范数参考路径：Math.hypot 逐元素累积（与 sqrt(Σx²) 是不同算法）
+  function hypotRef(x) { let s = 0; for (let i = 0; i < x.length; i++) s = Math.hypot(s, x[i]); return s; }
+  // 逐位相等：±0 归一后 Object.is（与 relClose 的 exact 模式语义一致）
+  function bitEq(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      let x = a[i], y = b[i];
+      if (x === 0) x = 0; if (y === 0) y = 0;
+      if (!Object.is(x, y)) return false;
+    }
+    return true;
+  }
+
+  /* ---------- RoPE（同 D001/D002 的自包含实现） ---------- */
+  function invFreq(d, theta) {
+    const half = Math.max(0, Math.floor(d / 2)), f = new Float64Array(half);
+    for (let i = 0; i < half; i++) f[i] = Math.pow(theta, -2 * i / d);
+    return f;
+  }
+  function rope(x, pos, d, theta) {
+    const n = x.length, out = new Float64Array(n), f = invFreq(d, theta);
+    const half = Math.min(f.length, Math.floor(n / 2));
+    for (let i = 0; i < n; i++) out[i] = x[i];
+    for (let i = 0; i < half; i++) {
+      const a = pos * f[i], c = Math.cos(a), s = Math.sin(a);
+      const x0 = x[2 * i], x1 = x[2 * i + 1];
+      out[2 * i] = x0 * c - x1 * s;
+      out[2 * i + 1] = x0 * s + x1 * c;
+    }
+    return out;
+  }
+
+  /* ---------- softmax 家族（安全版：减行最大值；全掩回退均匀） ---------- */
+  function softmaxRow(s, off, n) {
+    const out = new Float64Array(n);
+    let mx = -Infinity;
+    for (let j = 0; j < n; j++) if (s[off + j] > mx) mx = s[off + j];
+    if (mx === -Infinity) {
+      const u = 1 / n;
+      for (let j = 0; j < n; j++) out[j] = u;
+      return out;
+    }
+    let sum = 0;
+    for (let j = 0; j < n; j++) { const e = Math.exp(s[off + j] - mx); out[j] = e; sum += e; }
+    for (let j = 0; j < n; j++) out[j] /= sum;
+    return out;
+  }
+  function softmaxRows(M, n) {
+    const out = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) out.set(softmaxRow(M, i * n, n), i * n);
+    return out;
+  }
+  function lse(s, off, n) {
+    let mx = -Infinity;
+    for (let j = 0; j < n; j++) if (s[off + j] > mx) mx = s[off + j];
+    if (mx === -Infinity) return -Infinity;
+    let sum = 0;
+    for (let j = 0; j < n; j++) sum += Math.exp(s[off + j] - mx);
+    return mx + Math.log(sum);
+  }
+  function causal(M, n) {
+    const out = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) out[i * n + j] = (j <= i ? M[i * n + j] : -Infinity);
+    return out;
+  }
+
+  /* ---------- ALiBi（同 D001 的自包含实现） ---------- */
+  function alibiSlopes(h) {
+    const H = 1 + (Math.abs(h) % 16), s = new Float64Array(H);
+    for (let i = 0; i < H; i++) s[i] = Math.pow(2, -8 * i / H);
+    return s;
+  }
+  function alibiBias(n, slope) {
+    const B = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) B[i * n + j] = -slope * Math.abs(i - j);
+    return B;
+  }
+
+  /* ---------- GQA 头映射 + KV Cache（同 D002 的自包含实现） ---------- */
+  function kvIndexOf(h, nH, nKV) { return Math.floor(h * nKV / nH); }
+  function makeCache(cap, d) { return { data: new Float64Array(cap * d), len: 0, cap, d }; }
+  function cacheAppend(c, row) {
+    const out = { data: c.data.slice(), len: c.len, cap: c.cap, d: c.d };
+    if (c.len < c.cap) { out.data.set(row.subarray(0, c.d), c.len * c.d); out.len = c.len + 1; }
+    return out;
+  }
+  function cacheRow(c, p) {
+    if (p < 0 || p >= c.len) return null;
+    return c.data.slice(p * c.d, (p + 1) * c.d);
+  }
+  // 滚动窗口：满时淘汰最旧的非 sink 行（sink 索引集合永不淘汰）
+  function cacheAppendWindowed(c, row, sinks) {
+    const out = { data: c.data.slice(), len: c.len, cap: c.cap, d: c.d };
+    if (c.len < c.cap) { out.data.set(row.subarray(0, c.d), c.len * c.d); out.len = c.len + 1; return out; }
+    let victim = -1;
+    for (let i = 0; i < c.len; i++) { if (!sinks[i]) { victim = i; break; } }
+    if (victim < 0) return out;                    // 全是 sink：拒绝淘汰（保护锚点）
+    const nd = new Float64Array(c.cap * c.d);
+    let w = 0;
+    for (let i = 0; i < c.len; i++) { if (i === victim) continue; nd.set(out.data.subarray(i * c.d, (i + 1) * c.d), w * c.d); w++; }
+    nd.set(row.subarray(0, c.d), w * c.d);
+    out.data = nd; out.len = w + 1;
+    return out;
+  }
+
+  /* ---------- 组装工具（与 L4-ops/attention 的 attnFwd 语义同源，自包含复刻） ----------
+   * S[i][j] = ⟨Qᵢ,Kⱼ⟩/√d；out[i] = Σⱼ P[i][j]·Vⱼ；端到端 = softmax(causal(S))·V */
+  function scoresFromQ(Q, K, m, n, d) {
+    const out = new Float64Array(m * n), sc = 1 / Math.sqrt(d);
+    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) {
+      out[i * n + j] = dot(Q.subarray(i * d, (i + 1) * d), K.subarray(j * d, (j + 1) * d)) * sc;
+    }
+    return out;
+  }
+  function attnFromScores(P, V, m, n, d) {           // 正向累加
+    const out = new Float64Array(m * d);
+    for (let i = 0; i < m; i++) for (let t = 0; t < d; t++) {
+      let s = 0;
+      for (let j = 0; j < n; j++) s += P[i * n + j] * V[j * d + t];
+      out[i * d + t] = s;
+    }
+    return out;
+  }
+  function attnFromScoresRev(P, V, m, n, d) {        // 参考路径：反向累加
+    const out = new Float64Array(m * d);
+    for (let i = 0; i < m; i++) for (let t = 0; t < d; t++) {
+      let s = 0;
+      for (let j = n - 1; j >= 0; j--) s += P[i * n + j] * V[j * d + t];
+      out[i * d + t] = s;
+    }
+    return out;
+  }
+  // 端到端（方阵 n×n、头维 d）：out = softmax(causal(QKᵀ/√d))·V
+  function attnFromQKV(Q, K, V, n, d) {
+    const P = softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+    return attnFromScores(P, V, n, n, d);
+  }
+  // 增量上下文：对 cache 前 len 行做缩放点积（cache 只含可见行，无需掩码）
+  function cacheCtx(kc, vc, q) {
+    const len = kc.len, d = kc.d, sc = 1 / Math.sqrt(d);
+    const s = new Float64Array(len);
+    for (let j = 0; j < len; j++) s[j] = dot(q, cacheRow(kc, j)) * sc;
+    const P = softmaxRow(s, 0, len);
+    const out = new Float64Array(d);
+    for (let t = 0; t < d; t++) { let acc = 0; for (let j = 0; j < len; j++) acc += P[j] * vc.data[j * d + t]; out[t] = acc; }
+    return out;
+  }
+
+  // ══ 缩放点积注意力组装（D097–D108）═══════════════════════════════════
+  reg(97, {
+    name: '组装 · 缩放打分的有界性（Cauchy–Schwarz 复合）',
+    intuition: '组装层先缩放再进 softmax：缩放打分的绝对值被 ‖q‖‖k‖/√d 扼住，是注意力数值稳定的第一道闸门。',
+    math: '|q·k|/√d ≤ ‖q‖₂·‖k‖₂/√d',
+    pseudocode: 'return abs(dot(q,k)/sqrt(d)) <= hypot(q)*hypot(k)/sqrt(d)*(1+eps)',
+    complexity: 'O(d)', ref: 'Cauchy–Schwarz 不等式 · 复合 D006（原始 CS 上界）与 D005（1/√d 缩放）',
+    commonPitfall: '范数参考路径用 Math.hypot 逐元素累积，与 sqrt(Σx²) 是不同算法，避免自证；这是组装粒度的复合界，不是 D006 的重复。',
+    invariant: '|q·k|/√d ≤ ‖q‖·‖k‖/√d·(1+1e-12)（d=4）',
+    inputs: ['q', 'k'], domains: { q: 'vecSmall', k: 'vecSmall' }, vecDims: { q: 4, k: 4 },
+    run: (q, k) => Math.abs(dot(q, k) / Math.sqrt(q.length)),
+    predicate: (q, k) => Math.abs(dot(q, k) / Math.sqrt(q.length)) <= (hypotRef(q) * hypotRef(k)) / Math.sqrt(q.length) * (1 + 1e-12),
+  });
+  reg(98, {
+    name: '组装 · softmax 权重值域与掩位归零',
+    intuition: '组装后的权重矩阵必须同时满足：每项 ∈[0,1]、被掩未来位严格为 0、每行和为一——三条一起才是合法注意力分布。',
+    math: 'P = softmax(causal(QKᵀ/√d))：0≤Pᵢⱼ≤1；j>i ⇒ Pᵢⱼ=0；ΣⱼPᵢⱼ=1',
+    pseudocode: 'S = causal(scoresFromQ(Q,K)); P = softmaxRows(S); assert range, mask-zero, row-sum',
+    complexity: 'O(n²·d + n²)', ref: 'Vaswani et al. 2017 §3.2.2 · 复合 D015（上三角 −∞）与 D025（安全 softmax）',
+    commonPitfall: '掩位权重为 0 是精确断言（exp(−∞)=0），不是近似；行和用 lse 参考路径校验（Σⱼexp(sᵢⱼ−lseᵢ)），不与 softmaxRow 自证。',
+    invariant: '0≤Pᵢⱼ≤1；j>i ⇒ Pᵢⱼ===0；rc(ΣⱼPᵢⱼ,1,1e-9)；rc(Σⱼexp(sᵢⱼ−lseᵢ),1,1e-9)',
+    inputs: ['Q', 'K'], domains: { Q: 'matSmall', K: 'matSmall' }, matrixDims: { Q: [4, 4], K: [4, 4] },
+    run: (Q, K) => {
+      const n = sq(Q), d = Q.length / n;
+      return softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+    },
+    predicate: (Q, K) => {
+      const n = sq(Q), d = Q.length / n;
+      const S = causal(scoresFromQ(Q, K, n, n, d), n);
+      const P = softmaxRows(S, n);
+      for (let i = 0; i < n; i++) {
+        let rowSum = 0, refSum = 0;
+        const li = lse(S, i * n, n);
+        for (let j = 0; j < n; j++) {
+          const p = P[i * n + j];
+          if (!(p >= 0 && p <= 1)) return false;
+          if (j > i && p !== 0) return false;
+          rowSum += p;
+          refSum += Math.exp(S[i * n + j] - li);      // 参考路径：lse 表出
+        }
+        if (!rc(rowSum, 1, 1e-9)) return false;
+        if (!rc(refSum, 1, 1e-9)) return false;
+      }
+      return true;
+    },
+  });
+  reg(99, {
+    name: '组装 · 输出是 V 的凸组合',
+    intuition: '注意力输出是 V 各行的凸组合：既不会跳出 V 的值域，也解释了「注意力 = 软查表」。',
+    math: 'outᵢ = ΣⱼPᵢⱼ·Vⱼ，Pᵢ∈Δ^{n−1} ⇒ outᵢₜ ∈ [minⱼVⱼₜ, maxⱼVⱼₜ]',
+    pseudocode: 'out = attnFromQKV(Q,K,V); assert minV[t]-eps <= out[i][t] <= maxV[t]+eps',
+    complexity: 'O(n²·d + n·d)', ref: '凸组合夹取定理 · 注意力加权和语义',
+    commonPitfall: '夹取界逐坐标取；加权和本身另用反向累加参考路径（attnFromScoresRev）验证，双重判据互补。',
+    invariant: '逐坐标 outᵢₜ ∈ [minⱼVⱼₜ−1e-12, maxⱼVⱼₜ+1e-12]；且 rc(正向加权和, 反向加权和, 1e-9)',
+    inputs: ['Q', 'K', 'V'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V) => attnFromQKV(Q, K, V, sq(Q), Q.length / sq(Q)),
+    predicate: (Q, K, V) => {
+      const n = sq(Q), d = Q.length / n;
+      const out = attnFromQKV(Q, K, V, n, d);
+      const P = softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+      if (!rc(out, attnFromScoresRev(P, V, n, n, d), 1e-9)) return false;   // 参考：反向累加
+      for (let i = 0; i < n; i++) for (let t = 0; t < d; t++) {
+        let lo = Infinity, hi = -Infinity;
+        for (let j = 0; j < n; j++) { const v = V[j * d + t]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        const o = out[i * d + t];
+        if (!(o >= lo - 1e-12 && o <= hi + 1e-12)) return false;
+      }
+      return true;
+    },
+  });
+  reg(100, {
+    name: '组装 · 因果行支撑大小',
+    intuition: '第 i 行的注意力只能落在前 i+1 个位置上：未来位权重严格为 0，正权重个数恰为 i+1。',
+    math: '|{j : Pᵢⱼ > 0}| = i+1；总数 = n(n+1)/2',
+    pseudocode: 'P = softmaxRows(causal(S)); for i: assert count(P[i]>0) === i+1',
+    complexity: 'O(n²)', ref: '因果注意力支撑集 · Vaswani et al. 2017 §3.2.3',
+    commonPitfall: '正权重要严格 >0：掩位 exp(−∞)=0 精确为 0，可见位 exp(s−mx) 在域内不下溢（打分跨度 ≤400 ≪ 708），故可数。',
+    invariant: '第 i 行正权重个数 === i+1；Σᵢ(i+1) === n(n+1)/2',
+    inputs: ['Q', 'K'], domains: { Q: 'matSmall', K: 'matSmall' }, matrixDims: { Q: [4, 4], K: [4, 4] },
+    run: (Q, K) => {
+      const n = sq(Q), d = Q.length / n;
+      const P = softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+      const cnt = new Float64Array(n);
+      for (let i = 0; i < n; i++) { let c = 0; for (let j = 0; j < n; j++) if (P[i * n + j] > 0) c++; cnt[i] = c; }
+      return cnt;
+    },
+    predicate: (Q, K) => {
+      const n = sq(Q), d = Q.length / n;
+      const P = softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        let c = 0;
+        for (let j = 0; j < n; j++) if (P[i * n + j] > 0) c++;
+        if (c !== i + 1) return false;
+        total += c;
+      }
+      return total === n * (n + 1) / 2;
+    },
+  });
+  reg(101, {
+    name: '组装 · 等分打分权重恰为 1/n',
+    intuition: '所有打分相等时 softmax 退化为均匀分布——exp(0)=1、整数和精确，可逐位断言而非容差。',
+    math: 'sᵢⱼ 全相等 ⇒ Pᵢⱼ = 1/(i+1)（j≤i，逐位）',
+    pseudocode: 'Q=K=行全为 v; P = softmaxRows(causal(S)); assert Object.is(P[i][j], 1/(i+1))',
+    complexity: 'O(n²·d + n²)', ref: 'softmax 均匀退化情形（D027 平移不变性的极值推论）',
+    commonPitfall: '逐位成立的关键：各行打分由同一次点积算出（位级相等）⇒ s−mx=0 精确 ⇒ exp(0)=1 ⇒ 和为整数 i+1 ⇒ 除法结果位级一致。',
+    invariant: 'j≤i 时 Object.is(Pᵢⱼ, 1/(i+1))；j>i 时 Pᵢⱼ===0',
+    inputs: ['v'], domains: { v: 'vecSmall' }, vecDims: { v: 4 },
+    run: (v) => {
+      const n = 4, d = v.length, Q = new Float64Array(n * d), K = new Float64Array(n * d);
+      for (let i = 0; i < n; i++) { Q.set(v, i * d); K.set(v, i * d); }
+      return softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+    },
+    predicate: (v) => {
+      const n = 4, d = v.length, Q = new Float64Array(n * d), K = new Float64Array(n * d);
+      for (let i = 0; i < n; i++) { Q.set(v, i * d); K.set(v, i * d); }
+      const P = softmaxRows(causal(scoresFromQ(Q, K, n, n, d), n), n);
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        if (j <= i) { if (!Object.is(P[i * n + j], 1 / (i + 1))) return false; }
+        else if (P[i * n + j] !== 0) return false;
+      }
+      return true;
+    },
+  });
+  reg(102, {
+    name: '组装 · 低温逼近 one-hot',
+    intuition: '温度趋零时 softmax 坍缩到最大打分位；有限低温下用「top-2 间距 ≥ 40·T」守卫给出可断言的数值版极限。',
+    math: 'g = sᵢ*−max_{j≠i*}sⱼ；恒有 pᵢ* ≥ 1−(n−1)e^{−g/T}−1e-12；g/T ≥ 40 ⇒ pᵢ* > 1−1e-12',
+    pseudocode: 'u = s/T; i* = argmax(s); g = gap; assert tight bound; guarded: strict order && one-hot',
+    complexity: 'O(n)', ref: 'softmax 温度极限 · Gibbs 分布集中性',
+    commonPitfall: '历史教训的守卫是 si−sj>1e-6 && si>−740；本项进一步收紧为缩放间距 g/T ≥ 40——e^−708 以下进入次正规带（相对粒度退化到 1e−4~1e−2），−740 附近的 exp 已不可靠，而 g/T ≥ 40 保证全部 exp 操作数 ≤ −40，位于正规区（相对精度 ~1e−16 ≪ 1e−6），严格序可证明保持。成对严格序守卫同时要求较大者的 exp 操作数 > −705（扣除 log Σe ≤ log 4 的裕量后仍 > −708 正规下界）。T = 0.05·(1+|t|%20) ∈ [0.05,1] 为低温段，不断言 T→0 的符号极限，只用有限 T 的紧界。',
+    invariant: 'pᵢ* ≥ 1−(n−1)·e^{−g/T}−1e-12；(uᵢ−uⱼ>1e-6 且 uᵢ−max(u)>−705) ⇒ pᵢ>pⱼ；g/T ≥ 40 ⇒ pᵢ* > 1−1e-12 且严格最大',
+    inputs: ['s', 't'], domains: { s: 'vecSmall', t: 'nat' }, vecDims: { s: 4 },
+    run: (s, t) => {
+      const T = 0.05 * (1 + (Math.abs(t) % 20)), n = s.length, u = new Float64Array(n);
+      for (let j = 0; j < n; j++) u[j] = s[j] / T;
+      return softmaxRow(u, 0, n);
+    },
+    predicate: (s, t) => {
+      const T = 0.05 * (1 + (Math.abs(t) % 20)), n = s.length;
+      let iStar = 0;
+      for (let j = 1; j < n; j++) if (s[j] > s[iStar]) iStar = j;
+      let second = -Infinity;
+      for (let j = 0; j < n; j++) if (j !== iStar && s[j] > second) second = s[j];
+      const g = s[iStar] - second;
+      const u = new Float64Array(n);
+      let mx = -Infinity;
+      for (let j = 0; j < n; j++) { u[j] = s[j] / T; if (u[j] > mx) mx = u[j]; }
+      const li = lse(u, 0, n);                          // 参考路径：lse 表出
+      const p = new Float64Array(n);
+      for (let j = 0; j < n; j++) p[j] = Math.exp(u[j] - li);
+      if (!(p[iStar] >= 1 - (n - 1) * Math.exp(-g / T) - 1e-12)) return false;   // 紧界（恒断言）
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {                 // 严格序（守卫）
+        if (i === j) continue;
+        if (u[i] - u[j] > 1e-6 && u[i] - mx > -705 && !(p[i] > p[j])) return false;
+      }
+      if (g / T >= 40) {                                // one-hot（守卫：top-2 缩放间距 ≥40）
+        if (!(p[iStar] > 1 - 1e-12)) return false;
+        for (let j = 0; j < n; j++) if (j !== iStar && !(p[iStar] > p[j])) return false;
+      }
+      return true;
+    },
+  });
+  reg(103, {
+    name: '组装 · V 平移 ⇒ 输出平移',
+    intuition: 'V 每个坐标加同一个常数 c，输出也加 c——权重和为 1，平移被无损传递。',
+    math: 'out(Q,K,V+c·1) = out(Q,K,V) + c',
+    pseudocode: 'a = attnFromQKV(Q,K,add(V,c)); b = attnFromQKV(Q,K,V); return relClose(a-c, b, 1e-9)',
+    complexity: 'O(n²·d)', ref: '凸组合平移不变性（ΣⱼPᵢⱼ=1 的推论，D027 的组装形式）',
+    commonPitfall: '不是逐位断言：c 先加进 V 再加权 与 加权后再加 c，两条舍入路径不同，用 1e-9 相对容差。',
+    invariant: 'relClose(out(V+c·1) − c, out(V), 1e-9)',
+    inputs: ['Q', 'K', 'V', 'c'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall', c: 'small' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V, c) => {
+      const n = sq(V), d = V.length / n, V2 = new Float64Array(V.length);
+      for (let k = 0; k < V.length; k++) V2[k] = V[k] + c;
+      return attnFromQKV(Q, K, V2, n, d);
+    },
+    predicate: (Q, K, V, c) => {
+      const n = sq(V), d = V.length / n, V2 = new Float64Array(V.length);
+      for (let k = 0; k < V.length; k++) V2[k] = V[k] + c;
+      const a = attnFromQKV(Q, K, V2, n, d), b = attnFromQKV(Q, K, V, n, d);
+      for (let i = 0; i < a.length; i++) if (!rc(a[i] - c, b[i], 1e-9)) return false;
+      return true;
+    },
+  });
+  reg(104, {
+    name: '组装 · 端到端与 lse 参考一致',
+    intuition: '把缩放、掩码、softmax、加权和四步串起来后，必须与「lse 表出概率 + 反向累加」的独立参考路径吻合。',
+    math: 'out = softmax(causal(QKᵀ/√d))·V = Σⱼexp(sᵢⱼ−lseᵢ)·Vⱼ',
+    pseudocode: 'out = attnFromQKV(Q,K,V); ref = reverse-accumulate(exp(s-lse)*V); return relClose(out, ref, 1e-9)',
+    complexity: 'O(n²·d)', ref: 'Milakov & Gimelshein 2018（在线 softmax 的 lse 表出） · Vaswani et al. 2017 §3.2.2',
+    commonPitfall: '正向累加（run）与 lse 表出 + 反向累加（predicate）是两条独立路径；只用同一 helper 家族内的位级断言会自证。',
+    invariant: 'relClose(out, Σⱼexp(sᵢⱼ−lseᵢ)·Vⱼ（反向累加）, 1e-9)',
+    inputs: ['Q', 'K', 'V'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V) => attnFromQKV(Q, K, V, sq(Q), Q.length / sq(Q)),
+    predicate: (Q, K, V) => {
+      const n = sq(Q), d = Q.length / n;
+      const S = causal(scoresFromQ(Q, K, n, n, d), n);
+      const out = attnFromQKV(Q, K, V, n, d);
+      for (let i = 0; i < n; i++) {
+        const li = lse(S, i * n, n);
+        for (let t = 0; t < d; t++) {
+          let acc = 0;
+          for (let j = n - 1; j >= 0; j--) acc += Math.exp(S[i * n + j] - li) * V[j * d + t];   // 参考：反向累加
+          if (!rc(out[i * d + t], acc, 1e-9)) return false;
+        }
+      }
+      return true;
+    },
+  });
+  reg(105, {
+    name: '组装 · 因果首行逐位等于 V 首行',
+    intuition: '第 0 个位置只能看自己：权重向量 [1,0,0,0] 是精确值，输出必须与 V 第 0 行逐位相同。',
+    math: 'P₀ = [1,0,…,0]（精确） ⇒ out₀ = V₀（逐位）',
+    pseudocode: 'out = attnFromQKV(Q,K,V); assert bitEq(out[0], V[0])',
+    complexity: 'O(d)', ref: '因果注意力第一行 · 逐位一致性（零回归判据）',
+    commonPitfall: '0·Vⱼ 可能产出 ±0，与首项相加时符号零会「吃掉」符号——用 ±0 归一的逐位比较（bitEq），不放宽容差。',
+    invariant: 'bitEq(out₀, V₀)（±0 归一后 Object.is）',
+    inputs: ['Q', 'K', 'V'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V) => attnFromQKV(Q, K, V, sq(Q), Q.length / sq(Q)).subarray(0, Q.length / sq(Q)),
+    predicate: (Q, K, V) => {
+      const n = sq(Q), d = Q.length / n;
+      const out = attnFromQKV(Q, K, V, n, d);
+      return bitEq(out.subarray(0, d), V.subarray(0, d));
+    },
+  });
+  reg(106, {
+    name: '组装 · V 缩放 ⇒ 输出缩放',
+    intuition: '加权和对 V 线性：V 整体放大 a 倍，输出也放大 a 倍（放 Q 则不然——那会改变 softmax 形状）。',
+    math: 'out(Q,K,a·V) = a·out(Q,K,V)',
+    pseudocode: 'x = attnFromQKV(Q,K,scale(V,a)); y = attnFromQKV(Q,K,V); return relClose(x, a*y, 1e-9)',
+    complexity: 'O(n²·d)', ref: '加权和线性性（对值向量齐次） · 与 D003（打分齐次性）对偶',
+    commonPitfall: '缩放 Q 会重塑 softmax（非线性），没有此恒等式；a 取整数域（smallInt）避免缩放本身引入额外舍入。',
+    invariant: 'relClose(out(Q,K,a·V), a·out(Q,K,V), 1e-9)',
+    inputs: ['Q', 'K', 'V', 'a'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall', a: 'smallInt' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V, a) => {
+      const n = sq(V), d = V.length / n, V2 = new Float64Array(V.length);
+      for (let k = 0; k < V.length; k++) V2[k] = a * V[k];
+      return attnFromQKV(Q, K, V2, n, d);
+    },
+    predicate: (Q, K, V, a) => {
+      const n = sq(V), d = V.length / n, V2 = new Float64Array(V.length);
+      for (let k = 0; k < V.length; k++) V2[k] = a * V[k];
+      const x = attnFromQKV(Q, K, V2, n, d), y = attnFromQKV(Q, K, V, n, d);
+      for (let i = 0; i < x.length; i++) if (!rc(x[i], a * y[i], 1e-9)) return false;
+      return true;
+    },
+  });
+  reg(107, {
+    name: '组装 · query 行局部性',
+    intuition: '因果性使输出第 i 行只依赖 Q 第 i 行：扰动 Q 的末段行，前 m+1 行输出逐位不变。',
+    math: 'Q′ 仅第 m+1..n−1 行不同 ⇒ ∀i≤m：out(Q′)[i] = out(Q)[i]（逐位）',
+    pseudocode: 'Q2 = Q with rows > m shifted by +777; assert bitEq(out(Q2)[0..m], out(Q)[0..m])',
+    complexity: 'O(n²·d)', ref: '因果注意力行独立性 · 增量解码正确性基础（与 D128 呼应）',
+    commonPitfall: '逐位成立的关键：被比较行的全部输入（Q 第 i 行、K、V）位级相同 ⇒ 同一计算图 ⇒ 位级相同输出。',
+    invariant: 'bitEq(out(Q₂) 第 0..m 行, out(Q) 第 0..m 行)；m = |m|%3 恒 ≤2（至少扰动第 3 行）',
+    inputs: ['Q', 'K', 'V', 'm'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall', m: 'nat' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V, m) => {
+      const n = sq(Q), d = Q.length / n, mm = Math.abs(m) % 3;
+      const Q2 = Q.slice();
+      for (let i = mm + 1; i < n; i++) for (let t = 0; t < d; t++) Q2[i * d + t] = Q[i * d + t] + 777;
+      return attnFromQKV(Q2, K, V, n, d);
+    },
+    predicate: (Q, K, V, m) => {
+      const n = sq(Q), d = Q.length / n, mm = Math.abs(m) % 3;
+      const Q2 = Q.slice();
+      for (let i = mm + 1; i < n; i++) for (let t = 0; t < d; t++) Q2[i * d + t] = Q[i * d + t] + 777;
+      const a = attnFromQKV(Q2, K, V, n, d), b = attnFromQKV(Q, K, V, n, d);
+      for (let i = 0; i <= mm; i++) if (!bitEq(a.subarray(i * d, (i + 1) * d), b.subarray(i * d, (i + 1) * d))) return false;
+      return true;
+    },
+  });
+  reg(108, {
+    name: '组装 · V 常列 ⇒ 输出常列',
+    intuition: 'V 某一列在所有行取同一常数 γ 时，输出该列 = γ·ΣⱼPᵢⱼ ≈ γ；其余列因输入未动而逐位不变。',
+    math: 'V′ⱼₜ = γ（∀j） ⇒ out′ᵢₜ = γ·ΣⱼPᵢⱼ ≈ γ；t≠t₀ 列逐位不变',
+    pseudocode: 'V2 = V with column t0 set to c; assert rc(out2[i][t0], c, 1e-9) && bitEq(other columns)',
+    complexity: 'O(n²·d)', ref: '凸组合的列结构保持（ΣⱼPᵢⱼ=1 的列形式推论，与 D103 互为行列对偶）',
+    commonPitfall: '目标列是 ≈γ 而非逐位 γ（行和有 1e−16 级舍入）；非目标列才是逐位判据——两类判据别混用。',
+    invariant: 'rc(out′ᵢₜ₀, γ, 1e-9)；t≠t₀ 时 bitEq(out′ᵢₜ, outᵢₜ)；t₀ = |t|%4',
+    inputs: ['Q', 'K', 'V', 't', 'c'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall', t: 'nat', c: 'small' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V, t, c) => {
+      const n = sq(V), d = V.length / n, t0 = Math.abs(t) % d, V2 = V.slice();
+      for (let j = 0; j < n; j++) V2[j * d + t0] = c;
+      return attnFromQKV(Q, K, V2, n, d);
+    },
+    predicate: (Q, K, V, t, c) => {
+      const n = sq(V), d = V.length / n, t0 = Math.abs(t) % d, V2 = V.slice();
+      for (let j = 0; j < n; j++) V2[j * d + t0] = c;
+      const a = attnFromQKV(Q, K, V2, n, d), b = attnFromQKV(Q, K, V, n, d);
+      for (let i = 0; i < n; i++) {
+        if (!rc(a[i * d + t0], c, 1e-9)) return false;
+        for (let tt = 0; tt < d; tt++) if (tt !== t0 && !Object.is(a[i * d + tt], b[i * d + tt])) return false;
+      }
+      return true;
+    },
+  });
+
+  // ══ 位置编码进阶（D109–D120）════════════════════════════════════════
+  reg(109, {
+    name: 'RoPE · 打分等于 q 与相对旋转 k 的内积',
+    intuition: '把两侧旋转坍缩成「只旋转 k、角度取相对距离 n−m」：相对性的单侧形式，工程上可缓存旋转后的 k。',
+    math: '⟨R_m q, R_n k⟩ = ⟨q, R_{n−m} k⟩',
+    pseudocode: 'a = dot(rope(q,m), rope(k,n)); b = dot(q, rope(k,n-m)); return relClose(a,b,1e-9)',
+    complexity: 'O(d)', ref: 'Su et al. 2021 §3.3（相对位置性质） · 与 D039（双侧平移）互为对偶',
+    commonPitfall: 'D039 断言「双侧同时平移打分不变」；此处断言「单侧坍缩为相对旋转」——数学等价但计算路径不同，两条都是必要的回归判据。',
+    invariant: 'relClose(⟨R_m q, R_n k⟩, ⟨q, R_{n−m} k⟩, 1e-9)（d=4，θ=10000）',
+    inputs: ['q', 'k', 'm', 'n'], domains: { q: 'vecSmall', k: 'vecSmall', m: 'small', n: 'small' },
+    vecDims: { q: 4, k: 4 },
+    run: (q, k, m, n) => dot(rope(q, m, 4, THETA), rope(k, n, 4, THETA)),
+    predicate: (q, k, m, n) => rc(dot(rope(q, m, 4, THETA), rope(k, n, 4, THETA)), dot(q, rope(k, n - m, 4, THETA)), 1e-9),
+  });
+  reg(110, {
+    name: 'RoPE · 步进角严格有序',
+    intuition: '同一位置增量下，高频对的角速度更大：步进角随对索引严格递减（pos>0）——多尺度位置分辨力的来源。',
+    math: 'aᵢ = pos·θ^(−2i/d)；pos≠0 ⇒ (aᵢ−aᵢ₊₁)·pos > 0；a₀ ≡ pos（逐位）',
+    pseudocode: 'f = invFreq(d,theta); a[i] = pos*f[i]; assert (a[i]-a[i+1])*pos > 0; assert Object.is(a[0], pos)',
+    complexity: 'O(d/2)', ref: 'Su et al. 2021 §3.2（D034 频率单调性的「步进角」量化形式）',
+    commonPitfall: '严格不等式的鲁棒性：最紧相邻间隙 ≥ 9e−3·|pos|（θ=10000、d=8 时 f₂−f₃=9e−3），比舍入误差 ~1e−16·|pos| 大 13 个数量级，故可严格断言；f[0]=1 精确 ⇒ pos·1=pos 逐位。',
+    invariant: 'pos≠0 ⇒ ∀i：(aᵢ−aᵢ₊₁)·pos > 0；Object.is(a₀, pos)；全部有限',
+    inputs: ['pos'], domains: { pos: 'small' },
+    run: (pos) => {
+      const f = invFreq(D8, THETA), out = new Float64Array(f.length);
+      for (let i = 0; i < f.length; i++) out[i] = pos * f[i];
+      return out;
+    },
+    predicate: (pos) => {
+      const f = invFreq(D8, THETA), a = new Float64Array(f.length);
+      for (let i = 0; i < f.length; i++) {
+        a[i] = pos * f[i];
+        if (!Number.isFinite(a[i])) return false;
+      }
+      if (!Object.is(a[0], pos)) return false;
+      if (pos === 0) return true;                       // 前置：pos≠0 才断序
+      for (let i = 0; i + 1 < a.length; i++) if (!((a[i] - a[i + 1]) * pos > 0)) return false;
+      return true;
+    },
+  });
+  reg(111, {
+    name: 'RoPE · 基向量旋转形式',
+    intuition: '只有第 i 对非零时，旋转把质量搬到 (cos a, sin a) 方向：验证 rope 确实实现了二维旋转而非近似。',
+    math: 'R(a)·(x₂ᵢ, x₂ᵢ₊₁) = r·(cos(φ+a), sin(φ+a))，r=hypot(x₂ᵢ,x₂ᵢ₊₁)，φ=atan2(x₂ᵢ₊₁,x₂ᵢ)；其余维 === 0',
+    pseudocode: 'e = 仅第 i 对非零; o = rope(e); assert rc(o[2i], polar form, 1e-12) && o[其他]===0',
+    complexity: 'O(d)', ref: 'Su et al. 2021 §3.2（分块对角旋转的显式形式，D043 的量化强化）',
+    commonPitfall: '参考路径用极式分解（hypot + atan2）独立重算，不调用 rope 也不复用它的笛卡尔闭式；i 由 nat 取模到 [0,4)，d=8 半维 4 对。',
+    invariant: 'rc(o[2i], r·cos(φ+a), 1e-12)；rc(o[2i+1], r·sin(φ+a), 1e-12)；其余维 === 0',
+    inputs: ['x', 'pos', 'i'], domains: { x: 'vecSmall', pos: 'small', i: 'nat' }, vecDims: { x: D8 },
+    run: (x, pos, i) => {
+      const e = new Float64Array(x.length), ii = Math.abs(i) % 4;
+      e[2 * ii] = x[2 * ii]; e[2 * ii + 1] = x[2 * ii + 1];
+      return rope(e, pos, D8, THETA);
+    },
+    predicate: (x, pos, i) => {
+      const e = new Float64Array(x.length), ii = Math.abs(i) % 4;
+      e[2 * ii] = x[2 * ii]; e[2 * ii + 1] = x[2 * ii + 1];
+      const o = rope(e, pos, D8, THETA);
+      const a = pos * invFreq(D8, THETA)[ii];
+      const x0 = x[2 * ii], x1 = x[2 * ii + 1];
+      const r = Math.hypot(x0, x1), ph = Math.atan2(x1, x0);       // 参考路径：极式分解
+      if (!rc(o[2 * ii], r * Math.cos(ph + a), 1e-12)) return false;
+      if (!rc(o[2 * ii + 1], r * Math.sin(ph + a), 1e-12)) return false;
+      for (let t = 0; t < o.length; t++) if (t !== 2 * ii && t !== 2 * ii + 1 && o[t] !== 0) return false;
+      return true;
+    },
+  });
+  reg(112, {
+    name: 'ALiBi · 等分打分的几何衰减',
+    intuition: '基分全相等时，ALiBi 把软最大质量压向最近邻：权重随距离几何衰减，且对角线严格最大。',
+    math: 'sⱼ = −slope·|i−j| ⇒ log(pⱼ/pᵢ) = −slope·|i−j|；pᵢ > pⱼ（j≠i）',
+    pseudocode: 's[j] = -slope*abs(i-j); p = softmaxRow(s); assert p[i] > p[j] && rc(log(p[j]/p[i]), -slope*|i-j|, 1e-9)',
+    complexity: 'O(m)', ref: 'Press et al. 2022 (ALiBi) §3 · 等基分情形的闭式（D047/D054 的分布层结论）',
+    commonPitfall: '严格最大性依赖 slope>0（域 smallPos 保证 ≥1e−6）；比值比较取对数——pⱼ 可小到 e^{−70}，直接比绝对差会淹没精度。',
+    invariant: 'm≥2 且 slope>0 ⇒ pᵢ 严格最大；∀j≠i：rc(log(pⱼ/pᵢ), −slope·|i−j|, 1e-9)',
+    inputs: ['n', 'slope', 'i'], domains: { n: 'nat', slope: 'smallPos', i: 'nat' },
+    run: (n, slope, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m;
+      const s = new Float64Array(m);
+      for (let j = 0; j < m; j++) s[j] = -slope * Math.abs(iq - j);
+      return softmaxRow(s, 0, m);
+    },
+    predicate: (n, slope, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m;
+      if (m < 2) return true;                            // 前置：至少两个位置才可比较
+      const s = new Float64Array(m);
+      for (let j = 0; j < m; j++) s[j] = -slope * Math.abs(iq - j);
+      const p = softmaxRow(s, 0, m);
+      for (let j = 0; j < m; j++) {
+        if (j === iq) continue;
+        if (!(p[iq] > p[j])) return false;
+        if (!rc(Math.log(p[j] / p[iq]), -slope * Math.abs(iq - j), 1e-9)) return false;
+      }
+      return true;
+    },
+  });
+  reg(113, {
+    name: 'RoPE×ALiBi · 联合平移不变',
+    intuition: '行打分 = RoPE 相对项 + ALiBi 距离项；query 与全部 key 同时平移 p，两项都不变——行分布冻结。',
+    math: 'softmaxⱼ(⟨R_{m+p}q, R_{j+p}kⱼ⟩/√d − slope·|m−j|) = softmaxⱼ(⟨R_m q, R_j kⱼ⟩/√d − slope·|m−j|)',
+    pseudocode: 'base = rowLogits(m,0); shifted = rowLogits(m+p,p); return rc(lse) && rc(dist)',
+    complexity: 'O(n·d)', ref: 'Su et al. 2021 §3.3 + Press et al. 2022 §3（D039/D054 的复合层推论）',
+    commonPitfall: 'RoPE 项与 ALiBi 项各自平移不变，复合后仍不变；分布用 lse 参考路径表出，不与 softmaxRow 自证；与 D120（纯 RoPE 基座）分工明确。',
+    invariant: 'rc(平移后行分布, 原行分布, 1e-9)；rc(平移后 lse, 原 lse, 1e-9)',
+    inputs: ['q', 'K', 'm', 'p', 'slope'], domains: { q: 'vecSmall', K: 'matSmall', m: 'small', p: 'small', slope: 'smallPos' },
+    matrixDims: { K: [4, 4] }, vecDims: { q: 4 },
+    run: (q, K, m, p, slope) => {
+      const n = sq(K), d = q.length, sc = 1 / Math.sqrt(d);
+      const s = new Float64Array(n);
+      for (let j = 0; j < n; j++) {
+        s[j] = dot(rope(q, m + p, d, THETA), rope(K.subarray(j * d, (j + 1) * d), j + p, d, THETA)) * sc - slope * Math.abs(m - j);
+      }
+      return softmaxRow(s, 0, n);
+    },
+    predicate: (q, K, m, p, slope) => {
+      const n = sq(K), d = q.length, sc = 1 / Math.sqrt(d);
+      const rowLogits = (mq, koff) => {
+        const s = new Float64Array(n);
+        for (let j = 0; j < n; j++) {
+          s[j] = dot(rope(q, mq, d, THETA), rope(K.subarray(j * d, (j + 1) * d), koff + j, d, THETA)) * sc - slope * Math.abs(mq - (koff + j));
+        }
+        return s;
+      };
+      const base = rowLogits(m, 0), shifted = rowLogits(m + p, p);
+      const lb = lse(base, 0, n), ls = lse(shifted, 0, n);
+      if (!rc(ls, lb, 1e-9)) return false;
+      const pb = new Float64Array(n), ps = new Float64Array(n);
+      for (let j = 0; j < n; j++) { pb[j] = Math.exp(base[j] - lb); ps[j] = Math.exp(shifted[j] - ls); }   // 参考：lse 表出
+      return rc(ps, pb, 1e-9);
+    },
+  });
+  reg(114, {
+    name: 'ALiBi · 斜率累积积闭合式',
+    intuition: '前 h 个斜率的乘积有闭式（指数等差求和）：它决定「级联 ALiBi 头」的等效衰减强度。',
+    math: 'Π_{i<h}2^(−8i/H) = 2^(−4h(h−1)/H)',
+    pseudocode: 'P[h] = prod(slopes[0..h-1]); assert rc(P[h], pow(2,-4*h*(h-1)/H), 1e-12) && P[h+1] <= P[h]',
+    complexity: 'O(H)', ref: 'Press et al. 2022 §3 · 等差指数求和（D045 斜率级数的积形式）',
+    commonPitfall: 'H=1 时只有 P[0]=1（空积）；单调性判据用 ≤——slope[0]=1 使前两项相等，不是严格递减。',
+    invariant: '∀h≤H：rc(P[h], 2^(−4h(h−1)/H), 1e-12)；P 非增',
+    inputs: ['h'], domains: { h: 'nat' },
+    run: (h) => {
+      const s = alibiSlopes(h), out = new Float64Array(s.length + 1);
+      out[0] = 1;
+      for (let i = 0; i < s.length; i++) out[i + 1] = out[i] * s[i];
+      return out;
+    },
+    predicate: (h) => {
+      const H = 1 + (Math.abs(h) % 16), s = alibiSlopes(h), P = new Float64Array(H + 1);
+      P[0] = 1;
+      for (let i = 0; i < H; i++) P[i + 1] = P[i] * s[i];
+      for (let k = 0; k <= H; k++) {
+        if (!rc(P[k], Math.pow(2, -4 * k * (k - 1) / H), 1e-12)) return false;   // 参考：闭式
+        if (k + 1 <= H && P[k + 1] > P[k]) return false;
+      }
+      return true;
+    },
+  });
+  reg(115, {
+    name: 'RoPE · 旋转只触碰前 2⌊d/2⌋ 维',
+    intuition: 'd 为奇数时第 d−1 维（尾维）没有旋转伴侣，必须恒等；d 为偶数时第 d 维及以后同理不被触碰。',
+    math: 'supp(R) ⊆ [0, 2⌊d/2⌋)；t ≥ 2⌊d/2⌋ ⇒ Object.is(out[t], x[t])',
+    pseudocode: 'o = rope(x, pos, dEff, theta); for t >= 2*floor(dEff/2): assert Object.is(o[t], x[t])',
+    complexity: 'O(d)', ref: 'Su et al. 2021 §3.2（floor 配对的边界情形，D043 的尾维强化）',
+    commonPitfall: '奇数头维是最常见的形状 bug：若按 (d+1)/2 配对会越界写或读错位；此处用逐位断言锁死 floor 语义。',
+    invariant: '∀t ≥ 2⌊d/2⌋：Object.is(o[t], x[t])（±0 归一）；dEff = 2+(|d|%7) ∈ [2,8]',
+    inputs: ['x', 'pos', 'd'], domains: { x: 'vecSmall', pos: 'small', d: 'nat' }, vecDims: { x: D8 },
+    run: (x, pos, d) => rope(x, pos, 2 + (Math.abs(d) % 7), THETA),
+    predicate: (x, pos, d) => {
+      const dEff = 2 + (Math.abs(d) % 7), o = rope(x, pos, dEff, THETA);
+      const bound = 2 * Math.floor(dEff / 2);
+      for (let t = bound; t < x.length; t++) {
+        let u = o[t], v = x[t];
+        if (u === 0) u = 0; if (v === 0) v = 0;
+        if (!Object.is(u, v)) return false;
+      }
+      return true;
+    },
+  });
+  reg(116, {
+    name: 'RoPE · 频率公比恒定',
+    intuition: '逆频率是几何级数：相邻频率之比恒为 θ^(−2/d)，与对索引无关——「多尺度」的代数根源。',
+    math: 'fᵢ₊₁/fᵢ = θ^(−2/d)（i = 0..⌊d/2⌋−2）；f₀ ≡ 1（逐位）',
+    pseudocode: 'f = invFreq(d,theta); assert Object.is(f[0],1) && rc(f[i+1]/f[i], pow(theta,-2/d), 1e-12)',
+    complexity: 'O(d/2)', ref: 'Su et al. 2021 §3.2（D034 单调性的量化形式）',
+    commonPitfall: 'θ 可小于 1（域 pos 下限 1e−6）：此时公比 >1（频率递增），断言的是「比值恒定」而非「递减」；f[0]=θ^0=1 逐位精确。',
+    invariant: 'f₀ === 1；∀i：rc(fᵢ₊₁/fᵢ, θ^(−2/d), 1e-12)；dEff = 2+(|d|%7)',
+    inputs: ['d', 'theta'], domains: { d: 'nat', theta: 'pos' },
+    run: (d, theta) => invFreq(2 + (Math.abs(d) % 7), theta),
+    predicate: (d, theta) => {
+      const dEff = 2 + (Math.abs(d) % 7), f = invFreq(dEff, theta), r = Math.pow(theta, -2 / dEff);
+      if (!Object.is(f[0], 1)) return false;
+      for (let i = 0; i + 1 < f.length; i++) if (!rc(f[i + 1] / f[i], r, 1e-12)) return false;
+      return true;
+    },
+  });
+  reg(117, {
+    name: 'ALiBi · 行距离和闭合式',
+    intuition: '一行偏置的绝对距离和有闭式（左右两段等差数列）：O(1) 核算整行的 ALiBi 总惩罚量。',
+    math: 'Σⱼ|i−j| = i(i+1)/2 + (m−1−i)(m−i)/2',
+    pseudocode: 's = sum(|i-j| for j); return rc(s, i*(i+1)/2 + (m-1-i)*(m-i)/2, 1e-12)',
+    complexity: 'O(m)', ref: '等差数列求和 · Press et al. 2022 §3（行级聚合量）',
+    commonPitfall: '两段分别是 j≤i 与 j>i 的距离和；闭式对 i=0 与 i=m−1 退化正确（一段为 0）；反向累加作参考路径。',
+    invariant: 'rc(Σⱼ|i−j|, i(i+1)/2 + (m−1−i)(m−i)/2, 1e-12)；m = 1+(|n|%8)',
+    inputs: ['n', 'i'], domains: { n: 'nat', i: 'nat' },
+    run: (n, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m;
+      let s = 0;
+      for (let j = 0; j < m; j++) s += Math.abs(iq - j);
+      return s;
+    },
+    predicate: (n, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m;
+      let s = 0;
+      for (let j = m - 1; j >= 0; j--) s += Math.abs(iq - j);      // 参考：反向累加
+      return rc(s, iq * (iq + 1) / 2 + (m - 1 - iq) * (m - iq) / 2, 1e-12);
+    },
+  });
+  reg(118, {
+    name: 'RoPE · 相邻位置打分 Lipschitz 界',
+    intuition: '位置每推进一步，打分变化被各频率对的弦长扼住：Σᵢ2sin(fᵢ/2)·‖qᵢ‖·‖kᵢ‖——RoPE 局部平滑性的定量形式。',
+    math: '|g(m+1) − g(m)| ≤ Σᵢ 2·sin(fᵢ/2)·‖qᵢ‖₂·‖kᵢ‖₂，fᵢ = θ^(−2i/8)',
+    pseudocode: 'g1 = dot(rope(q,m+1), k); g0 = dot(rope(q,m), k); assert |g1-g0| <= Σᵢ 2*sin(f[i]/2)*hypot(qᵢ)*hypot(kᵢ)',
+    complexity: 'O(d)', ref: '旋转矩阵 Lipschitz 性（逐对弦长界）· Su et al. 2021',
+    commonPitfall: '取逐对紧式而非粗式 2sin(f₀/2)·‖q‖·‖k‖——随机输入下 ‖R_{m+1}q−R_m q‖ ≈ 0.96·‖q₀‖（仅最高频对有满弦长）而 ‖q‖ 含全部 4 对，粗式松约 2 倍，连「频率翻倍」级 bug 都漏判；每对弦长 2sin(fᵢ/2)·‖qᵢ‖（fᵢ ≤ f₀=1），三角不等式求和；范数参考用 Math.hypot 累积路径，裕度用 (1+1e−12) 相对形式。',
+    invariant: '|g(m+1)−g(m)| ≤ Σᵢ 2sin(fᵢ/2)·‖qᵢ‖·‖kᵢ‖·(1+1e-12)',
+    inputs: ['q', 'k', 'm'], domains: { q: 'vecSmall', k: 'vecSmall', m: 'small' }, vecDims: { q: D8, k: D8 },
+    run: (q, k, m) => Math.abs(dot(rope(q, m + 1, D8, THETA), k) - dot(rope(q, m, D8, THETA), k)),
+    predicate: (q, k, m) => {
+      const lhs = Math.abs(dot(rope(q, m + 1, D8, THETA), k) - dot(rope(q, m, D8, THETA), k));
+      const f = invFreq(D8, THETA);
+      let rhs = 0;
+      for (let i = 0; i < f.length; i++) {
+        rhs += 2 * Math.sin(f[i] / 2) * hypotRef(q.subarray(2 * i, 2 * i + 2)) * hypotRef(k.subarray(2 * i, 2 * i + 2));
+      }
+      return lhs <= rhs * (1 + 1e-12) + 1e-12;
+    },
+  });
+  reg(119, {
+    name: 'ALiBi · 行最小偏置闭合式',
+    intuition: '一行里惩罚最重的位置是最远端点：闭式 −slope·max(i, m−1−i)，O(1) 给出行内下界。',
+    math: 'minⱼ B[i][j] = −slope·max(i, m−1−i)',
+    pseudocode: 'row = alibiBias(m,slope) 第 i 行; return rc(min(row), -slope*max(i, m-1-i), 1e-12)',
+    complexity: 'O(m)', ref: 'Press et al. 2022 §3（行级极值，与 D050 距离单调性互补）',
+    commonPitfall: '最远点是「左端 0 与右端 m−1 中更远的那个」，不是固定的某一端；反向扫描作参考路径。',
+    invariant: 'rc(minⱼBᵢⱼ, −slope·max(i, m−1−i), 1e-12)；m = 1+(|n|%8)',
+    inputs: ['n', 'slope', 'i'], domains: { n: 'nat', slope: 'smallPos', i: 'nat' },
+    run: (n, slope, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m, B = alibiBias(m, slope);
+      let mn = Infinity;
+      for (let j = 0; j < m; j++) { const v = B[iq * m + j]; if (v < mn) mn = v; }
+      return mn;
+    },
+    predicate: (n, slope, i) => {
+      const m = 1 + (Math.abs(n) % 8), iq = Math.abs(i) % m, B = alibiBias(m, slope);
+      let mn = Infinity;
+      for (let j = m - 1; j >= 0; j--) { const v = B[iq * m + j]; if (v < mn) mn = v; }   // 参考：反向扫描
+      return rc(mn, -slope * Math.max(iq, m - 1 - iq), 1e-12);
+    },
+  });
+  reg(120, {
+    name: 'RoPE · 行分布整体平移不变',
+    intuition: 'query 与全部 key 同时平移 p，RoPE 行打分逐项不变 ⇒ softmax 行分布冻结。这是 D113 去掉 ALiBi 后的基座。',
+    math: 'softmaxⱼ(⟨R_{m+p}q, R_{j+p}kⱼ⟩/√d) = softmaxⱼ(⟨R_m q, R_j kⱼ⟩/√d)',
+    pseudocode: 'base = rowLogits(m,0); shifted = rowLogits(m+p,p); return rc(lse) && rc(dist)',
+    complexity: 'O(n·d)', ref: 'Su et al. 2021 §3.3（D039 的行分布形式；无偏置基座）',
+    commonPitfall: '与 D113 的分工：此处纯 RoPE（无 ALiBi 项）断言行分布，D113 复合距离偏置后仍不变；两者共同覆盖「位置编码平移族」，不断言同一事实。',
+    invariant: 'rc(平移后行分布, 原行分布, 1e-9)；rc(平移后 lse, 原 lse, 1e-9)',
+    inputs: ['q', 'K', 'm', 'p'], domains: { q: 'vecSmall', K: 'matSmall', m: 'small', p: 'small' },
+    matrixDims: { K: [4, 4] }, vecDims: { q: 4 },
+    run: (q, K, m, p) => {
+      const n = sq(K), d = q.length, sc = 1 / Math.sqrt(d);
+      const s = new Float64Array(n);
+      for (let j = 0; j < n; j++) {
+        s[j] = dot(rope(q, m + p, d, THETA), rope(K.subarray(j * d, (j + 1) * d), j + p, d, THETA)) * sc;
+      }
+      return softmaxRow(s, 0, n);
+    },
+    predicate: (q, K, m, p) => {
+      const n = sq(K), d = q.length, sc = 1 / Math.sqrt(d);
+      const rowLogits = (mq, koff) => {
+        const s = new Float64Array(n);
+        for (let j = 0; j < n; j++) {
+          s[j] = dot(rope(q, mq, d, THETA), rope(K.subarray(j * d, (j + 1) * d), koff + j, d, THETA)) * sc;
+        }
+        return s;
+      };
+      const base = rowLogits(m, 0), shifted = rowLogits(m + p, p);
+      const lb = lse(base, 0, n), ls = lse(shifted, 0, n);
+      if (!rc(ls, lb, 1e-9)) return false;
+      const pb = new Float64Array(n), ps = new Float64Array(n);
+      for (let j = 0; j < n; j++) { pb[j] = Math.exp(base[j] - lb); ps[j] = Math.exp(shifted[j] - ls); }   // 参考：lse 表出
+      return rc(ps, pb, 1e-9);
+    },
+  });
+
+  // ══ GQA×Cache 复合（D121–D128）══════════════════════════════════════
+  reg(121, {
+    name: '多头 cache · 头间写入独立性',
+    intuition: '往某个头的缓存写行，绝不能碰到其他头的任何一行——多头 cache 的正确性底线。',
+    math: 'append(cacheₕ, row) 后：∀k≠h, ∀p<len：bitEq(cache′ₖ.row(p), cacheₖ.row(p))',
+    pseudocode: 'cs = [c0, c1]; cs[h] = append(cs[h], row); assert bitEq(cs[1-h].data, before)',
+    complexity: 'O(H·cap·d)', ref: '多头 KV Cache 隔离契约 · 复合 D079–D086（追加语义）',
+    commonPitfall: '共享底层缓冲区（视图别名）会让「写头 h」静默污染头 1−h；此处构造两个独立 cache 对象并逐位校验另一个的数据区；H=2、cap=2、d=4。',
+    invariant: '写头 h 后，头 1−h 的 data 逐位不变；且头 h 的 len === L+1（L = |len|%2 < cap）',
+    inputs: ['seed', 'h', 'len', 'row'], domains: { seed: 'matSmall', h: 'nat', len: 'nat', row: 'vecSmall' },
+    matrixDims: { seed: [4, 4] }, vecDims: { row: 4 },
+    run: (seed, h, len, row) => {
+      const cap = 2, d = 4, H = 2, he = Math.abs(h) % H, L = Math.abs(len) % cap;
+      const cs = [];
+      for (let k = 0; k < H; k++) cs.push({ data: seed.slice(k * cap * d, (k + 1) * cap * d), len: L, cap, d });
+      cs[he] = cacheAppend(cs[he], row);
+      return cs[1 - he].data;
+    },
+    predicate: (seed, h, len, row) => {
+      const cap = 2, d = 4, H = 2, he = Math.abs(h) % H, L = Math.abs(len) % cap;
+      const cs = [];
+      for (let k = 0; k < H; k++) cs.push({ data: seed.slice(k * cap * d, (k + 1) * cap * d), len: L, cap, d });
+      const before = cs[1 - he].data.slice();
+      cs[he] = cacheAppend(cs[he], row);
+      if (!bitEq(cs[1 - he].data, before)) return false;
+      return cs[he].len === L + 1;
+    },
+  });
+  reg(122, {
+    name: 'cache · 追加后 QK 打分前缀逐位不变',
+    intuition: '追加只写新行：缓存里旧行内容位级不变 ⇒ 与同一 query 的打分也位级不变，新打分有限。',
+    math: '∀j<L：Object.is(score′(j), score(j))；L<cap ⇒ isFinite(score(L))',
+    pseudocode: 'c2 = cacheAppend(c, row); assert prefix scores bitwise equal && new score finite',
+    complexity: 'O(cap·d)', ref: 'KV Cache 追加语义 + 打分的列独立性（D086/D011 的复合）',
+    commonPitfall: '逐位成立的关键：cacheAppend 复制数据区且只写末尾 ⇒ 旧行位级不变 ⇒ 点积操作数位级不变 ⇒ 结果位级不变。',
+    invariant: '前缀打分逐位 Object.is；未满时新打分有限；L = min(|len|%(cap+1), cap)',
+    inputs: ['K', 'len', 'q', 'row'], domains: { K: 'matSmall', len: 'nat', q: 'vecSmall', row: 'vecSmall' },
+    matrixDims: { K: [4, 4] }, vecDims: { q: 4, row: 4 },
+    run: (K, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap);
+      const c2 = cacheAppend({ data: K, len: L, cap, d }, row);
+      const sc = 1 / Math.sqrt(d), out = new Float64Array(c2.len);
+      for (let j = 0; j < c2.len; j++) out[j] = dot(q, cacheRow(c2, j)) * sc;
+      return out;
+    },
+    predicate: (K, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap);
+      const c = { data: K, len: L, cap, d };
+      const c2 = cacheAppend(c, row);
+      const sc = 1 / Math.sqrt(d);
+      for (let j = 0; j < L; j++) {
+        const before = dot(q, cacheRow(c, j)) * sc, after = dot(q, cacheRow(c2, j)) * sc;
+        if (!Object.is(before, after)) return false;
+      }
+      if (L < cap && !Number.isFinite(dot(q, cacheRow(c2, L)) * sc)) return false;
+      return true;
+    },
+  });
+  reg(123, {
+    name: 'GQA · 组内共享 KV 一致',
+    intuition: '同一 GQA 组的 query 头吃同一份 KV：喂相同的 query 行，经过完整组装后输出必须逐位相同。',
+    math: 'kv(h₁) = kv(h₂) ⇒ attnFromQKV(q, KV[kv(h₁)]) === attnFromQKV(q, KV[kv(h₂)])（逐位）',
+    pseudocode: 'H=4, nKV=1+|g|%2; for 同组 (h1,h2): assert kvIdx equal && bitEq(out(h1), out(h2))',
+    complexity: 'O(H·m·d²)', ref: 'Ainslie et al. 2023 §2.2（组共享的组装层判据，复合 D065 映射 + D097–D108 组装）',
+    commonPitfall: '前置 kvIndexOf(h₁)===kvIndexOf(h₂)（H=4、nKV∈{1,2} 时头 0/1 与 2/3 同组）；「相同 query 内容 + 相同 kv 行内容 ⇒ 相同计算图」是逐位判据的依据，与 D073（repeat_kv 逐位）分工：D073 查复制，本项查组装输出。',
+    invariant: '前置同组 ⇒ bitEq(out(h₁), out(h₂))（±0 归一）',
+    inputs: ['q', 'KV', 'g'], domains: { q: 'vecSmall', KV: 'matSmall', g: 'nat' },
+    matrixDims: { KV: [4, 4] }, vecDims: { q: 4 },
+    run: (q, KV, g) => {
+      const H = 4, nKV = 1 + (Math.abs(g) % 2), n = sq(KV), d = KV.length / n;
+      const rows = Math.max(1, Math.floor(n / nKV));
+      const out = new Float64Array(H * rows * d);
+      for (let h = 0; h < H; h++) {
+        const k = kvIndexOf(h, H, nKV);
+        const sub = KV.subarray(k * rows * d, Math.min(n, (k + 1) * rows) * d);
+        const m = sub.length / d, Q = new Float64Array(m * d);
+        for (let i = 0; i < m; i++) Q.set(q, i * d);
+        out.set(attnFromQKV(Q, sub, sub, m, d), h * rows * d);
+      }
+      return out;
+    },
+    predicate: (q, KV, g) => {
+      const H = 4, nKV = 1 + (Math.abs(g) % 2), n = sq(KV), d = KV.length / n;
+      const rows = Math.max(1, Math.floor(n / nKV));
+      const headOut = (h) => {
+        const k = kvIndexOf(h, H, nKV);
+        const sub = KV.subarray(k * rows * d, Math.min(n, (k + 1) * rows) * d);
+        const m = sub.length / d, Q = new Float64Array(m * d);
+        for (let i = 0; i < m; i++) Q.set(q, i * d);
+        return attnFromQKV(Q, sub, sub, m, d);
+      };
+      for (let h1 = 0; h1 < H; h1++) for (let h2 = h1 + 1; h2 < H; h2++) {
+        if (kvIndexOf(h1, H, nKV) !== kvIndexOf(h2, H, nKV)) continue;   // 不同组：不适用
+        if (!bitEq(headOut(h1), headOut(h2))) return false;
+      }
+      return true;
+    },
+  });
+  reg(124, {
+    name: '滚动窗口 · 可见长度守恒',
+    intuition: '窗口满之后每次滚动追加都「进一出一」：可见长度恒为 cap，打分永远有限——流式解码不丢长度的判据。',
+    math: '满窗后 N 次 cacheAppendWindowed：len === cap 恒成立；∀j<cap：isFinite(scoreⱼ)',
+    pseudocode: 'fill to cap; for N: c = appendWindowed(c, freshRow, noSinks); assert c.len === cap',
+    complexity: 'O(N·cap·d)', ref: 'Xiao et al. 2024 (StreamingLLM) §3.3 · 长度守恒（D082 滚动的打分层验证）',
+    commonPitfall: '「无 sink」时每步淘汰最旧行；长度判据是 ===cap（精确），不是约等于；N = |n|%9 ∈ [0,8]。',
+    invariant: '填满后每次追加 len === cap；最终全部可见打分有限',
+    inputs: ['cache', 'n', 'q'], domains: { cache: 'matSmall', n: 'nat', q: 'vecSmall' },
+    matrixDims: { cache: [4, 4] }, vecDims: { q: 4 },
+    run: (cache, n, q) => {
+      const cap = sq(cache), d = cache.length / cap, N = Math.abs(n) % 9;
+      let c = { data: cache.slice(), len: cap, cap, d };
+      const noSinks = new Float64Array(cap);
+      for (let i = 0; i < N; i++) {
+        const row = new Float64Array(d);
+        for (let t = 0; t < d; t++) row[t] = 777 + i * d + t;
+        c = cacheAppendWindowed(c, row, noSinks);
+      }
+      const sc = 1 / Math.sqrt(d), out = new Float64Array(c.len);
+      for (let j = 0; j < c.len; j++) out[j] = dot(q, cacheRow(c, j)) * sc;
+      return out;
+    },
+    predicate: (cache, n, q) => {
+      const cap = sq(cache), d = cache.length / cap, N = Math.abs(n) % 9;
+      let c = { data: cache.slice(), len: cap, cap, d };
+      const noSinks = new Float64Array(cap);
+      for (let i = 0; i < N; i++) {
+        if (c.len !== cap) return false;
+        const row = new Float64Array(d);
+        for (let t = 0; t < d; t++) row[t] = 777 + i * d + t;
+        c = cacheAppendWindowed(c, row, noSinks);
+      }
+      if (c.len !== cap) return false;
+      const sc = 1 / Math.sqrt(d);
+      for (let j = 0; j < c.len; j++) if (!Number.isFinite(dot(q, cacheRow(c, j)) * sc)) return false;
+      return true;
+    },
+  });
+  reg(125, {
+    name: '增量 softmax · 旧权重等比缩放',
+    intuition: '新块并入时，旧权重整体乘同一个常数 c（在线 softmax 的核心）：比例不变，只有尺度重标定。',
+    math: 'M = max(m_old, s_new)；c = l_old·e^{m_old−M}/(l_old·e^{m_old−M} + e^{s_new−M})；peⱼ = c·pⱼ（j<L）',
+    pseudocode: 'p = softmax(old); pe = softmax(old+[s_new]); assert pairwise ratios equal && rc(pe[0]/p[0], c_closed, 1e-9)',
+    complexity: 'O(L)', ref: 'Milakov & Gimelshein 2018（在线 softmax 合并法则）',
+    commonPitfall: '两两比值相等用 rc(peⱼ/pⱼ, peₖ/pₖ, 1e-9)——pⱼ 在域内恒 >0（打分跨度 ≤400，exp 不下溢）；闭式 c 由 lse 分解独立算出，与 pe₀/p₀ 互为交叉验证。',
+    invariant: '∀j,k<L：rc(peⱼ/pⱼ, peₖ/pₖ, 1e-9)；rc(pe₀/p₀, c闭式, 1e-9)；rc(pe_L, 1−Σ旧, 1e-9)；L=0 时 pe₀===1',
+    inputs: ['K', 'V', 'len', 'q', 'row'], domains: { K: 'matSmall', V: 'matSmall', len: 'nat', q: 'vecSmall', row: 'vecSmall' },
+    matrixDims: { K: [4, 4], V: [4, 4] }, vecDims: { q: 4, row: 4 },
+    run: (K, V, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap), sc = 1 / Math.sqrt(d);
+      const all = new Float64Array(L + 1);
+      for (let j = 0; j < L; j++) all[j] = dot(q, K.subarray(j * d, (j + 1) * d)) * sc;
+      all[L] = dot(q, row) * sc;
+      return softmaxRow(all, 0, L + 1);
+    },
+    predicate: (K, V, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap), sc = 1 / Math.sqrt(d);
+      const sOld = new Float64Array(L);
+      for (let j = 0; j < L; j++) sOld[j] = dot(q, K.subarray(j * d, (j + 1) * d)) * sc;
+      const sNew = dot(q, row) * sc;
+      const p = softmaxRow(sOld, 0, L);
+      const all = new Float64Array(L + 1);
+      for (let j = 0; j < L; j++) all[j] = sOld[j];
+      all[L] = sNew;
+      const pe = softmaxRow(all, 0, L + 1);
+      if (L === 0) return Object.is(pe[0], 1);           // 空旧块：新块独占
+      for (let j = 0; j < L; j++) for (let k = 0; k < L; k++) {
+        if (!rc(pe[j] / p[j], pe[k] / p[k], 1e-9)) return false;      // 等比缩放：两两比值相等
+      }
+      let mOld = -Infinity;
+      for (let j = 0; j < L; j++) if (sOld[j] > mOld) mOld = sOld[j];
+      let lOld = 0;
+      for (let j = 0; j < L; j++) lOld += Math.exp(sOld[j] - mOld);
+      const M = Math.max(mOld, sNew);
+      const cRef = lOld * Math.exp(mOld - M) / (lOld * Math.exp(mOld - M) + Math.exp(sNew - M));   // 参考：闭式
+      if (!rc(pe[0] / p[0], cRef, 1e-9)) return false;
+      let sumOld = 0;
+      for (let j = 0; j < L; j++) sumOld += pe[j];
+      if (!rc(pe[L], 1 - sumOld, 1e-9)) return false;
+      return true;
+    },
+  });
+  reg(126, {
+    name: '增量上下文 · 输出递推式',
+    intuition: '并入新块后的输出 = 旧输出乘缩放常数 + 新行权重乘新值：O(d) 更新，无需重算全部历史。',
+    math: 'out′ = c·out + p_new·v_new；c = pe₀/p₀（L≥1）；L=0 时 c=0、out=0、out′=v_new',
+    pseudocode: 'out = attn(old P, old V); out2 = attn(pe, old V + [v_new]); assert rc(out2, c*out + pe[L]*row, 1e-9)',
+    complexity: 'O(L·d)', ref: 'Milakov & Gimelshein 2018（在线 softmax 输出递推） · Dao et al. 2022 (FlashAttention)',
+    commonPitfall: 'c 从 pe₀/p₀ 反推（而非再次用闭式）——两条路径互为交叉验证；L=0 的退化（out′=v_new）要单独处理。',
+    invariant: 'rc(out′, c·out + p_new·v_new, 1e-9)；L = min(|len|%(cap+1), cap)',
+    inputs: ['K', 'V', 'len', 'q', 'row'], domains: { K: 'matSmall', V: 'matSmall', len: 'nat', q: 'vecSmall', row: 'vecSmall' },
+    matrixDims: { K: [4, 4], V: [4, 4] }, vecDims: { q: 4, row: 4 },
+    run: (K, V, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap), sc = 1 / Math.sqrt(d);
+      const all = new Float64Array(L + 1);
+      for (let j = 0; j < L; j++) all[j] = dot(q, K.subarray(j * d, (j + 1) * d)) * sc;
+      all[L] = dot(q, row) * sc;
+      const pe = softmaxRow(all, 0, L + 1);
+      const out = new Float64Array(d);
+      for (let t = 0; t < d; t++) { let acc = 0; for (let j = 0; j < L; j++) acc += pe[j] * V[j * d + t]; acc += pe[L] * row[t]; out[t] = acc; }
+      return out;
+    },
+    predicate: (K, V, len, q, row) => {
+      const cap = sq(K), d = K.length / cap, L = Math.min(Math.abs(len) % (cap + 1), cap), sc = 1 / Math.sqrt(d);
+      const sOld = new Float64Array(L);
+      for (let j = 0; j < L; j++) sOld[j] = dot(q, K.subarray(j * d, (j + 1) * d)) * sc;
+      const sNew = dot(q, row) * sc;
+      const p = softmaxRow(sOld, 0, L);
+      const all = new Float64Array(L + 1);
+      for (let j = 0; j < L; j++) all[j] = sOld[j];
+      all[L] = sNew;
+      const pe = softmaxRow(all, 0, L + 1);
+      const out = new Float64Array(d);                   // 旧输出（前向加权和）
+      for (let t = 0; t < d; t++) { let acc = 0; for (let j = 0; j < L; j++) acc += p[j] * V[j * d + t]; out[t] = acc; }
+      const out2 = new Float64Array(d);                  // 并入后输出
+      for (let t = 0; t < d; t++) { let acc = 0; for (let j = 0; j < L; j++) acc += pe[j] * V[j * d + t]; acc += pe[L] * row[t]; out2[t] = acc; }
+      const c = L >= 1 ? pe[0] / p[0] : 0;               // 缩放常数（由权重反推）
+      for (let t = 0; t < d; t++) {
+        if (!rc(out2[t], c * out[t] + pe[L] * row[t], 1e-9)) return false;   // 参考：递推闭式
+      }
+      return true;
+    },
+  });
+  reg(127, {
+    name: '滚动后 · 锚点打分逐位不变',
+    intuition: 'attention sink 行永不淘汰：滚动追加后按内容找到锚点，它与同一 query 的打分必须逐位保持。',
+    math: 'i ∈ sinks ⇒ ∃k：bitEq(newCache.row(k), oldCache.row(i)) ⇒ Object.is(score(k), score(i))',
+    pseudocode: 'c2 = appendWindowed(c, row, sinks); for sink i: find row by content; assert score bitwise kept',
+    complexity: 'O(cap²·d)', ref: 'Xiao et al. 2024 §3.2（sink 保护 + D083 的内容匹配判据的打分层版）',
+    commonPitfall: '剔除后剩余行「前移」，故按行内容匹配而非索引匹配（与 D083 同思路）；约定首行恒为锚点（sinks[0]=1），其余按 vecMask，保证非虚设。',
+    invariant: '每个锚点行的内容在新缓存中按位找到且其打分 Object.is 保持；有非锚点时末尾行为新行（逐位）且 len===cap',
+    inputs: ['cache', 'q', 'row', 'keep'], domains: { cache: 'matSmall', q: 'vecSmall', row: 'vecSmall', keep: 'vecMask' },
+    matrixDims: { cache: [4, 4] }, vecDims: { q: 4, row: 4, keep: 4 },
+    run: (cache, q, row, keep) => {
+      const cap = sq(cache), d = cache.length / cap;
+      const sinks = new Float64Array(cap);
+      sinks[0] = 1;                                       // 约定：首行恒为锚点
+      for (let i = 1; i < cap; i++) sinks[i] = keep[i];
+      const c = { data: cache.slice(), len: cap, cap, d };
+      return cacheAppendWindowed(c, row, sinks).data;
+    },
+    predicate: (cache, q, row, keep) => {
+      const cap = sq(cache), d = cache.length / cap, sc = 1 / Math.sqrt(d);
+      const sinks = new Float64Array(cap);
+      sinks[0] = 1;
+      for (let i = 1; i < cap; i++) sinks[i] = keep[i];
+      const c = { data: cache.slice(), len: cap, cap, d };
+      const c2 = cacheAppendWindowed(c, row, sinks);
+      for (let i = 0; i < cap; i++) {
+        if (sinks[i] === 0) continue;
+        const oldRow = c.data.subarray(i * d, (i + 1) * d);
+        const oldScore = dot(q, oldRow) * sc;
+        let found = false;
+        for (let k = 0; k < c2.len && !found; k++) {
+          if (bitEq(c2.data.subarray(k * d, (k + 1) * d), oldRow)) {
+            found = true;
+            if (!Object.is(dot(q, c2.data.subarray(k * d, (k + 1) * d)) * sc, oldScore)) return false;
+          }
+        }
+        if (!found) return false;
+      }
+      let hasNonSink = false;
+      for (let i = 0; i < cap; i++) if (sinks[i] === 0) hasNonSink = true;
+      if (!hasNonSink) return c2.len === cap;             // 全锚点：拒绝淘汰，长度不变
+      if (c2.len !== cap) return false;
+      for (let t = 0; t < d; t++) if (!Object.is(c2.data[(cap - 1) * d + t], row[t])) return false;   // 末尾 = 新行
+      return true;
+    },
+  });
+  reg(128, {
+    name: '增量解码 · 与全量重算逐位一致',
+    intuition: '逐位置追加 cache 的增量输出，必须与「拿全部历史做一次因果注意力」的行逐位相同——增量推理的终极回归判据。',
+    math: '∀pos<P：bitEq(cacheCtx(追加 pos 步后的 cache), attnFromQKV(Q,K,V) 第 pos 行)',
+    pseudocode: 'for pos: append K[pos],V[pos]; out_inc = cacheCtx(...); assert bitEq(out_inc, fullRow(pos))',
+    complexity: 'O(P²·d)', ref: '增量解码正确性 · Vaswani et al. 2017 §3.2.2 + KV Cache 追加语义（D107 行局部性的系统级结论）',
+    commonPitfall: '逐位成立的关键链：cache 存的是位级副本 ⇒ 打分位级相同；掩位 exp(−∞)=0 与 0·V=±0 不改变累加器（±0 归一后）⇒ 整行位级相同；P = 2+(|p|%3) ∈ [2,4] ≤ cap。',
+    invariant: '∀pos<P：bitEq(增量输出第 pos 行, 全量因果重算第 pos 行)',
+    inputs: ['Q', 'K', 'V', 'p'], domains: { Q: 'matSmall', K: 'matSmall', V: 'matSmall', p: 'nat' },
+    matrixDims: { Q: [4, 4], K: [4, 4], V: [4, 4] },
+    run: (Q, K, V, p) => {
+      const n = sq(Q), d = Q.length / n, P = 2 + (Math.abs(p) % 3);
+      let kc = makeCache(n, d), vc = makeCache(n, d);
+      const out = new Float64Array(P * d);
+      for (let pos = 0; pos < P; pos++) {
+        kc = cacheAppend(kc, K.subarray(pos * d, (pos + 1) * d));
+        vc = cacheAppend(vc, V.subarray(pos * d, (pos + 1) * d));
+        out.set(cacheCtx(kc, vc, Q.subarray(pos * d, (pos + 1) * d)), pos * d);
+      }
+      return out;
+    },
+    predicate: (Q, K, V, p) => {
+      const n = sq(Q), d = Q.length / n, P = 2 + (Math.abs(p) % 3);
+      const full = attnFromQKV(Q, K, V, n, d);            // 参考：全量因果重算
+      let kc = makeCache(n, d), vc = makeCache(n, d);
+      for (let pos = 0; pos < P; pos++) {
+        kc = cacheAppend(kc, K.subarray(pos * d, (pos + 1) * d));
+        vc = cacheAppend(vc, V.subarray(pos * d, (pos + 1) * d));
+        const o = cacheCtx(kc, vc, Q.subarray(pos * d, (pos + 1) * d));
+        if (!bitEq(o, full.subarray(pos * d, (pos + 1) * d))) return false;
+      }
+      return true;
+    },
+  });
+})(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
+
+/* ============================================================================
  * L10 微指令 · F 域（归一化）· 第 1/3 批（F001–F032）
  * ----------------------------------------------------------------------------
  * 所属层：L10-microIsa  域：F（归一化）
@@ -7777,8 +10961,14 @@
   function gnNormRef(M, n, d, G, g, b) {
     const out = new Float64Array(n * d), cpg = Math.max(1, Math.floor(d / G));
     for (let i = 0; i < n; i++) for (let gr = 0; gr < G; gr++) {
-      const s0 = gr * cpg, s1 = Math.min(d, (gr + 1) * cpg); let s = 0; for (let j = s1 - 1; j >= s0; j--) s += M[i * d + j]; const mu = s / (s1 - s0);
-      let ss = 0; for (let j = s0; j < s1; j++) ss += M[i * d + j] * M[i * d + j]; const v = Math.max(0, ss / (s1 - s0) - mu * mu);
+      const s0 = gr * cpg, s1 = Math.min(d, (gr + 1) * cpg);
+      // 独立参考路径：Welford 在线算法（单遍增量更新均值与 M2），数值稳定且与
+      // gnNorm 的两遍法算法结构完全不同 —— 保持交叉验证力。
+      // 注意：不可改用简化公式 Σx²/n − μ²：均值大、方差小时会触发灾难性抵消，
+      // 方差精度崩塌（F084 曾因此在 2500 种子扫描中假红）。
+      let m = 0, m2 = 0, cnt = 0;
+      for (let j = s1 - 1; j >= s0; j--) { const x = M[i * d + j]; cnt++; const delta = x - m; m += delta / cnt; m2 += delta * (x - m); }
+      const mu = m; const v = cnt > 0 ? Math.max(0, m2 / cnt) : 0;
       const inv = 1 / Math.sqrt(v + EPS);
       for (let j = s0; j < s1; j++) out[i * d + j] = (b ? b[j] : 0) + (g ? g[j] : 1) * (M[i * d + j] - mu) * inv;
     }

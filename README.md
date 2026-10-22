@@ -4,10 +4,10 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.5-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.6-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
-[![ISA](https://img.shields.io/badge/ISA-864%2F1024-blue)](#十层分解架构落地状态)
+[![ISA](https://img.shields.io/badge/ISA-896%2F1024-blue)](#十层分解架构落地状态)
 [![Architecture](https://img.shields.io/badge/architecture-L1%E2%86%92L10%20ten--layer-blueviolet)](#十层分解架构落地状态)
 [![Regression](https://img.shields.io/badge/regression-R1%E2%80%93R10%20%CE%94%3D0-brightgreen)](#十层分解架构落地状态)
 [![CI](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/CJX0712/flagship-ai/actions/workflows/ci.yml)
@@ -17,7 +17,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Author](https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-purple)](https://github.com/CJX0712)
 
-*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 864 项已实现）· 浏览器与 Node 双端同码*
+*Char/BPE Tokenizer · Decoder-only Transformer · GPT-2 ⇄ LLaMA ⇄ LLaMA-GQA ⇄ Mixtral-MoE ⇄ SWA ⇄ Gemma 架构可切换 · INT8 权重量化推理 · MoE 混合专家 · 滑动窗口/层交错稀疏注意力 · QK-norm/logit soft-cap · Attention Sink/StreamingLLM 无限上下文 · YaRN 长度外推 · Hand-written Backpropagation · AdamW · KV Cache · Temperature/top-k/top-p Sampling · 十层分解架构（L3–L10 实拆 + 1024 槽位微指令注册中心 896 项已实现）· 浏览器与 Node 双端同码*
 
 </div>
 
@@ -176,7 +176,34 @@
 
 **三处 latent predicate 失败已修复**（G087 gumbel-softmax 单调 / G093 温度缩放概率单调 / H041 温度保序）：极端温度（如 T=0.0167）或大幅值 logits（如 9232）下，多个相异 logit 经 x/T 后都坠入 softmax 浮点下溢尾部（二者均≈0），严格输出序比较对数学上应为严格大于的一对失效（双零 tie）。修复为「缩放 logit 精确序 + 可解析性守卫」——softmax(z/T)_i > softmax(z/T)_j ⇔ (z_i−m)/T > (z_j−m)/T（T>0 恒精确），仅当 si−sj>1e-6 且 si>−740（未坠入下溢尾部）时才断言严格输出序：既消除假阳性，又保留对真正乱序/常量输出回归的检测力。2500 种子确定性扫描复验 0 失败。
 
-### v15.4 新增（L10 微指令 G 域：激活与损失 96 项）
+### v15.6 新增（L10 微指令 A–E 五域补满：八域 1024 槽位全落实，864 → 1024）
+
+八域 × 128 槽位**全部落实**（此前 A–E 各 96 + F/G/H 各 128 = 864）。本批为 A/B/C/D/E 五域各补第 4 批 32 项（X097–X128），共 160 项：
+
+| 域 | 指令 | 代表不变量 |
+|---|---|---|
+| **A 标量** | A097–A128 | sign 奇/乘性/原点、copysign、fmod 符号随被除数、clamp 夹取/保序/两定义一致、NaN 传播（0·∞、∞−∞）、isFinite/isNaN、ulp 为 2 的幂、nextafter 可逆、exp2/log2 换底、cbrt 奇、atan2 四象限/对跖、度弧度往返、三参 hypot、min/max 交换·结合·幂等·对偶·次超可加 |
+| **B 向量** | B097–B128 | Lp(p=3) 齐次/非负/三角、加权 L2、余弦距离有界 [0,2] 且自为 0、切比雪夫距离对称/三角、汉明距离对称/三角、L1 距离、cumprod 末项即总积、cummax/cummin 单调且末项即极值、argmax 选中最大值、one-hot 恰一个 1、gather 单热桥接、concat 长度可加且偏移切片还原、slice 半开长度/内容、pad 保原值、rotate 复合还原 |
+| **C 矩阵** | C097–C128 | det 2×2 公式、det 转置不变、det(I)=1、对角/三角阵 det 为对角线积、det 乘积性（2×2 一般 + 3×3 固定对角因子）、2×2 迹=特征值之和、对称/反对称判定、列均值/列 softmax/列 argmax、行 LSE 上下界、列方差非负·平移不变·等于转置行方差、垂直/水平拼接形状内容、行切片、矩形双转置、对角提取、pad 补零 |
+| **E 形状** | E097–E128 | squeeze 去 1 维无残留且幂等、unsqueeze 保 size 且与 squeeze 互逆、expand 尾形广播 size/单元素复制、flatten 指定轴区间保 size、split 与 flatten 互逆、moveaxis 保 size、ravel/unravel 往返、sub2ind/ind2sub 行主序往返与越界抛、负索引归一、slice 偏移/半开长度公式、翻转轴镜像恒等式、contiguous 后缀积准则、广播三形状结合律、共轭置换仍为置换、空维移除互逆 |
+
+**D 域（D097–D128）**在 D001–D096 原子操作之上覆盖**组装 / 位置编码 / KV Cache 三层交叉的复合判据**：
+
+D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / 位置编码 / KV Cache 三层交叉的复合判据**：
+
+| 子域 | 指令 | 代表不变量 |
+|---|---|---|
+| **组装语义** | D097–D108 | 缩放打分 CS 有界、softmax 掩位归零、输出是 V 凸组合、因果行支撑=i+1、等分打分权重 1/n、低温 one-hot 守卫、V 平移⇒输出平移、V 缩放⇒输出缩放、端到端=lse 参考、因果首行逐位=V 首行、query 行局部性、常列守恒 |
+| **RoPE 深度性质** | D109–D111, D115–D116, D118, D120 | 打分=q 与相对旋转 k 内积、步进角严格有序、基向量旋转形式、旋转只触碰前 2⌊d/2⌋ 维、频率公比恒定、**相邻位置 Lipschitz 逐对弦长界**、行分布整体平移不变 |
+| **ALiBi 与复合** | D112–D114, D117, D119 | 等分打分几何衰减、RoPE×ALiBi 联合平移不变、斜率累积积闭式、行距离和闭式、行最小偏置闭式 |
+| **GQA×Cache 复合** | D121–D128 | 头间写入独立、追加后 QK 打分前缀逐位不变、组内共享 KV 一致、滚动长度守恒、增量 softmax 旧权重等比缩放、输出递推闭式、滚动后锚点逐位不变、增量解码=全量重算逐位一致 |
+
+**D118 Lipschitz 界的收紧**（变异测试倒逼）：相邻位置打分变化界由粗式 `2sin(f₀/2)·‖q‖·‖k‖` 收紧为逐对弦长 `Σᵢ2sin(fᵢ/2)·‖qᵢ‖·‖kᵢ‖`——随机输入下粗式松约 2 倍（仅最高频对有满弦长而 ‖q‖ 含全部 4 对），连「频率翻倍」级实现 bug 都漏判；对应变异 twin（漏因子 2）468/800 被判负，证明紧式有牙齿。
+
+**QA 三件套**（交付前全过）：① 32 项 × 2500 种子确定性扫描（80,000 条断言）0 失败；② 32 个变异 twin 全部被判负（每项注入一个合理漏洞，证明断言非空转）；③ 条件守卫分支激活率统计（如 D127 淘汰路径 706/800、D102 保序守卫 800/800），证明守卫被真实行使而非摆设。
+
+**修复一处真实的数值 bug（F084）**：F-norm-002.js 的 `gnNormRef`（GroupNorm 参考路径）原用简化方差公式 `v = Σx²/n − μ²`。该式数学等价但**数值病态**——「均值大、方差小」时两个相近大数相减触发**灾难性抵消**，方差精度崩塌（本例 μ≈5、组方差极小），导致用病态参考路径去验证稳定的两遍法实现时，在 2500 种子扫描中出现假红（seed 1450）。修复：参考路径改用 **Welford 在线算法**（单遍增量更新均值与 M2），既数值稳定、又与两遍法算法结构完全不同，保留交叉验证力。修复后 1024 项 × 2500 种子扫描 0 失败。**纪律沉淀：参考路径必须独立且数值稳定——不可用病态公式（简化方差/E·[X²]−μ² 类）充当验证基准。**
+
 ### v15.4 新增（L10 微指令 G 域：激活与损失 96 项）
 
 补齐八域中的 **G 域（激活与损失）**，微指令实现数 **576 → 672**，覆盖激活函数族与损失函数族的全链路原子操作：
@@ -229,9 +256,9 @@
 | **L7 张量与内存** | `src/L7-tensor/*`：tensor / shape / arena（指针碰撞分配）/ kv-cache |
 | **L8 数值内核** | `src/L8-kernel/*`：matmul / reduce / quantize —— 与 legacy **逐位一致**（Δ=0），R9 契约 |
 | **L9 数值基础** | `src/L9-numbase/*`：rng（mulberry32 与 v11 同款）/ fp-ops / special / assert |
-| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**864 项已实现**（A–E 各 96 + F 128 + G 128 + H 128），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
-| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 67 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
-| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · B 96/128 · C 96/128 · D 96/128 · E 96/128 · F 128/128 · G 128/128 · H 128/128 · 合计 864/1024），不拿桩充数 |
+| **L10 微指令** | `src/L10-microisa/*`：**1024 槽位**注册中心（八域 × 128），**896 项已实现**（A/B/C/E 各 96 + D/F/G/H 各 128），每项七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ `run` + `predicate` |
+| **浏览器双端同码** | `demo.html` 内联**完整十层栈**（mini-require 运行时 + 72 个模块），浏览器执行的就是 Node 侧同一份 `src/index.js` 装配代码 → 前向 logits 与 Node **逐位一致**（maxΔ=0，280 logits） |
+| **不注水** | 未实现槽位显式 `status='stub'` 且 `run=null`；`npm run isa` 逐域报进度（A 96/128 · B 96/128 · C 96/128 · D 128/128 · E 96/128 · F 128/128 · G 128/128 · H 128/128 · 合计 896/1024），不拿桩充数 |
 
 > **修复（历史事故）**：v12.0–v14.0 期间 `build-demo.js` 误把 6 行 Node shim（`module.exports = require(...)`）内联进 `demo.html`，浏览器 classic script 执行到 `require` 即 `ReferenceError` —— 连续三个版本 demo 全坏却无人察觉（Node 侧测试全绿掩盖了浏览器断裂）。v15.1 三处根治：① 构建期硬校验（shim 特征检测 + `GPTModel` 存在性断言，不符即 exit 1）；② 改为内联完整十层栈，浏览器与 Node 同码；③ 新增 `scripts/probe-demo.js` 无头门禁，把该类事故变成 CI 可检测失败。
 
@@ -239,7 +266,7 @@
 
 | 门禁 | 命令 | 项数 |
 |---|---|---|
-| 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 864 实现计数诚实且与 `isa.js` 交叉一致 · 864 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
+| 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 1024 实现计数诚实且与 `isa.js` 交叉一致 · 1024 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
 | 浏览器装配门禁 | `npm run test:demo` | 9 项全绿（脚本块无异常 · 34 键一致 · L3–L10 挂载 · L10 容量双端一致 · 自检套件就位 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性） |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
 | 性质测试 | `npm run test:layers` | A/B/C/D/E/F/G/H 八域每项 ≥120 例 fast-check 任意子谓词检验 |
@@ -419,7 +446,7 @@ flagship-ai/
 │   ├── verify.js            # 12 项自检套件（Node + 浏览器双端）
 │   ├── corpus.js            # 默认中文语料（可随意替换）
 │   ├── legacy/              # v11 引擎本体（零回归 oracle，R1–R10 逐位对照）
-│   ├── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（864 项已实现）
+│   ├── L10-microisa/        # 微指令层：1024 槽位注册中心 + 七件套微指令（1024 项已实现）
 │   ├── L9-numbase/          # 数值基础：rng / fp-ops / special / assert
 │   ├── L8-kernel/           # 数值内核：matmul / reduce / quantize（与 legacy 逐位一致）
 │   ├── L7-tensor/           # 张量与内存：tensor / shape / arena / kv-cache
@@ -444,7 +471,7 @@ flagship-ai/
 ├── scripts/probe-kvquant.js # v12 验证：KV INT8 量化保真 / 误差硬界 / kvShift 同步 / 全组合 / 端到端生成
 ├── scripts/probe-streaming.js # v13 验证：Attention Sink / StreamingLLM 锚点不淘汰 / 滚动窗口 / ×KV-INT8 / ×SWA / 确定性
 ├── scripts/probe-yarn.js      # v14 验证：YaRN 频率插值 / mscale / 梯度检验 / 长上下文外推 / 零回归
-├── scripts/probe-microisa.js # v15 门禁：L10 1024 槽位 / 864 实现诚实计数 / 不变量抽查 / 引擎零影响
+├── scripts/probe-microisa.js # v15 门禁：L10 1024 槽位 / 1024 实现诚实计数 / 不变量抽查 / 引擎零影响
 ├── scripts/probe-demo.js     # v15 门禁：demo.html 浏览器装配无头验证 + 前向双端逐位一致
 ├── scripts/bench.js         # 统一基准报告：聚合度量 → docs/BENCHMARK.md（`npm run bench`）
 ├── demo.html                # 单文件浏览器演示（构建产物，双击即用）

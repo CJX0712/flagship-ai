@@ -54,8 +54,14 @@
   function gnNormRef(M, n, d, G, g, b) {
     const out = new Float64Array(n * d), cpg = Math.max(1, Math.floor(d / G));
     for (let i = 0; i < n; i++) for (let gr = 0; gr < G; gr++) {
-      const s0 = gr * cpg, s1 = Math.min(d, (gr + 1) * cpg); let s = 0; for (let j = s1 - 1; j >= s0; j--) s += M[i * d + j]; const mu = s / (s1 - s0);
-      let ss = 0; for (let j = s0; j < s1; j++) ss += M[i * d + j] * M[i * d + j]; const v = Math.max(0, ss / (s1 - s0) - mu * mu);
+      const s0 = gr * cpg, s1 = Math.min(d, (gr + 1) * cpg);
+      // 独立参考路径：Welford 在线算法（单遍增量更新均值与 M2），数值稳定且与
+      // gnNorm 的两遍法算法结构完全不同 —— 保持交叉验证力。
+      // 注意：不可改用简化公式 Σx²/n − μ²：均值大、方差小时会触发灾难性抵消，
+      // 方差精度崩塌（F084 曾因此在 2500 种子扫描中假红）。
+      let m = 0, m2 = 0, cnt = 0;
+      for (let j = s1 - 1; j >= s0; j--) { const x = M[i * d + j]; cnt++; const delta = x - m; m += delta / cnt; m2 += delta * (x - m); }
+      const mu = m; const v = cnt > 0 ? Math.max(0, m2 / cnt) : 0;
       const inv = 1 / Math.sqrt(v + EPS);
       for (let j = s0; j < s1; j++) out[i * d + j] = (b ? b[j] : 0) + (g ? g[j] : 1) * (M[i * d + j] - mu) * inv;
     }
