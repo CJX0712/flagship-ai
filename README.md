@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.7-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.7.1-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
@@ -208,7 +208,7 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 
 **修复一处真实的数值 bug（F084）**：F-norm-002.js 的 `gnNormRef`（GroupNorm 参考路径）原用简化方差公式 `v = Σx²/n − μ²`。该式数学等价但**数值病态**——「均值大、方差小」时两个相近大数相减触发**灾难性抵消**，方差精度崩塌（本例 μ≈5、组方差极小），导致用病态参考路径去验证稳定的两遍法实现时，在 2500 种子扫描中出现假红（seed 1450）。修复：参考路径改用 **Welford 在线算法**（单遍增量更新均值与 M2），既数值稳定、又与两遍法算法结构完全不同，保留交叉验证力。修复后 1024 项 × 2500 种子扫描 0 失败。**纪律沉淀：参考路径必须独立且数值稳定——不可用病态公式（简化方差/E·[X²]−μ² 类）充当验证基准。**
 
-### v15.5.1 修复（L10 F/G 域谓词纪律：224 项全部「先调 run，再验性质」）
+### v15.7.1 修复（L10 F/G 域谓词纪律：224 项全部「先调 run，再验性质」）
 
 **发现的系统性缺陷**：门禁只调 `op.predicate(...args)`，**从不调 `op.run`**（`tests/lib/op-harness.js:43`、`scripts/probe-microisa.js:106`）。但 F 域 96 项 + G 域 128 项中有大量谓词把 run 的定义式**内联复算或硬编码在定点上自比**，等于「run 等于它自己」的恒真断言 —— run 若被改坏，门禁完全失明（假绿）。
 
