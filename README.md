@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.8-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.9-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
@@ -71,7 +71,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **统一基准报告 `bench.js`** | `npm run bench` 一键聚合多架构梯度检验 / RoPE 不变性 / GQA / BPE / INT8 量化 / KV cache 加速比，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)；`npm run bench:full` 追加参数对齐架构对照（llama 准确率 47.6% > gpt2 34.9%） |
+| **统一基准报告 `bench.js`** | `npm run bench` 一键聚合多架构梯度检验 / RoPE 不变性 / GQA / BPE / INT8 量化 / KV cache 加速比，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)；`npm run bench:full` 追加**参数对齐全现代架构对照**（GPT-2/LLaMA/GQA/SWA/Gemma/MoE 六套架构等参数预算下 llама 准确率 47.6% > gpt2 34.9%） |
 | **CI 门禁闭环** | GitHub Actions（Node 20/22）依次跑 verify(12/12) → probe-v3/v4/v5 → bench，把"可复现可验证"固化成工程纪律 |
 
 ### v7.0 新增（MoE 混合专家，Mixtral/DeepSeek 核心稀疏架构）
@@ -162,6 +162,21 @@
 | **全组合兼容** | — | 与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、soft-cap 任意组合均经探针验证；`ropeScale` 缺省或 `factor≤1` 逐位等价于旧版 RoPE |
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
+
+### v15.9 新增（bench:full 参数对齐全现代架构对照）
+
+把 `npm run bench:full` 从「gpt2 vs llama 两项对照」升级为**六套现代架构等参数预算横向对照**：以 gpt2 参数量为基准、二分各预设 `ffnHidden` 把 **GPT-2 / LLaMA / LLaMA-GQA / SWA / Gemma / Mixtral-MoE** 拉到相等参数预算（对齐偏差均 < 5K），再同语料/同种子/同步数训练，报 final loss 与准确率，并给出「等参数预算最优（准确率 / 最低 loss）」结论。
+
+| 架构（ffnHidden 对齐后） | final loss | 准确率 | 参数 |
+|---|---|---|---|
+| gpt2 (256) | 1.910 | 34.9% | 124,480 |
+| **llama (181)** | 0.859 | **47.6%** | 124,244 |
+| llama-gqa (203) | 0.831 | 44.4% | 124,460 |
+| swa (203) | 0.831 | 44.4% | 124,460 |
+| gemma (202) | **0.802** | 44.4% | 124,136 |
+| mixtral/MoE (50) | 1.260 | 38.1% | 124,200 |
+
+**结论**：等参数预算下现代 RMSNorm+SwiGLU+RoPE 配方（llama 47.6%）显著优于 vanilla GPT-2（34.9%），gemma 拿到最低 loss；MoE 在小专家 + 微语料下暂不占优（诚实呈现）。swa 与 llama-gqa 结果逐位相同——window=64=blockSize 时滑窗退化为全注意力，本身即一条正确性佐证。对齐用的二分搜索对 GQA（KV 头少→需更大 ffnHidden）与 MoE（专家多→需更小 ffnHidden）均收敛。
 
 ### v15.8 新增（CI 真实浏览器渲染/交互门禁 + demo 截图）
 
@@ -398,7 +413,20 @@ KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 toke
 
 ### 一键基准报告
 
-`npm run bench` 聚合所有核心度量，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)（多架构梯度检验、RoPE 不变性、GQA、MoE、BPE、INT8 量化、KV cache 加速比）；`npm run bench:full` 追加**参数对齐架构对照**（同语料/同种子/同步数下 gpt2 vs llama 的 loss 与准确率）。CI 默认跑快速版，并把报告作为 artifact 上传（每次运行可下载）。一键全探针：`npm run test:all`。
+`npm run bench` 聚合所有核心度量，自动生成 [`docs/BENCHMARK.md`](docs/BENCHMARK.md)（多架构梯度检验、RoPE 不变性、GQA、MoE、BPE、INT8 量化、KV cache 加速比）；`npm run bench:full` 追加**参数对齐全现代架构对照**——以 gpt2 参数量为基准、二分各预设 `ffnHidden` 把六套架构（GPT-2 / LLaMA / LLaMA-GQA / SWA / Gemma / Mixtral-MoE）拉到**等参数预算**，再同语料/同种子/同步数训练，横向比较 loss 与准确率。CI 默认跑快速版，并把报告作为 artifact 上传（每次运行可下载）。一键全探针：`npm run test:all`。
+
+**等参数预算架构对照实测**（`bench:full`，约 12.4 万参数对齐，同语料/同种子/300 步）：
+
+| 架构 | final loss | 准确率 |
+|---|---|---|
+| gpt2 | 1.910 | 34.9% |
+| **llama** | 0.859 | **47.6%** |
+| llama-gqa | 0.831 | 44.4% |
+| swa | 0.831 | 44.4% |
+| gemma | **0.802** | 44.4% |
+| mixtral (MoE) | 1.260 | 38.1% |
+
+结论：等参数预算下现代 RMSNorm+SwiGLU+RoPE 配方（llama 47.6%）显著优于 vanilla GPT-2（34.9%）；gemma 拿到最低 loss。swa 与 llama-gqa 逐位相同（window=64=blockSize 时滑窗退化为全注意力）——本身即一条正确性佐证。
 
 ## 快速开始
 

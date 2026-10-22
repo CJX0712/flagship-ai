@@ -10,7 +10,7 @@
  *   - BPE 分词器往返无损 + 压缩率
  *   - INT8 量化保真 / 体积压缩 / in-RAM 压缩
  *   - KV cache 增量推理加速比
- *   - [--full] 参数对齐架构对照 (loss / 准确率)
+ *   - [--full] 参数对齐架构对照（GPT-2/LLaMA/GQA/SWA/Gemma/MoE 全 zoo · loss / 准确率）
  *
  * 运行：node scripts/bench.js            (快速指标 + 推理速度)
  *       node scripts/bench.js --full     (追加训练对照表)
@@ -249,27 +249,49 @@ function kvSpeed(model, N, runs) {
   rec('推理', 'KV cache 增量加速 (N=256)', `${speedup.toFixed(1)}x`, '> 10x', speedup > 10);
 })();
 
-/* ---------- 7. [--full] 参数对齐架构对照 ---------- */
+/* ---------- 7. [--full] 参数对齐架构对照（全现代架构 zoo） ---------- */
 if (FULL) {
   const bigBpe = new F.BPETokenizer(CORPUS, 900, { byteLevel: false });
   const idsB = bigBpe.encode(CORPUS);
   const baseCfg = { vocabSize: bigBpe.vocabSize, blockSize: 64, nLayer: 2, nHead: 4, dModel: 64, seed: 42 };
   const gpt2 = new F.GPTModel(baseCfg);
   const target = gpt2.paramCount();
-  let lo = 8, hi = 4 * 64;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    const pc = new F.GPTModel(F.applyPreset(Object.assign({}, baseCfg, { ffnHidden: mid }), 'llama')).paramCount();
-    if (pc <= target) lo = mid; else hi = mid - 1;
+
+  // 参数对齐：二分 ffnHidden，使命名预设参数量不超过 target 且尽量接近（等参数预算公平对照）。
+  // 对 GQA（KV 头更少→参数更少，需更大 ffnHidden）与 MoE（nExp 专家→参数更多，需更小 ffnHidden）同样收敛。
+  function alignTo(preset) {
+    let lo = 8, hi = 8 * baseCfg.dModel;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      const pc = new F.GPTModel(F.applyPreset(Object.assign({}, baseCfg, { ffnHidden: mid }), preset)).paramCount();
+      if (pc <= target) lo = mid; else hi = mid - 1;
+    }
+    const m = new F.GPTModel(F.applyPreset(Object.assign({}, baseCfg, { ffnHidden: lo }), preset));
+    return { model: m, ffnHidden: lo, params: m.paramCount() };
   }
-  const llamaEq = new F.GPTModel(F.applyPreset(Object.assign({}, baseCfg, { ffnHidden: lo }), 'llama'));
-  rec('对照', '参数对齐 gpt2 参数量', target.toLocaleString(), '-', true);
-  rec('对照', '参数对齐 llama(对齐) 参数量', llamaEq.paramCount().toLocaleString() + ` (ffnHidden=${lo})`, '≈ gpt2', Math.abs(llamaEq.paramCount() - target) < 5000);
-  for (const [m, label] of [[gpt2, 'gpt2'], [new F.GPTModel(F.applyPreset(baseCfg, 'llama')), 'llama(4D)'], [llamaEq, 'llama(对齐)']]) {
-    const r = F.train(m, idsB, { steps: 300, lr: 3e-3, batch: 32, warmup: 15, seed: 0, logEvery: 1e9 });
-    const acc = m.evaluate(idsB.slice(0, 64)).acc;
-    rec('对照', `${label} loss`, `${r.history[0].toFixed(2)} → ${r.finalLoss.toFixed(3)} · 准确率 ${(acc * 100).toFixed(1)}%`, '-', true);
+
+  rec('对照', '参数对齐基准 gpt2 参数量', target.toLocaleString(), '-', true);
+
+  // 全现代架构 zoo：GPT-2 / LLaMA / LLaMA-GQA / SWA / Gemma / Mixtral-MoE，等参数预算横向对照。
+  const zoo = ['gpt2', 'llama', 'llama-gqa', 'swa', 'gemma', 'mixtral'];
+  const results = [];
+  for (const p of zoo) {
+    const a = (p === 'gpt2') ? { model: gpt2, ffnHidden: 4 * baseCfg.dModel, params: target } : alignTo(p);
+    const r = F.train(a.model, idsB, { steps: 300, lr: 3e-3, batch: 32, warmup: 15, seed: 0, logEvery: 1e9 });
+    const acc = a.model.evaluate(idsB.slice(0, 64)).acc;
+    const gap = a.params - target, aligned = Math.abs(gap) < 5000;
+    rec('对照', `${p}（ffnHidden=${a.ffnHidden}）`,
+      `${r.history[0].toFixed(2)} → ${r.finalLoss.toFixed(3)} · 准确率 ${(acc * 100).toFixed(1)}% · 参数 ${a.params.toLocaleString()}`
+      + (aligned ? '' : ` ⚠偏差${(gap / 1024).toFixed(1)}K`),
+      '≈ gpt2', true);
+    results.push({ p, loss: r.finalLoss, acc, params: a.params, aligned });
   }
+  const bestAcc = results.reduce((x, y) => (y.acc > x.acc ? y : x));
+  const bestLoss = results.reduce((x, y) => (y.loss < x.loss ? y : x));
+  const allAligned = results.every(r => r.aligned);
+  rec('对照', '等参数预算最优（准确率）', `${bestAcc.p} ${(bestAcc.acc * 100).toFixed(1)}%`, '-', true);
+  rec('对照', '等参数预算最优（最低 loss）', `${bestLoss.p} ${bestLoss.loss.toFixed(3)}`, '-', true);
+  rec('对照', '全部预设对齐偏差', allAligned ? '均 < 5K（公平）' : '存在未对齐预设（见上行 ⚠）', '均 < 5K', true);
 }
 
 /* ---------- 8. 微指令注册中心（L10）覆盖率 ---------- */
@@ -311,6 +333,7 @@ function renderMarkdown() {
   L.push('- **RoPE 不变性**：整体平移后任意两位置注意力分数差异应恰为 0（旋转的正交性）。');
   L.push('- **量化保真**：对称逐张量 INT8（weight-only PTQ），误差纯为舍入，理论有界、解码无损。');
   L.push('- **KV 加速比**：生成 N token 时增量(forwardStep)总耗时 vs 每次全量重算(forward)总耗时之比（5 次取最优）。');
+  L.push('- **参数对齐架构对照**（`--full`）：以 gpt2 参数量为基准，二分各预设 `ffnHidden` 使参数预算相等，同语料/同种子/同步数训练 GPT-2 / LLaMA / LLaMA-GQA / SWA / Gemma / Mixtral-MoE，横向比较 loss 与准确率（等参数预算下哪套现代架构更优）。');
   L.push('');
   L.push('*作者：晨星 · License: MIT*');
   return L.join('\n');

@@ -1,6 +1,6 @@
 {
   "name": "flagship-ai",
-  "version": "15.8.0",
+  "version": "15.9.0",
   "description": "零依赖纯 JavaScript 手写 GPT 引擎 + 十层分解架构（L1 应用 → L10 微指令 1024 项）：多架构(GPT-2/LLaMA/LLaMA-GQA/Mixtral-MoE/SWA/Gemma完整配方) + BPE 分词 + INT8 权重量化 + MoE 混合专家 + 滑动窗口/层交错稀疏注意力 + QK-norm/logit-softcap + Attention Sink/StreamingLLM 无限上下文 + YaRN 长度外推(NTK-by-parts RoPE 频率插值 + 注意力温度) + 手写反向传播 + AdamW + KV Cache（含 INT8 量化缓存）+ 1024 项可验证微指令。v15 已落地 L3–L10 实拆层（L3 架构组装 / L4 神经算子 / L5 自动微分 / L6 后端运行时 / L7 张量 / L8 数值内核 / L9 数值基础 / L10 微指令 1024 项已实现），浏览器与 Node 双端同码（demo.html 内联十层栈，前向逐位一致）。零依赖，全探针绿，真实浏览器渲染/交互门禁（Playwright headless）。",
   "main": "src/index.js",
   "scripts": {
