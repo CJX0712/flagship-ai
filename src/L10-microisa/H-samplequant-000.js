@@ -7,9 +7,13 @@
  *           Vaswani 2017；Jacob et al. 2018 int8；Banner et al. 2018
  *
  * 每项含七件套（直觉/数学/伪代码/复杂度/论文/常见坑/不变量）+ run + predicate。
- * 确定性 op：predicate 调用 run 并断言精确不变量（relClose / Object.is）。
- * 随机 op：seed 由输入确定性派生（rngSeed），predicate 调用 run 并断言结构有效性
- *          （索引进域、排列合法、值落于合法集等），绝非恒真。
+ * 谓词纪律（硬约束）：predicate 必须调用 NS.L10.ops['Hxxx'].run(...) 检验
+ *         真实产出，再辅以文件内独立 oracle（descOrder / sameOut / softmax
+ *         基准）断言数学性质；严禁「内联复算 run 后自比」（那会令 run 改坏
+ *         而门禁仍绿 = 假绿）。
+ * 确定性 op：断言精确不变量（次序 / 集合 / 和 / 隶属）。
+ * 随机 op：seed 由输入确定性派生（rngSeed），断言结构有效性（索引进域、
+ *          排列合法、值落于合法集）+ 同种子逐位可复现，绝非恒真。
  * K5：本文件禁用模块级语法（详见全局契约 K5）。
  * ==========================================================================*/
 ;(function (NS) {
@@ -70,6 +74,37 @@
   }
   function isInt(x) { return typeof x === 'number' && Number.isInteger(x); }
 
+  // ── 谓词专用独立 oracle（不复用 run 内的 topK/nucleus helper）────────────
+  function runOf(key) { return NS.L10.ops[key].run; }
+  function descOrder(v) { // 值降序、同值下标升序 —— top-k 的独立基准
+    const idx = Array.from({ length: v.length }, (_, i) => i);
+    idx.sort((a, b) => (v[b] - v[a]) || (a - b));
+    return idx;
+  }
+  function sameOut(a, b) { // 结构化逐位相等 —— 种子化 rng 的可复现性
+    if (Object.is(a, b)) return true;
+    if (a && b && typeof a.length === 'number' && typeof b.length === 'number') {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+      return true;
+    }
+    return false;
+  }
+  // 核（nucleus）三性质：降序概率前缀 / 累计≥p / 最小性。对 run 输出的下标集断言。
+  function nucleusProps(set, pr, pp) {
+    const n = pr.length;
+    if (set.size < 1 || set.size > n) return false;
+    let minSel = Infinity, maxUnsel = -Infinity, s = 0;
+    for (let i = 0; i < n; i++) {
+      if (set.has(i)) { if (pr[i] < minSel) minSel = pr[i]; s += pr[i]; }
+      else if (pr[i] > maxUnsel) maxUnsel = pr[i];
+    }
+    if (minSel < maxUnsel - 1e-12) return false;          // ① 前缀：核内最小 ≥ 核外最大
+    if (s < pp - 1e-9 || s > 1 + 1e-9) return false;      // ② 累计 ≥ p 且 ≤1
+    if (set.size > 1 && s - minSel >= pp + 1e-9) return false; // ③ 最小性：去掉末元素即 <p
+    return true;
+  }
+
   function reg(i, o) { NS.L10.register('H', i, o); }
 
   // ── 类别 1：确定性采样原语（H001–H016）─────────────────────────────────
@@ -82,7 +117,12 @@
     invariant: '0<=run<n 且 ∀i: x[run] >= x[i]',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => { const r = argmaxIdx(x); return r; },
-    predicate: (x) => { const r = argmaxIdx(x); if (!(r >= 0 && r < x.length)) return false; const m = maxOf(x); for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false; return x[r] >= m - 1e-12; },
+    predicate: (x) => {
+      const r = runOf('H001')(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false;
+      return true;
+    },
   });
 
   // H002 argmin：返回最小元素的下标。
@@ -93,7 +133,12 @@
     invariant: '0<=run<n 且 ∀i: x[run] <= x[i]',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => argminIdx(x),
-    predicate: (x) => { const r = argminIdx(x); if (!(r >= 0 && r < x.length)) return false; for (let i = 0; i < x.length; i++) if (x[r] > x[i] + 1e-12) return false; return true; },
+    predicate: (x) => {
+      const r = runOf('H002')(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] > x[i] + 1e-12) return false;
+      return true;
+    },
   });
 
   // H003 top-1：返回最大值（数值）。
@@ -101,10 +146,16 @@
     name: 'top-1 · 最大取值', intuition: '直接返回向量最大元素，等价于 argmax 处的取值。',
     math: 'run = max_i x_i', pseudocode: 'return max(x)', complexity: 'O(n)',
     ref: 'Vaswani 2017', commonPitfall: '返回的是值而非下标。',
-    invariant: 'relClose(run, max(x))',
+    invariant: 'run 不小于任何元素且确为 x 的某个元素',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => maxOf(x),
-    predicate: (x) => { const r = maxOf(x); return relClose(r, maxOf(x), 1e-9); },
+    predicate: (x) => {
+      const r = runOf('H003')(x);
+      if (typeof r !== 'number' || !isFinite(r)) return false;
+      for (let i = 0; i < x.length; i++) if (r < x[i] - 1e-12) return false;
+      for (let i = 0; i < x.length; i++) if (Object.is(r, x[i])) return true;
+      return false;
+    },
   });
 
   // H004 greedy：贪心解码，返回 argmax 下标。
@@ -112,10 +163,15 @@
     name: 'greedy · 贪心解码', intuition: '每一步选概率最大 token，即 argmax。',
     math: 'run = argmax_i x_i', pseudocode: 'return argmax(x)', complexity: 'O(n)',
     ref: 'Vaswani 2017', commonPitfall: '梯度不可导，训练用 Gumbel 软化。',
-    invariant: 'run === argmax(x)',
+    invariant: '0<=run<n 且 x[run] 即最大值',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => argmaxIdx(x),
-    predicate: (x) => { const r = argmaxIdx(x); return r === argmaxIdx(x) && r >= 0 && r < x.length; },
+    predicate: (x) => {
+      const r = runOf('H004')(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false;
+      return true;
+    },
   });
 
   // H005 随机 argmax（确定性 rng）：在并列最大元素中等概率取一个。
@@ -123,7 +179,7 @@
     name: '随机 argmax · 平局抽样', intuition: '当存在多个并列最大值时，用种子化 rng 在其中等概率取一个。',
     math: 'run ∈ {i : x_i = max(x)}', pseudocode: 'among argmax-set pick rng', complexity: 'O(n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '唯一最大时退化为 argmax。',
-    invariant: 'run 必为某个最大元素的下标',
+    invariant: 'run 必为某个最大元素的下标，且同种子逐位可复现',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => {
       const m = maxOf(x); const cands = [];
@@ -132,7 +188,13 @@
       const rng = NS.L9.rng.mulberry32(rngSeed([x]));
       return cands[Math.floor(rng() * cands.length)];
     },
-    predicate: (x) => { const m = maxOf(x); const r = (function () { const cands = []; for (let i = 0; i < x.length; i++) if (x[i] === m) cands.push(i); if (cands.length === 1) return cands[0]; const rng = NS.L9.rng.mulberry32(rngSeed([x])); return cands[Math.floor(rng() * cands.length)]; })(); return r >= 0 && r < x.length && Object.is(x[r], m); },
+    predicate: (x) => {
+      const run = runOf('H005');
+      const r = run(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false;
+      return sameOut(r, run(x));
+    },
   });
 
   // H006 等概率采样：在 [0,n) 中等概率取一个下标。
@@ -140,10 +202,15 @@
     name: '等概率采样 · 均匀下标', intuition: '从 n 个候选中等概率抽取一个位置。',
     math: 'P(run=i)=1/n', pseudocode: 'return floor(rng()*n)', complexity: 'O(1)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: 'rng 必须种子化且可复现。',
-    invariant: 'run ∈ [0,n) 且为整数',
+    invariant: 'run ∈ [0,n) 且为整数，同种子逐位可复现',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => { const rng = NS.L9.rng.mulberry32(rngSeed([x])); return Math.floor(rng() * x.length); },
-    predicate: (x) => { const rng = NS.L9.rng.mulberry32(rngSeed([x])); const r = Math.floor(rng() * x.length); return isInt(r) && r >= 0 && r < x.length; },
+    predicate: (x) => {
+      const run = runOf('H006');
+      const r = run(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      return sameOut(r, run(x));
+    },
   });
 
   // H007 加权抽样（categorical）：按权重 w 比例抽样。
@@ -151,7 +218,7 @@
     name: '加权抽样 · categorical', intuition: '以归一化权重为概率抽取类别。',
     math: 'P(run=i) ∝ w_i', pseudocode: 'cdf-sample over w', complexity: 'O(n)',
     ref: 'Bishop 2006', commonPitfall: '权重全 0 时退化为返回 0。',
-    invariant: 'run ∈ [0,n) 且为整数',
+    invariant: 'run ∈ [0,n) 且为整数；权重全 0 时必为 0；同种子可复现',
     inputs: ['w'], domains: { w: 'vecNonNeg' },
     run: (w) => {
       let s = 0; for (let i = 0; i < w.length; i++) s += w[i];
@@ -161,7 +228,14 @@
       for (let i = 0; i < w.length; i++) { r -= w[i]; if (r < 0) return i; }
       return w.length - 1;
     },
-    predicate: (w) => { let s = 0; for (let i = 0; i < w.length; i++) s += w[i]; if (!(s > 0)) return (function () { return 0; })() === 0; const rng = NS.L9.rng.mulberry32(rngSeed([w])); let r = rng() * s; for (let i = 0; i < w.length; i++) { r -= w[i]; if (r < 0) { const out = i; return isInt(out) && out >= 0 && out < w.length; } } const out = w.length - 1; return isInt(out) && out >= 0 && out < w.length; },
+    predicate: (w) => {
+      const run = runOf('H007');
+      const r = run(w);
+      let s = 0; for (let i = 0; i < w.length; i++) s += w[i];
+      if (!(s > 0)) return r === 0;
+      if (!isInt(r) || r < 0 || r >= w.length) return false;
+      return sameOut(r, run(w));
+    },
   });
 
   // H008 Bernoulli 采样：以概率 p 返回 1，否则 0。
@@ -169,10 +243,17 @@
     name: 'Bernoulli 采样', intuition: '二值随机变量，常用于 dropout / 门控。',
     math: 'run ~ Bernoulli(p)', pseudocode: 'return rng()<p?1:0', complexity: 'O(1)',
     ref: 'Goodfellow 2016', commonPitfall: 'p 必须在 [0,1]。',
-    invariant: 'run ∈ {0,1}',
+    invariant: 'run ∈ {0,1}；p=0 必 0，p=1 必 1；同种子可复现',
     inputs: ['p'], domains: { p: 'unit' },
     run: (p) => { const rng = NS.L9.rng.mulberry32(rngSeed([p])); return rng() < p ? 1 : 0; },
-    predicate: (p) => { const rng = NS.L9.rng.mulberry32(rngSeed([p])); const r = rng() < p ? 1 : 0; return r === 0 || r === 1; },
+    predicate: (p) => {
+      const run = runOf('H008');
+      const r = run(p);
+      if (r !== 0 && r !== 1) return false;
+      if (p <= 0 && r !== 0) return false; // rng()∈[0,1) 恒 ≥0
+      if (p >= 1 && r !== 1) return false; // rng()∈[0,1) 恒 <1
+      return sameOut(r, run(p));
+    },
   });
 
   // H009 确定性打乱（Fisher–Yates）：返回 [0..n-1] 的一个排列。
@@ -189,11 +270,9 @@
       return Float64Array.from(a);
     },
     predicate: (x) => {
-      const n = x.length; const rng = NS.L9.rng.mulberry32(rngSeed([x]));
-      const a = Array.from({ length: n }, (_, i) => i);
-      for (let i = n - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; }
-      const r = Float64Array.from(a);
-      if (!(r && r.length === n)) return false;
+      const r = runOf('H009')(x);
+      const n = x.length;
+      if (!r || r.length !== n) return false;
       const seen = new Array(n).fill(false);
       for (let i = 0; i < n; i++) { const v = r[i]; if (!isInt(v) || v < 0 || v >= n || seen[v]) return false; seen[v] = true; }
       return true;
@@ -209,19 +288,20 @@
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => Float64Array.from(topKIndices(x, k)),
     predicate: (x, k) => {
-      const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
-      const r = Float64Array.from(topKIndices(x, k));
-      if (!(r && r.length === kk)) return false;
+      const r = runOf('H010')(x, k);
+      const n = x.length;
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      if (!r || r.length !== kk) return false;
       const ins = new Set();
       for (let j = 0; j < kk; j++) {
         const v = r[j];
-        if (!isInt(v) || v < 0 || v >= x.length || ins.has(v)) return false;
+        if (!isInt(v) || v < 0 || v >= n || ins.has(v)) return false;
         ins.add(v);
         if (j > 0 && x[r[j - 1]] < x[r[j]] - 1e-12) return false;
       }
-      let minS = Infinity; for (let j = 0; j < kk; j++) minS = Math.min(minS, x[r[j]]);
-      let maxC = -Infinity; for (let i = 0; i < x.length; i++) if (!ins.has(i)) maxC = Math.max(maxC, x[i]);
-      return minS >= maxC - 1e-9;
+      let minS = Infinity; for (const j of ins) minS = Math.min(minS, x[j]);
+      let maxC = -Infinity; for (let i = 0; i < n; i++) if (!ins.has(i)) maxC = Math.max(maxC, x[i]);
+      return minS >= maxC - 1e-12;
     },
   });
 
@@ -230,7 +310,7 @@
     name: '类别采样计数 · multinomial 计数', intuition: '多次抽样后各列计数，用于直方图/经验分布。',
     math: 'Σ_i count_i = n', pseudocode: 'for t in 1..n: count[sample(w)]++', complexity: 'O(n·m)',
     ref: 'Bishop 2006', commonPitfall: 'n 须有界以防溢出；此处夹取 [1,128]。',
-    invariant: 'Σ count_i = n 且各 count 为非负整数',
+    invariant: 'Σ count_i = n 且各 count 为非负整数；权重全 0 时计入第 0 类',
     inputs: ['w', 'n'], domains: { w: 'vecNonNeg', n: 'smallPos' },
     run: (w, n) => {
       const m = w.length; let s = 0; for (let i = 0; i < m; i++) s += w[i];
@@ -246,18 +326,16 @@
       return counts;
     },
     predicate: (w, n) => {
+      const r = runOf('H011')(w, n);
+      const m = w.length;
       const N = Math.max(1, Math.min(128, Math.round(n)));
-      const m = w.length; let s = 0; for (let i = 0; i < m; i++) s += w[i];
-      const counts = new Float64Array(m);
-      if (!(s > 0)) { counts[0] = N; }
-      else {
-        const rng = NS.L9.rng.mulberry32(rngSeed([w, n]));
-        for (let t = 0; t < N; t++) { let r = rng() * s, idx = 0; for (let i = 0; i < m; i++) { r -= w[i]; if (r < 0) { idx = i; break; } } counts[idx]++; }
-      }
-      if (!counts || counts.length !== w.length) return false;
+      let s = 0; for (let i = 0; i < m; i++) s += w[i];
+      if (!r || r.length !== m) return false;
       let sum = 0;
-      for (let i = 0; i < counts.length; i++) { if (!isInt(counts[i]) || counts[i] < 0) return false; sum += counts[i]; }
-      return sum === N;
+      for (let i = 0; i < m; i++) { if (!isInt(r[i]) || r[i] < 0) return false; sum += r[i]; }
+      if (sum !== N) return false;
+      if (!(s > 0)) return r[0] === N;
+      return true;
     },
   });
 
@@ -266,10 +344,15 @@
     name: '温度无关贪心 · softmax 保序', intuition: '任意正温度下 softmax 的 argmax 等于原始 logits 的 argmax。',
     math: 'argmax(softmax(x)) = argmax(x)', pseudocode: 'return argmax(softmax(x))', complexity: 'O(n)',
     ref: 'Vaswani 2017', commonPitfall: '仅对严格正温度成立。',
-    invariant: 'argmax(softmax(x)) === argmax(x)',
+    invariant: 'run 即 x 的 argmax（softmax 保序）',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => argmaxIdx(softmax(x)),
-    predicate: (x) => { const r = argmaxIdx(softmax(x)); return r === argmaxIdx(x); },
+    predicate: (x) => {
+      const r = runOf('H012')(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false;
+      return true;
+    },
   });
 
   // H013 top-p 子集（nucleus）：取概率降序累加最早达到 p 的最小前缀。
@@ -277,18 +360,17 @@
     name: 'top-p 子集 · nucleus', intuition: '仅在累计概率达 p 的最小核心集内采样，避免长尾。',
     math: 'run = min prefix of sorted-desc probs with cumsum ≥ p', pseudocode: 'sort probs desc; take until cumsum>=p', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: 'p=1 取全部；p→0 仅 argmax。',
-    invariant: 'run 为最小前缀集，长度=核大小，且累计概率≥p',
+    invariant: 'run 为最小前缀集：降序前缀 / 累计≥p / 最小性',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => Float64Array.from(nucleusIndices(softmax(x), p)),
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p);
-      const r = Float64Array.from(nucleusIndices(softmax(x), p));
-      if (!(r && r.length === idx.length)) return false;
-      const set1 = new Set(idx), set2 = new Set(r);
-      if (set1.size !== set2.size) return false;
-      for (const v of set2) if (!set1.has(v)) return false;
-      let s = 0; for (const i of idx) s += pr[i];
-      return s >= Math.min(Math.max(p, 0), 1) - 1e-9;
+      const r = runOf('H013')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      if (!r || r.length < 1 || r.length > n) return false;
+      const set = new Set();
+      for (let i = 0; i < r.length; i++) { const v = r[i]; if (!isInt(v) || v < 0 || v >= n || set.has(v)) return false; set.add(v); }
+      return nucleusProps(set, softmax(x), pp);
     },
   });
 
@@ -307,12 +389,12 @@
       return counts;
     },
     predicate: (x, n) => {
-      const m = x.length; const N = Math.max(1, Math.min(128, Math.round(n)));
-      const counts = new Float64Array(m);
-      const rng = NS.L9.rng.mulberry32(rngSeed([x, n]));
-      for (let t = 0; t < N; t++) counts[Math.floor(rng() * m)]++;
-      if (!counts || counts.length !== m) return false;
-      let sum = 0; for (let i = 0; i < counts.length; i++) { if (!isInt(counts[i]) || counts[i] < 0) return false; sum += counts[i]; }
+      const r = runOf('H014')(x, n);
+      const m = x.length;
+      const N = Math.max(1, Math.min(128, Math.round(n)));
+      if (!r || r.length !== m) return false;
+      let sum = 0;
+      for (let i = 0; i < m; i++) { if (!isInt(r[i]) || r[i] < 0) return false; sum += r[i]; }
       return sum === N;
     },
   });
@@ -322,7 +404,7 @@
     name: '随机 argmin · 平局抽样', intuition: '与随机 argmax 对称，处理最小值的并列。',
     math: 'run ∈ {i : x_i = min(x)}', pseudocode: 'among argmin-set pick rng', complexity: 'O(n)',
     ref: 'Vaswani 2017', commonPitfall: '唯一最小时退化为 argmin。',
-    invariant: 'run 必为某个最小元素的下标',
+    invariant: 'run 必为某个最小元素的下标，且同种子逐位可复现',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => {
       const m = minOf(x); const c = [];
@@ -332,11 +414,11 @@
       return c[Math.floor(rng() * c.length)];
     },
     predicate: (x) => {
-      const m = minOf(x); const c = []; for (let i = 0; i < x.length; i++) if (x[i] === m) c.push(i);
-      let r;
-      if (c.length === 1) r = c[0];
-      else { const rng = NS.L9.rng.mulberry32(rngSeed([x])); r = c[Math.floor(rng() * c.length)]; }
-      return r >= 0 && r < x.length && Object.is(x[r], m);
+      const run = runOf('H015');
+      const r = run(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] > x[i] + 1e-12) return false;
+      return sameOut(r, run(x));
     },
   });
 
@@ -348,7 +430,11 @@
     invariant: 'run 等于 x 的某个元素',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => { const rng = NS.L9.rng.mulberry32(rngSeed([x])); return x[Math.floor(rng() * x.length)]; },
-    predicate: (x) => { const rng = NS.L9.rng.mulberry32(rngSeed([x])); const r = x[Math.floor(rng() * x.length)]; for (let i = 0; i < x.length; i++) if (Object.is(x[i], r)) return true; return false; },
+    predicate: (x) => {
+      const r = runOf('H016')(x);
+      for (let i = 0; i < x.length; i++) if (Object.is(x[i], r)) return true;
+      return false;
+    },
   });
 
   // ── 类别 2：top-k / top-p（H017–H032）─────────────────────────────────
@@ -362,14 +448,20 @@
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => Float64Array.from(topKIndices(x, k)),
     predicate: (x, k) => {
-      const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
-      const r = Float64Array.from(topKIndices(x, k));
-      if (!(r && r.length === kk)) return false;
+      const r = runOf('H017')(x, k);
+      const n = x.length;
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      if (!r || r.length !== kk) return false;
       const ins = new Set();
-      for (let j = 0; j < kk; j++) { const v = r[j]; if (!isInt(v) || v < 0 || v >= x.length || ins.has(v)) return false; ins.add(v); if (j > 0 && x[r[j - 1]] < x[r[j]] - 1e-12) return false; }
-      let minS = Infinity; for (let j = 0; j < kk; j++) minS = Math.min(minS, x[r[j]]);
-      let maxC = -Infinity; for (let i = 0; i < x.length; i++) if (!ins.has(i)) maxC = Math.max(maxC, x[i]);
-      return minS >= maxC - 1e-9;
+      for (let j = 0; j < kk; j++) {
+        const v = r[j];
+        if (!isInt(v) || v < 0 || v >= n || ins.has(v)) return false;
+        ins.add(v);
+        if (j > 0 && x[r[j - 1]] < x[r[j]] - 1e-12) return false;
+      }
+      let minS = Infinity; for (const j of ins) minS = Math.min(minS, x[j]);
+      let maxC = -Infinity; for (let i = 0; i < n; i++) if (!ins.has(i)) maxC = Math.max(maxC, x[i]);
+      return minS >= maxC - 1e-12;
     },
   });
 
@@ -378,10 +470,21 @@
     name: 'top-k 掩码', intuition: '保留 k 个最大位置，掩码和恰为 k。',
     math: 'm_i = 1[i∈topk]', pseudocode: 'mask = 1 on top-k else 0', complexity: 'O(n log n)',
     ref: 'Vaswani 2017', commonPitfall: '掩码和必须等于 kk。',
-    invariant: 'run ∈ {0,1}^n 且 Σ run = kk',
+    invariant: 'run ∈ {0,1}^n 且 Σ run = kk，且 1 恰落在 kk 个最大值上',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => { const idx = topKIndices(x, k); const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; },
-    predicate: (x, k) => { const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length); const idx = topKIndices(x, k); const r = (function () { const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; })(); let sum = 0; for (let i = 0; i < r.length; i++) { if (!(r[i] === 0 || r[i] === 1)) return false; sum += r[i]; } return sum === kk; },
+    predicate: (x, k) => {
+      const r = runOf('H018')(x, k);
+      const n = x.length;
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      if (!r || r.length !== n) return false;
+      let sum = 0;
+      for (let i = 0; i < n; i++) { if (r[i] !== 0 && r[i] !== 1) return false; sum += r[i]; }
+      if (sum !== kk) return false;
+      let minS = Infinity, maxC = -Infinity;
+      for (let i = 0; i < n; i++) { if (r[i] === 1) minS = Math.min(minS, x[i]); else maxC = Math.max(maxC, x[i]); }
+      return minS >= maxC - 1e-12;
+    },
   });
 
   // H019 top-k 重归一化：仅对 top-k 做 softmax，使其和为 1。
@@ -389,7 +492,7 @@
     name: 'top-k 重归一化', intuition: '截断到 top-k 后再归一化成合法分布。',
     math: 'run_i = softmax(x_i) for i∈topk, else 0; Σ run = 1', pseudocode: 'softmax on top-k subvector, zero others', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '非 top-k 处必须严格为 0。',
-    invariant: 'Σ run = 1; 非 top-k 处为 0; top-k 处>0',
+    invariant: 'Σ run = 1; 非 top-k 处为 0; 支撑=top-k 且概率比=exp 比',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => {
       const idx = topKIndices(x, k); const sub = idx.map((i) => x[i]);
@@ -398,12 +501,28 @@
       return out;
     },
     predicate: (x, k) => {
-      const idx = topKIndices(x, k); const set = new Set(idx);
-      const sub = idx.map((i) => x[i]); const p = softmax(sub);
-      const r = (function () { const out = new Float64Array(x.length); for (let j = 0; j < idx.length; j++) out[idx[j]] = p[j]; return out; })();
+      const r = runOf('H019')(x, k);
+      const n = x.length;
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      if (!r || r.length !== n) return false;
+      const inTop = new Set(descOrder(x).slice(0, kk)); // 独立基准：kk 个最大值
       let sum = 0;
-      for (let i = 0; i < r.length; i++) { sum += r[i]; if (set.has(i)) { if (!(r[i] >= 0)) return false; } else { if (!(r[i] === 0)) return false; } }
-      return Math.abs(sum - 1) < 1e-9;
+      for (let i = 0; i < n; i++) {
+        if (inTop.has(i)) { if (!(r[i] >= 0)) return false; sum += r[i]; }
+        else if (r[i] !== 0) return false;
+      }
+      if (Math.abs(sum - 1) > 1e-9) return false;
+      // 支撑内：按 x 降序，且概率比 = exp 比（以 top-1 为基准，避免溢出）
+      const ord = descOrder(x);
+      const imax = ord[0];
+      if (!(r[imax] > 0)) return false;
+      for (let a = 1; a < kk; a++) {
+        const j = ord[a];
+        if (r[ord[a - 1]] < r[j] - 1e-15) return false;        // 降序
+        if (r[j] <= 0) continue;                                // 下溢为 0 处跳过比值
+        if (!relClose(r[j] / r[imax], Math.exp(x[j] - x[imax]), 1e-9)) return false;
+      }
+      return true;
     },
   });
 
@@ -412,17 +531,17 @@
     name: 'top-p 阈值 · 核下标', intuition: '累计概率达 p 的最小前缀。',
     math: 'run = min prefix with cumsum≥p', pseudocode: 'sort probs desc; take until cumsum>=p', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '核大小随 p 增大而增大。',
-    invariant: 'run 为最小核集，长度=核大小',
+    invariant: 'run 为最小核集：降序前缀 / 累计≥p / 最小性',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => Float64Array.from(nucleusIndices(softmax(x), p)),
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p);
-      const r = Float64Array.from(nucleusIndices(softmax(x), p));
-      if (!(r && r.length === idx.length)) return false;
-      const set1 = new Set(idx), set2 = new Set(r);
-      if (set1.size !== set2.size) return false;
-      for (const v of set2) if (!set1.has(v)) return false;
-      return true;
+      const r = runOf('H020')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      if (!r || r.length < 1 || r.length > n) return false;
+      const set = new Set();
+      for (let i = 0; i < r.length; i++) { const v = r[i]; if (!isInt(v) || v < 0 || v >= n || set.has(v)) return false; set.add(v); }
+      return nucleusProps(set, softmax(x), pp);
     },
   });
 
@@ -430,11 +549,22 @@
   reg(21, {
     name: 'top-p 掩码', intuition: '核位置掩码，和等于核大小。',
     math: 'm_i = 1[i∈nucleus]', pseudocode: 'mask=1 on nucleus else 0', complexity: 'O(n log n)',
-    ref: 'Holtzman et al. 2019 top-p', commonPitfall: '掩码和必须等于核大小。',
-    invariant: 'run ∈ {0,1}^n 且 Σ run = |nucleus|',
+    ref: 'Holtzman et al. 2019 top-p', commonPitfall: 'p→1 时核覆盖几乎全部质量；尾部概率下溢为 0 时最小前缀可在末尾前终止（浮点细节，非缺陷）。',
+    invariant: 'run ∈ {0,1}^n 且支撑=最小核（降序前缀 / 累计≥p / 最小性）',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => { const idx = nucleusIndices(softmax(x), p); const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; },
-    predicate: (x, p) => { const pr = softmax(x); const idx = nucleusIndices(pr, p); const r = (function () { const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; })(); let sum = 0; for (let i = 0; i < r.length; i++) { if (!(r[i] === 0 || r[i] === 1)) return false; sum += r[i]; } return sum === idx.length; },
+    predicate: (x, p) => {
+      const r = runOf('H021')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      if (!r || r.length !== n) return false;
+      let sum = 0;
+      for (let i = 0; i < n; i++) { if (r[i] !== 0 && r[i] !== 1) return false; sum += r[i]; }
+      const set = new Set();
+      for (let i = 0; i < n; i++) if (r[i] === 1) set.add(i);
+      if (set.size !== sum || set.size < 1) return false;
+      return nucleusProps(set, softmax(x), pp);
+    },
   });
 
   // H022 top-p 重归一化：核内归一化，和为 1。
@@ -442,22 +572,39 @@
     name: 'top-p 重归一化', intuition: '核内重归一化得到局部概率分布。',
     math: 'run_i = softmax(p_i) for i∈nucleus, else 0; Σ run = 1', pseudocode: 'softmax on nucleus subvector, zero others', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '核外必须严格为 0。',
-    invariant: 'Σ run = 1; 核外为 0; 核内>0',
+    invariant: 'Σ run = 1; 核外为 0; 支撑=最小核且概率比=exp 比',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => {
       const pr = softmax(x); const idx = nucleusIndices(pr, p);
-      const sub = idx.map((i) => pr[i]); const p2 = softmax(sub);
+      const sub = idx.map((i) => x[i]); const p2 = softmax(sub); // 对 logits 子向量做 softmax = 核内重归一化
       const out = new Float64Array(x.length);
       for (let j = 0; j < idx.length; j++) out[idx[j]] = p2[j];
       return out;
     },
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p); const set = new Set(idx);
-      const sub = idx.map((i) => pr[i]); const p2 = softmax(sub);
-      const r = (function () { const out = new Float64Array(x.length); for (let j = 0; j < idx.length; j++) out[idx[j]] = p2[j]; return out; })();
-      let sum = 0;
-      for (let i = 0; i < r.length; i++) { sum += r[i]; if (set.has(i)) { if (!(r[i] >= 0)) return false; } else { if (!(r[i] === 0)) return false; } }
-      return Math.abs(sum - 1) < 1e-9;
+      const r = runOf('H022')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      const pr = softmax(x);
+      if (!r || r.length !== n) return false;
+      const set = new Set(); let sum = 0;
+      for (let i = 0; i < n; i++) {
+        if (r[i] > 0) { set.add(i); sum += r[i]; }
+        else if (r[i] !== 0) return false;
+      }
+      if (set.size < 1) return false;
+      if (Math.abs(sum - 1) > 1e-9) return false;
+      if (!nucleusProps(set, pr, pp)) return false;
+      // 支撑内概率比 = exp 比（以核内 top-1 为基准）
+      const ord = descOrder(x);
+      const imax = ord[0];
+      if (!set.has(imax) || !(r[imax] > 0)) return false;
+      for (let a = 1; a < n; a++) {
+        const j = ord[a];
+        if (!set.has(j) || r[j] <= 0) continue;
+        if (!relClose(r[j] / r[imax], Math.exp(x[j] - x[imax]), 1e-9)) return false;
+      }
+      return true;
     },
   });
 
@@ -466,7 +613,7 @@
     name: 'top-k + top-p 组合', intuition: '先筛 top-k，再在核内，二者交集。',
     math: 'run = topk ∩ nucleus', pseudocode: 'intersect top-k set and nucleus set', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '交集可能为空时退化为核。',
-    invariant: 'run = topk 与 nucleus 的交集（作为集合）',
+    invariant: 'run = topk 与 nucleus 的交集（二者同为降序前缀，故 = 较短前缀）',
     inputs: ['x', 'k', 'p'], domains: { x: 'vecFinite', k: 'nat', p: 'unit' },
     run: (x, k, p) => {
       const tk = topKIndices(x, k); const pr = softmax(x); const nuc = nucleusIndices(pr, p);
@@ -474,12 +621,21 @@
       return Float64Array.from(inter);
     },
     predicate: (x, k, p) => {
-      const tk = topKIndices(x, k); const pr = softmax(x); const nuc = nucleusIndices(pr, p);
-      const nset = new Set(nuc); const inter = tk.filter((i) => nset.has(i));
-      const r = Float64Array.from(inter);
-      if (!(r && r.length === inter.length)) return false;
-      const set1 = new Set(inter);
-      for (let i = 0; i < r.length; i++) if (!set1.has(r[i])) return false;
+      const r = runOf('H023')(x, k, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      const ord = descOrder(x);
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      const pr = softmax(x);
+      let ns = 0, s = 0;
+      for (let a = 0; a < n; a++) { ns++; s += pr[ord[a]]; if (s >= pp) break; }
+      const L = Math.min(kk, ns);
+      const expect = new Set(ord.slice(0, L));
+      if (!r || r.length !== L) return false;
+      const got = new Set();
+      for (let i = 0; i < r.length; i++) { const v = r[i]; if (!isInt(v) || v < 0 || v >= n || got.has(v)) return false; got.add(v); }
+      if (got.size !== expect.size) return false;
+      for (const v of got) if (!expect.has(v)) return false;
       return true;
     },
   });
@@ -489,27 +645,36 @@
     name: 'top-1 别名 = argmax', intuition: 'k=1 的 top-k 即 argmax 下标。',
     math: 'run = argmax(x)', pseudocode: 'return argmax(x)', complexity: 'O(n)',
     ref: 'Vaswani 2017', commonPitfall: '验证 k=1 时结果恰为 argmax。',
-    invariant: 'run === argmax(x)',
+    invariant: 'run 即 argmax：x[run] 为最大值',
     inputs: ['x'], domains: { x: 'vecFinite' },
     run: (x) => argmaxIdx(x),
-    predicate: (x) => { const r = argmaxIdx(x); return r === argmaxIdx(x) && r >= 0 && r < x.length; },
+    predicate: (x) => {
+      const r = runOf('H024')(x);
+      if (!isInt(r) || r < 0 || r >= x.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[r] < x[i] - 1e-12) return false;
+      return true;
+    },
   });
 
-  // H025 top-p 当 p≥1 时全为 1：一般情形为合法核掩码，p≥1 时全 1。
+  // H025 top-p 掩码（p≥1 情形）：一般情形为合法核掩码；p≥1 时核须覆盖几乎全部概率质量。
   reg(25, {
-    name: 'top-p p≥1 全掩码', intuition: 'p=1 时核覆盖全部，掩码全 1。',
-    math: 'if p≥1: run=1^n ; else run=nucleus mask', pseudocode: 'mask on nucleus; all-1 when p>=1', complexity: 'O(n log n)',
-    ref: 'Holtzman et al. 2019 top-p', commonPitfall: 'p 随机时仅检验一般核掩码性质。',
-    invariant: 'run ∈ {0,1}^n, Σ=核大小; 且 p≥1 ⇒ Σ=n',
+    name: 'top-p p≥1 近全掩码', intuition: 'p=1 时核累计概率达 1，掩码覆盖几乎全部。',
+    math: 'run = nucleus mask; p≥1 ⇒ cumsum(核内概率)≈1', pseudocode: 'mask on nucleus; ~all-1 when p>=1', complexity: 'O(n log n)',
+    ref: 'Holtzman et al. 2019 top-p', commonPitfall: '尾部概率下溢为 0 时最小前缀可在末尾前终止，故不断言严格全 1（浮点细节）。',
+    invariant: 'run ∈ {0,1}^n 且支撑=最小核（降序前缀 / 累计≥p / 最小性）',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => { const idx = nucleusIndices(softmax(x), p); const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; },
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p);
-      const r = (function () { const m = new Float64Array(x.length); for (const i of idx) m[i] = 1; return m; })();
-      let sum = 0; for (let i = 0; i < r.length; i++) { if (!(r[i] === 0 || r[i] === 1)) return false; sum += r[i]; }
-      if (p >= 1 - 1e-9) { if (sum !== r.length) return false; }
-      else { if (sum !== idx.length) return false; }
-      return true;
+      const r = runOf('H025')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      if (!r || r.length !== n) return false;
+      let sum = 0;
+      for (let i = 0; i < n; i++) { if (r[i] !== 0 && r[i] !== 1) return false; sum += r[i]; }
+      const set = new Set();
+      for (let i = 0; i < n; i++) if (r[i] === 1) set.add(i);
+      if (set.size !== sum || set.size < 1) return false;
+      return nucleusProps(set, softmax(x), pp);
     },
   });
 
@@ -518,14 +683,25 @@
     name: 'nucleus 含 argmax', intuition: '核从最大概率开始累加，必含 argmax。',
     math: 'argmax(x) ∈ nucleus', pseudocode: 'check argmax in nucleus set', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: 'p→0 极限下核仅含 argmax。',
-    invariant: 'argmax(x) 必在核内',
+    invariant: 'run 非空且含 x 的某个 argmax，并满足核三性质',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => Float64Array.from(nucleusIndices(softmax(x), p)),
     predicate: (x, p) => {
-      const r = Float64Array.from(nucleusIndices(softmax(x), p));
-      const a = argmaxIdx(x);
-      for (let i = 0; i < r.length; i++) if (r[i] === a) return true;
-      return false;
+      const r = runOf('H026')(x, p);
+      const n = x.length;
+      const pp = Math.min(Math.max(p, 0), 1);
+      if (!r || r.length < 1 || r.length > n) return false;
+      const set = new Set();
+      for (let i = 0; i < r.length; i++) { const v = r[i]; if (!isInt(v) || v < 0 || v >= n || set.has(v)) return false; set.add(v); }
+      // 含某个 argmax
+      let hasMax = false;
+      for (const i of set) {
+        let isMax = true;
+        for (let j = 0; j < n; j++) if (x[i] < x[j] - 1e-12) { isMax = false; break; }
+        if (isMax) { hasMax = true; break; }
+      }
+      if (!hasMax) return false;
+      return nucleusProps(set, softmax(x), pp);
     },
   });
 
@@ -533,17 +709,31 @@
   reg(27, {
     name: '温度 top-k', intuition: 'softmax 保序，故温度缩放后 top-k 与原始 top-k 相同。',
     math: 'topk(softmax(x/T)) = topk(x)', pseudocode: 'top-k on softmax(x/T)', complexity: 'O(n log n)',
-    ref: 'Vaswani 2017', commonPitfall: '依赖 softmax 单调保序。',
-    invariant: 'run 集合 = topk(x)',
+    ref: 'Vaswani 2017', commonPitfall: '大动态范围输入下尾部概率下溢为 0，此时 top-k 由概率序（含并列 0 的下标次序）决定。',
+    invariant: 'run = 概率降序的前 kk 个（并列按下标）；且正概率段必满足 x 降序（softmax 保序）',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => Float64Array.from(topKIndices(softmax(x), k)),
     predicate: (x, k) => {
-      const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
-      const idx = topKIndices(x, k);
-      const r = Float64Array.from(topKIndices(softmax(x), k));
-      if (!(r && r.length === kk)) return false;
-      const set1 = new Set(idx);
-      for (let i = 0; i < r.length; i++) if (!set1.has(r[i])) return false;
+      const r = runOf('H027')(x, k);
+      const n = x.length;
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), n);
+      if (!r || r.length !== kk) return false;
+      const pr = softmax(x);
+      const ins = new Set();
+      for (let j = 0; j < kk; j++) {
+        const v = r[j];
+        if (!isInt(v) || v < 0 || v >= n || ins.has(v)) return false;
+        ins.add(v);
+        if (j > 0 && pr[r[j - 1]] < pr[r[j]] - 1e-12) return false; // 概率降序
+      }
+      // ① 所选即概率最大的 kk 个（独立基准：概率降序 + 同值下标升序）
+      const expect = new Set(descOrder(pr).slice(0, kk));
+      if (ins.size !== expect.size) return false;
+      for (const v of ins) if (!expect.has(v)) return false;
+      // ② softmax 保序：正概率段内 x 必降序
+      for (let j = 1; j < kk; j++) {
+        if (pr[r[j - 1]] > 0 && pr[r[j]] > 0 && x[r[j - 1]] < x[r[j]] - 1e-12) return false;
+      }
       return true;
     },
   });
@@ -553,14 +743,15 @@
     name: 'top-k 值向量', intuition: '返回 top-k 位置对应的原始值。',
     math: 'run_j = x[idx_j], idx = topk(x) sorted desc', pseudocode: 'return x[topk]', complexity: 'O(n log n)',
     ref: 'Vaswani 2017', commonPitfall: '顺序须与 top-k 下标一致。',
-    invariant: 'run 为 top-k 值，降序，且与 x 对应',
+    invariant: 'run 逐位等于 x 降序排列的前 kk 个值',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => { const idx = topKIndices(x, k); return Float64Array.from(idx.map((i) => x[i])); },
     predicate: (x, k) => {
-      const idx = topKIndices(x, k);
-      const r = Float64Array.from(idx.map((i) => x[i]));
-      if (!(r && r.length === idx.length)) return false;
-      for (let j = 0; j < idx.length; j++) { if (!Object.is(r[j], x[idx[j]])) return false; if (j > 0 && r[j - 1] < r[j] - 1e-12) return false; }
+      const r = runOf('H028')(x, k);
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
+      const sv = Array.from(x).sort((a, b) => b - a); // 独立基准：降序值
+      if (!r || r.length !== kk) return false;
+      for (let j = 0; j < kk; j++) if (!Object.is(r[j], sv[j])) return false;
       return true;
     },
   });
@@ -570,14 +761,16 @@
     name: 'top-k 累积概率', intuition: 'top-k 覆盖的概率质量。',
     math: 'run = Σ_{i∈topk} softmax(x)_i', pseudocode: 'sum probs over top-k', complexity: 'O(n log n)',
     ref: 'Vaswani 2017', commonPitfall: '结果必在 (0,1]。',
-    invariant: '0 < run <= 1 且 = top-k 概率和',
+    invariant: '0 < run <= 1 且等于 kk 个最大值的概率和',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
     run: (x, k) => { const idx = topKIndices(x, k); const pr = softmax(x); let s = 0; for (const i of idx) s += pr[i]; return s; },
     predicate: (x, k) => {
-      const idx = topKIndices(x, k); const pr = softmax(x);
-      let s = 0; for (const i of idx) s += pr[i];
-      const r = (function () { let t = 0; for (const i of idx) t += pr[i]; return t; })();
-      return r > 0 && r <= 1 + 1e-9 && Math.abs(r - s) < 1e-9;
+      const r = runOf('H029')(x, k);
+      const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
+      const pr = softmax(x);
+      const ord = descOrder(x);
+      let s = 0; for (let a = 0; a < kk; a++) s += pr[ord[a]]; // 独立基准
+      return r > 0 && r <= 1 + 1e-9 && relClose(r, s, 1e-9);
     },
   });
 
@@ -586,14 +779,18 @@
     name: 'top-k 熵', intuition: '截断分布的熵，上限 log(kk)。',
     math: 'run = H(softmax(sub_topk))', pseudocode: 'entropy of renormalized top-k', complexity: 'O(n log n)',
     ref: 'Shannon 1948', commonPitfall: '熵非负且 ≤ log(kk)。',
-    invariant: '0 <= run <= log(kk) 且等于重归一化熵',
+    invariant: '0 <= run <= log(kk) 且等于重归一化 top-k 熵',
     inputs: ['x', 'k'], domains: { x: 'vecFinite', k: 'nat' },
-    run: (x, k) => { const idx = topKIndices(x, k); const sub = idx.map((i) => softmax(x)[i]); return entropy(softmax(sub)); },
+    run: (x, k) => { const idx = topKIndices(x, k); const sub = idx.map((i) => x[i]); return entropy(softmax(sub)); },
     predicate: (x, k) => {
+      const r = runOf('H030')(x, k);
       const kk = Math.min(Math.max(1, Math.floor(k || 1)), x.length);
-      const idx = topKIndices(x, k); const sub = idx.map((i) => softmax(x)[i]);
-      const r = entropy(softmax(sub));
-      return r >= -1e-12 && r <= Math.log(kk) + 1e-9;
+      const pr = softmax(x);
+      const ord = descOrder(x);
+      let Z = 0; for (let a = 0; a < kk; a++) Z += pr[ord[a]];
+      let h = 0;
+      for (let a = 0; a < kk; a++) { const q = pr[ord[a]] / Z; if (q > 0) h -= q * Math.log(q); }
+      return r >= -1e-12 && r <= Math.log(kk) + 1e-9 && relClose(r, h, 1e-9);
     },
   });
 
@@ -602,15 +799,17 @@
     name: 'top-p 累积概率', intuition: '核覆盖的概率质量，必 ≥ p。',
     math: 'run = Σ_{i∈nucleus} p_i >= p', pseudocode: 'sum probs over nucleus', complexity: 'O(n log n)',
     ref: 'Holtzman et al. 2019 top-p', commonPitfall: '和必 ≥ p 且 ≤ 1。',
-    invariant: 'p <= run <= 1',
+    invariant: 'p <= run <= 1 且等于最小核的累计概率',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
     run: (x, p) => { const pr = softmax(x); const idx = nucleusIndices(pr, p); let s = 0; for (const i of idx) s += pr[i]; return s; },
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p);
-      let s = 0; for (const i of idx) s += pr[i];
-      const r = (function () { let t = 0; for (const i of idx) t += pr[i]; return t; })();
+      const r = runOf('H031')(x, p);
       const pp = Math.min(Math.max(p, 0), 1);
-      return r >= pp - 1e-9 && r <= 1 + 1e-9 && Math.abs(r - s) < 1e-9;
+      const pr = softmax(x);
+      const ord = descOrder(x);
+      let s = 0;
+      for (let a = 0; a < ord.length; a++) { s += pr[ord[a]]; if (s >= pp) break; } // 独立基准
+      return r >= pp - 1e-9 && r <= 1 + 1e-9 && relClose(r, s, 1e-9);
     },
   });
 
@@ -619,13 +818,19 @@
     name: 'top-p 熵', intuition: '核分布的熵，上限 log(核大小)。',
     math: 'run = H(softmax(sub_nucleus))', pseudocode: 'entropy of renormalized nucleus', complexity: 'O(n log n)',
     ref: 'Shannon 1948', commonPitfall: '熵非负且 ≤ log(|nucleus|)。',
-    invariant: '0 <= run <= log(|nucleus|)',
+    invariant: '0 <= run <= log(|nucleus|) 且等于重归一化核熵',
     inputs: ['x', 'p'], domains: { x: 'vecFinite', p: 'unit' },
-    run: (x, p) => { const pr = softmax(x); const idx = nucleusIndices(pr, p); const sub = idx.map((i) => pr[i]); return entropy(softmax(sub)); },
+    run: (x, p) => { const pr = softmax(x); const idx = nucleusIndices(pr, p); const sub = idx.map((i) => x[i]); return entropy(softmax(sub)); },
     predicate: (x, p) => {
-      const pr = softmax(x); const idx = nucleusIndices(pr, p); const sub = idx.map((i) => pr[i]);
-      const r = entropy(softmax(sub));
-      return r >= -1e-12 && r <= Math.log(Math.max(1, idx.length)) + 1e-9;
+      const r = runOf('H032')(x, p);
+      const pp = Math.min(Math.max(p, 0), 1);
+      const pr = softmax(x);
+      const ord = descOrder(x);
+      const idx = []; let s = 0;
+      for (let a = 0; a < ord.length; a++) { idx.push(ord[a]); s += pr[ord[a]]; if (s >= pp) break; }
+      let h = 0;
+      for (let a = 0; a < idx.length; a++) { const q = pr[idx[a]] / s; if (q > 0) h -= q * Math.log(q); }
+      return r >= -1e-12 && r <= Math.log(Math.max(1, idx.length)) + 1e-9 && relClose(r, h, 1e-9);
     },
   });
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
