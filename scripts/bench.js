@@ -279,8 +279,8 @@ if (FULL) {
   const s = L10.stats();
   const per = L10.DOMAINS.map((d) => `${d} ${s[d].impl}/${s[d].capacity}`).join(' · ');
   rec('微指令', 'L10 槽位总容量', String(s.total.capacity), '1024', s.total.capacity === 1024);
-  rec('微指令', 'L10 已实现指令数', String(s.total.impl), '≥ 480', s.total.impl >= 480);
-  rec('微指令', '逐域明细', per, 'A/B/C/D/E 各 96', ['A', 'B', 'C', 'D', 'E'].every((d) => s[d].impl === 96));
+  rec('微指令', 'L10 已实现指令数', String(s.total.impl), '= 1024（满额）', s.total.impl === 1024);
+  rec('微指令', '逐域明细', per, '八域各 128', L10.DOMAINS.every((d) => s[d].impl === 128));
 })();
 
 /* ---------- 渲染 Markdown ---------- */
