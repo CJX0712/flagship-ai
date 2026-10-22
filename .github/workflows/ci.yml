@@ -97,6 +97,30 @@ jobs:
       - name: Browser assembly gate (demo.html headless + dual-end bit-exact parity)
         run: node scripts/probe-demo.js
 
+      # 真实浏览器渲染/交互门禁（v15.8）：Playwright headless Chromium 直开 demo.html（file://，
+      # 与用户双击打开同一条路径），断言十层栈装配 + L10 1024/1024 + 微指令浏览器 DOM 渲染 /
+      # 按域筛选 / 批量试运行（1024×8 谓词全绿），并产出 docs/demo-screenshot.png 作可视化留痕。
+      # 浏览器二进制按 package-lock 哈希缓存，避免每次重下 ~130MB Chromium。
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser demo gate (headless render + interaction + L10 1024x8)
+        run: npm run test:demo-browser
+
+      - name: Upload demo screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-screenshot-node-${{ matrix.node }}
+          path: docs/demo-screenshot.png
+          if-no-files-found: warn
+
       - name: Unified benchmark report (bench.js → docs/BENCHMARK.md)
         run: node scripts/bench.js
 

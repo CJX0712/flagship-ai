@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.7-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.8-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
@@ -163,6 +163,19 @@
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
 
+### v15.8 新增（CI 真实浏览器渲染/交互门禁 + demo 截图）
+
+把 demo 从「代码层可验证」升级为「真实浏览器层可验证」——用 Playwright headless Chromium 直开 `demo.html`（file://，与用户双击同一条路径），新增一条独立于 `probe-demo`（结构校验）与 `test:layers`（Node 单测）的可视化验证通路：
+
+| 能力 | 说明 |
+|---|---|
+| **真实渲染门禁** | `scripts/probe-demo-browser.js`（`npm run test:demo-browser`）在 headless Chromium 加载 demo，断言十层栈装配完成、`window.FlagshipNS.L10.stats()` = 1024/1024（八域各 128） |
+| **交互断言** | 微指令浏览器 DOM 渲染（八域摘要卡 8/8 + 列表首屏 60 条 + 计数 1024/1024）；点「A」域筛选 → 计数变 128/1024、首项 key=μA001、chip `aria-pressed=true`；点首项展开七件套详情 8 段 |
+| **批量不变量** | 触发「批量试运行」：1024 项 × 8 种子 = 8192 次谓词求值，断言 `✓ 1024/1024 项通过`、失败 0（实测 ~0.8s） |
+| **截图留痕** | 产出 `docs/demo-screenshot.png`（下方头图 + CI artifact），把整条微指令不变量验证通路可视化 |
+| **CI 集成** | GitHub Actions 新增步骤：按 `package-lock` 哈希缓存 Playwright 浏览器（免每次重下 ~130MB Chromium）→ `playwright install chromium` → 跑门禁 → 上传截图 artifact |
+| **零运行时依赖不变** | Playwright 仅入 `devDependencies`，`dependencies` 仍为 0（CI 零依赖断言照常通过）；Chromium 解析顺序：`PW_CHROMIUM_EXECUTABLE` → Playwright 托管 → 本机 ms-playwright 缓存扫描 |
+
 ### v15.7 新增（demo 视觉/交互升级 + L10 微指令浏览器）
 
 十层架构与 1024 项微指令全量落地后，把 demo 从「能用」升级为「可展示」：
@@ -302,6 +315,7 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 |---|---|---|
 | 微指令门禁 | `npm run test:L10` | 8 项全绿（1024 容量 · 1024 实现计数诚实且与 `isa.js` 交叉一致 · 1024 项 × 2 种子 × 20 例不变量抽查 · stub 诚实标记 · RNG 确定性 · L8/L9 与 legacy 逐位一致 · 引擎零影响 K15 34 键 · L3–L10 全挂载） |
 | 浏览器装配门禁 | `npm run test:demo` | 9 项全绿（脚本块无异常 · 34 键一致 · L3–L10 挂载 · L10 容量双端一致 · 自检套件就位 · 微指令可运行 · **前向双端逐位一致** · 浏览器侧确定性） |
+| 真实浏览器门禁 | `npm run test:demo-browser` | Playwright headless Chromium 直开 demo.html：十层栈装配 · L10 1024/1024 · 微指令浏览器 DOM/筛选/七件套 · 批量 1024×8 谓词全绿 · 产出截图 |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
 | 性质测试 | `npm run test:layers` | A/B/C/D/E/F/G/H 八域每项 ≥120 例 fast-check 任意子谓词检验 |
 
@@ -449,9 +463,14 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 
 - 📝 语料实时编辑 → 一键构建模型（词表/参数量即时统计）
 - 🧪 一键自检（10 项逐项点亮，与 Node 结果一致）
+- 🔬 **L10 微指令浏览器**（八域 A–H × 128 = 1024 项全貌；按域筛选 / 关键字搜索 / 展开七件套 / **浏览器内试运行不变量** / 批量 1024×8 谓词全绿）
 - 📈 训练（分块不卡 UI，loss 实时曲线，断点续训与直训**逐位等价**）
 - ✨ 生成（温度 / top-k / 种子可调，KV cache 加速，实时显示 token/s）
 - 💾 导出/导入模型（参数 + 词表，JSON 无损）
+
+**L10 微指令浏览器实测截图**（由 `npm run test:demo-browser` 在 headless Chromium 真实渲染 + 交互 + 批量试运行后生成，CI 每次运行上传同款 artifact）：
+
+![Flagship AI — L10 微指令浏览器（1024/1024，批量试运行 8192 次谓词求值全绿）](docs/demo-screenshot.png)
 
 ## API 速查
 
