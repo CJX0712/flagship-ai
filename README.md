@@ -21,6 +21,8 @@
 
 </div>
 
+🌐 **语言 / Language**：[English](README.en.md) · 中文（当前）
+
 ---
 
 ## 📑 目录
@@ -435,7 +437,7 @@ KV Cache 增量解码是唯一有效的提速手段：每步只算 1 个新 toke
 ```bash
 git clone https://github.com/CJX0712/flagship-ai.git
 cd flagship-ai
-node src/verify.js   # 10 项自检，约 10 秒
+node src/verify.js   # 12 项自检，约 10 秒
 ```
 
 10 行训练 + 生成：
@@ -516,7 +518,7 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 无构建、无服务器：**双击 `demo.html`**（file:// 协议直开）。单文件内联全部代码，支持：
 
 - 📝 语料实时编辑 → 一键构建模型（词表/参数量即时统计）
-- 🧪 一键自检（10 项逐项点亮，与 Node 结果一致）
+- 🧪 一键自检（12 项逐项点亮，与 Node 结果一致）
 - 🔬 **L10 微指令浏览器**（八域 A–H × 128 = 1024 项全貌；按域筛选 / 关键字搜索 / 展开七件套 / **浏览器内试运行不变量** / 批量 1024×8 谓词全绿）
 - 📈 训练（分块不卡 UI，loss 实时曲线，断点续训与直训**逐位等价**）
 - ✨ 生成（温度 / top-k / 种子可调，KV cache 加速，实时显示 token/s）
