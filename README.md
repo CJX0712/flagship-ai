@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.10-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.11-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
@@ -27,7 +27,7 @@
 
 ## 📑 目录
 
-- [这是什么（v3.0 → v15.10 版本演进）](#这是什么)
+- [这是什么（v3.0 → v15.11 版本演进）](#这是什么)
 - [自检套件（12 项全绿）](#自检套件12-项全绿)
 - [性能](#性能)
   - [一键基准报告](#一键基准报告)
@@ -164,6 +164,44 @@
 | **全组合兼容** | — | 与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、soft-cap 任意组合均经探针验证；`ropeScale` 缺省或 `factor≤1` 逐位等价于旧版 RoPE |
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
+
+### v15.11 修复（L10 A–E 五域谓词纪律：640 项全部「先调 run，再验性质」+ 变异门禁）
+
+**发现的系统性缺陷**：门禁只调 `op.predicate(...args)`，**从不调 `op.run`**（`tests/lib/op-harness.js:43`、`scripts/probe-microisa.js:106`）。A–E 五域 640 项谓词中，存在大量「把 run 的定义式内联复算、或直调 run 内部的底层 helper」的自比断言 —— run 若被改坏，门禁完全失明（假绿）。**E 域最严重：128/128 项谓词全部直接调 `NS.L7.shape.*` 或本地 helper，从不调本 op 的 run**，即整域彻底假绿。
+
+**修复范围**（A-scalar-000~003、B-vector-000~003、C-matrix-000~003、D-attention-000~003、E-shape-000~003 共 20 文件 640 项，+6046 / −3752 行）：
+
+| 域 | 原缺陷 | 修复手法 |
+|---|---|---|
+| **E（形状与索引）** | 128/128 谓词直调 `NS.L7.shape.*`（size / linearize / contiguousStrides / broadcastShapes / permute / invertPerm），run 从未被调用 | 全部经 `runOf('Exxx')` 调 run；oracle 取本文件内第一性原理实现（`prod` 维度乘积、`suffixProds` 后缀积、`dotIdx` 本地点积、`bcastLocal` 本地尾部对齐广播、`invLocal` 本地逆置换、`Math.floor(d/2)` 与 run 的位运算写法区分）+ 逐元素独立重建 |
+| **D（注意力）** | 谓词「独立校验」但比对对象是本地 helper（det2 / isSym / colVar / vcat）—— 与 run 同源，run 损坏仍失明 | 全部改 `runOf` 路由；跨 op 互引（D001 裸点积、D013 因果、D025 softmax、D030 LSE）；幂等经 run 双重调用（D016↔D013） |
+| **C（矩阵）** | C035 / C062 谓词是 `meq(o,o)` 自比较（**恒真假绿**）；C104–C106、C120 的「独立校验」比对对象仍是本地 helper | 改内联索引 oracle / 独立三重循环 / 前向 vs 后向递推（方向相反的独立实现）；C106 第二子句逻辑反向亦修正 |
+| **B（向量）** | B106 / B108 谓词误传 2 参给 3 参 run（z=undefined → 崩溃）；多处仅校验长度或单边不等式 | 修传参；长度类判据升级为「钉死内容逐位比对」 |
+| **A（标量）** | A107 只断言「非有限」，不钉符号与 NaN 分支 | 强化为 `a>0 ⇒ +∞`、`a<0 ⇒ −∞`、`a=0 ⇒ NaN` 三分支精确刻画 |
+
+**新增变异测试门禁（`mutcheck`）——证明断言非空转**：光靠「全部通过」无法证明门禁有牙齿。`mutcheck` 对每个 impl op 采集原 run 下谓词为 true 的输入集，然后把 `op.run` 替换为四种损坏版本（`shift` 每次调用加不同常数 / `neg` 逐元素取负 / `rev` 数组反序 / `flip` 布尔翻转、NaN→0、字符串加后缀），重跑谓词 —— 若四种扰动全部漏网，即判为**弱判据（潜在假绿）**并列出。这道门禁额外暴露了 **16 项此前全绿但判据过松的谓词**，全部补独立 oracle 钉死：
+
+| 弱判据 | 原判据 | 钉死方式 |
+|---|---|---|
+| A107 | `isFinite(run(a)) === false` | 三分支精确（+∞ / −∞ / NaN） |
+| B078 / B104 | 只验单边不等式（超可加 / 三角不等式），返回常量也过 | 钉死 `minᵢ(xᵢ+yᵢ)` / `maxᵢ|xᵢ−zᵢ|` |
+| B121 / B123 | 只验长度 | 钉死拼接 / 切片的逐位内容 |
+| C015 / C121 | 只验长度（转置 / 垂直拼接） | 钉死逐位转置关系 / 逐位拼接内容 |
+| C059 | 只验 idx/val 长度 | 钉死每行 top-2 次序统计值 + idx↔val 自洽 |
+| C065 / C080 | 只验输出长度（matmul） | 独立三重循环钉死乘积 |
+| C075 | 只验 `fro(P) == √ΣP²`（对**任意** P 都成立，不校验 matmul 本身） | 补独立三重循环钉死乘积，再验 Frobenius 自洽 |
+| D006 | 只验 Cauchy–Schwarz 上界（不钉值） | 钉死 `\|⟨q,k⟩\|` |
+| D018 | 只验掩码对称性 | 独立 `\|i−j\|>w` 可见性 oracle 钉死掩码 |
+| D019 | 只验单调性符号 | 闭式可见格点计数差钉死值 |
+| D051 / D055 | 只验对称性 / 有限性 | 钉死 `−slope·\|i−j\|` |
+
+**废弃 6 处恒真式假绿**（D 域）：D074 `nH*hd===nH*hd`、D075 `d!==d` 恒假循环、D078、D087 `(base+pos*d)===base+pos*d`、D089 `(i+1)-i!==1`、D094 —— 全部改为 run 耦合断言 + 定点锚。
+
+**修复一处 run 本体潜伏缺陷（D079）**：`cacheAppend(cache, L, cap, d, row)` 误以 5 参调用 2 参的 `cacheAppend` —— 因谓词从不调 run，该崩溃从未被发现。改为 `cacheAppend({data: cache, len: L, cap, d}, row)`。
+
+**校验脚本自身两次扩能（消除伪红误判）**：① 边缘用例池原为定长 4×4 / 8 维，与 op 声明的 `matrixDims` / `vecDims` 冲突会 OOB 读出 `undefined` → 伪红；改为按声明维度自适应伸缩（平铺 / 截断）。② 组合上限 400 会把尾部输入截断为 `undefined` → 伪红；提至 5000。**纪律沉淀：先证明失败是真实缺陷而非工具伪红，再改代码。**
+
+**验证**：双模式校验（4 种子 × 80 例随机 + 边缘用例手工构造）覆盖 640 项 —— A `44971/0`、B `47781/0`、C `42601/0`、D `80493/0`、E `42380/0`，合计 **258226 例 0 失败**；变异门禁 **640 项 0 弱判据**。全门禁：verify.js 12/12、lint 72 文件 0 违例、isa 1024/1024、probe-microisa 8/8、tests/L10 8 文件 8/8、13 组探针全绿、demo.html 重建两次 md5 一致。
 
 ### v15.10 新增（ALiBi 线性距离偏置 · 第 7 套位置表示）
 

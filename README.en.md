@@ -4,7 +4,7 @@
 
 **A zero-dependency, single-file GPT engine in pure JavaScript — from characters to generation, every line verifiable**
 
-[![Version](https://img.shields.io/badge/version-v15.10-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.11-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#verification)
 [![Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#verification)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#capabilities)
@@ -50,7 +50,7 @@ A **zero-dependency, single-file** GPT language model, implemented end to end �
 | **Micro-ISA (L10)** | **1024-slot registry, 8 domains A–H × 128, all 1024 implemented** — each op ships intuition / math / pseudocode / complexity / reference / pitfall / invariant + `run` + `predicate` | — |
 | **Dual-end** | Node and browser share one codebase; forward is **bit-identical** across both | — |
 
-Full version-by-version changelog (v3.0 → v15.10) lives in the [Chinese README](README.md).
+Full version-by-version changelog (v3.0 → v15.11) lives in the [Chinese README](README.md).
 
 ## Verification
 

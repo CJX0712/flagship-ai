@@ -17,6 +17,13 @@
  *   logsumexp2 → NS.L9.special；转置/缩放/全1等 → NS.L10.mh；
  *   行切片 → NS.L7.tensor.slice+contiguous。det/拼接/pad/对角提取在 L7/L8
  *   无裸矩阵内核，于本文件本地实现（谓词走独立参考路径）。
+ *
+ * ── 谓词纪律（本批全部重写，2026-10-23）─────────────────────────────────
+ * 门禁只调 op.predicate，从不调 op.run（op-harness.js:43、probe-microisa.js:106）。
+ * 原 32 项谓词虽多为"独立校验"写法，但校验对象是本地 helper（det2/isSym/
+ * colVar/vcat/…）而非 run 本体——helper 与 run 同源，run 若损坏门禁失明。
+ * 现全部改为：先经 runOf('Cxxx') 调 run 本体，再对 run 的产出断言；oracle
+ * 取内联索引路径（行列式展开、列和、方差、前缀和、拼接定位）或常数锚。
  * ==========================================================================*/
 ;(function (NS) {
   'use strict';
@@ -24,6 +31,7 @@
   const M = NS.L8.matmul, R = NS.L8.reduce, SP = NS.L9.special, L10 = NS.L10;
   const mh = L10.mh;
   function reg(i, o) { NS.L10.register('C', i, o); }
+  function runOf(key) { const o = NS.L10.ops[key]; return o && typeof o.run === 'function' ? o.run : null; }
   const { Z, madd, msub, mscale, mneg, mabs, mrelu, mclamp, emp, msq, trans, id, ones, allIn, sumAll, fro, colSum, meq } = mh;
   const rc = (a, b, t) => NS.L10.relClose(a, b, t);
   const z0 = (v) => v === 0 || v === -0; // ±0 归一判零（IEEE 中 −0 与 0 数值等价）
@@ -139,6 +147,19 @@
     }
     return o;
   }
+  // 内联列方差 oracle（4×5，总体方差除以 4）：与 colVar 完全独立的参考路径。
+  function inlineColVar(A) {
+    const o = new Float64Array(5);
+    for (let j = 0; j < 5; j++) {
+      let s = 0;
+      for (let i = 0; i < 4; i++) s += A[i * 5 + j];
+      const m = s / 4;
+      let v = 0;
+      for (let i = 0; i < 4; i++) { const d = A[i * 5 + j] - m; v += d * d; }
+      o[j] = v / 4;
+    }
+    return o;
+  }
   const THREES = mscale(3, ones(4, 5), 20); // 全 3 矩阵（4×5），供平移不变性对照
   const DIAG235 = (() => { const o = Z(3, 3); o[0] = 2; o[4] = 3; o[8] = 5; return o; })(); // diag(2,3,5)
 
@@ -149,21 +170,23 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '副对角线项符号为负。', invariant: '逐位 Object.is（整数域）',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
     run: (A) => det2(A),
-    predicate: (A) => { let acc = 0; acc += A[0] * A[3]; acc -= A[1] * A[2]; return meq(det2(A), acc); },
+    predicate: (A) => meq(runOf('C097')(A), A[0] * A[3] - A[1] * A[2])
+      && Object.is(runOf('C097')(id(2)), 1),   // 定点锚：det(I₂)=1
   });
   reg(98, {
     name: 'det · 转置不变', intuition: '行列式对转置不变：det(Aᵀ) = det(A)（逐位）。',
     math: 'det(Aᵀ) = det(A)', pseudocode: 'return det2(Aᵀ)', complexity: 'O(1)',
     ref: 'Horn & Johnson 1985', commonPitfall: '无。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
-    run: (A) => det2(trans(A, 2, 2)), predicate: (A) => meq(det2(trans(A, 2, 2)), det2(A)),
+    run: (A) => det2(trans(A, 2, 2)),
+    predicate: (A) => meq(runOf('C098')(A), det2(A)) && Object.is(runOf('C098')(id(2)), 1),
   });
   reg(99, {
     name: 'det · 单位阵等于 1', intuition: '单位阵行列式为 1（矩阵乘的单位元）。',
     math: 'det(I₂) = 1', pseudocode: 'return det2(I)', complexity: 'O(1)',
     ref: '线性代数', commonPitfall: '无。', invariant: 'Object.is(det(I₂), 1)',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
-    run: () => det2(id(2)), predicate: () => Object.is(det2(id(2)), 1),
+    run: () => det2(id(2)), predicate: () => Object.is(runOf('C099')(), 1),
   });
   reg(100, {
     name: 'det · 对角阵等于对角线积', intuition: '对角阵行列式等于对角线元素之积（3×3，从输入提取对角块验证）。',
@@ -171,7 +194,8 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '非对角项必须精确为 0。', invariant: '逐位 Object.is（整数域）',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
     run: (A) => det3(diagPart(A, 3)),
-    predicate: (A) => { const D = diagPart(A, 3); return meq(det3(D), D[0] * D[4] * D[8]); },
+    predicate: (A) => meq(runOf('C100')(A), A[0] * A[4] * A[8])   // 内联对角线积（不经 diagPart/det3）
+      && Object.is(runOf('C100')(id(3)), 1),                     // 定点锚：det(I₃)=1
   });
   reg(101, {
     name: 'det · 乘积性（2×2 精确）', intuition: 'det(AB) = det(A)·det(B)；整数域两侧皆为精确整数（≤8e12 < 2⁵³），逐位相等。',
@@ -179,7 +203,8 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '更大规模会溢出精确整数区，故限 2×2。', invariant: '逐位 Object.is',
     inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 2], B: [2, 2] },
     run: (A, B) => det2(M.matmul(A, B, 2, 2, 2)),
-    predicate: (A, B) => meq(det2(M.matmul(A, B, 2, 2, 2)), det2(A) * det2(B)),
+    predicate: (A, B) => meq(runOf('C101')(A, B), det2(A) * det2(B))
+      && Object.is(runOf('C101')(id(2), id(2)), 1),   // 定点锚：det(I·I)=1
   });
   reg(102, {
     name: 'det · 乘积性（3×3 对角因子）', intuition: 'B 取对角阵 diag(2,3,5) 时 det(AB) = det(A)·30，即列缩放定理；3×3 全程整数精确（≤4e11 < 2⁵³）。',
@@ -187,7 +212,8 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '一般 3×3 双矩阵乘积有大数抵消，故选固定对角因子保精确。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
     run: (A) => det3(M.matmul(A, DIAG235, 3, 3, 3)),
-    predicate: (A) => meq(det3(M.matmul(A, DIAG235, 3, 3, 3)), det3(A) * 30),
+    predicate: (A) => meq(runOf('C102')(A), det3(A) * 30)
+      && Object.is(runOf('C102')(id(3)), 30),   // 定点锚：det(I·D)=30
   });
   reg(103, {
     name: '2×2 · 迹等于特征值之和', intuition: '特征方程 λ²−tr·λ+det=0 的两根之和等于迹（Vieta）；实根还验证积等于 det 且根满足方程，复共轭根验证多项式在根处消失。',
@@ -201,15 +227,15 @@
     },
     predicate: (A) => {
       const t = A[0] + A[3], d = A[0] * A[3] - A[1] * A[2], disc = t * t - 4 * d;
+      if (!rc(runOf('C103')(A), t, 1e-9)) return false;          // run 根和 vs 内联迹
       if (disc >= 0) {
         const s = Math.sqrt(disc), l1 = (t + s) / 2, l2 = (t - s) / 2;
-        return rc(l1 + l2, t, 1e-9) && rc(l1 * l2, d, 1e-9) &&
+        return rc(l1 * l2, d, 1e-9) &&
           rc(l1 * l1 - t * l1 + d, 0, 1e-9) && rc(l2 * l2 - t * l2 + d, 0, 1e-9);
       }
       const h = Math.sqrt(-disc) / 2, a = t / 2; // 根为 a ± i·h
-      return rc(a + a, t, 1e-9) &&
-        rc(a * a - h * h - t * a + d, 0, 1e-9) &&   // Re p(a+ih) = 0
-        rc(2 * a * h - t * h, 0, 1e-9);             // Im p(a+ih) = 0
+      return rc(a * a - h * h - t * a + d, 0, 1e-9) &&   // Re p(a+ih) = 0
+        rc(2 * a * h - t * h, 0, 1e-9);                 // Im p(a+ih) = 0
     },
   });
   reg(104, {
@@ -218,7 +244,11 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '±0 须视为相等（IEEE 中 Object.is(−0,0) 为假）。', invariant: 'isSym(A) === (A=Aᵀ) 且 isSym(A+Aᵀ) 恒真',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
     run: (A) => isSym(A, 4),
-    predicate: (A) => isSym(A, 4) === meq(A, trans(A, 4, 4)) && isSym(madd(A, trans(A, 4, 4), 16), 4) === true,
+    predicate: (A) => {
+      if (runOf('C104')(A) !== meq(A, trans(A, 4, 4))) return false;   // run 判定 vs 异构转置比对
+      return runOf('C104')(id(4)) === true && runOf('C104')(Z(4, 4)) === true
+        && isSym(madd(A, trans(A, 4, 4), 16), 4) === true;             // 正向构造恒真
+    },
   });
   reg(105, {
     name: '反对称判定 · 与定义一致', intuition: 'isAnti(A) 当且仅当 A = −Aᵀ（对角线必为 0）；且反对称化 A−Aᵀ 必为反对称阵。',
@@ -227,10 +257,11 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
     run: (A) => isAnti(A, 4),
     predicate: (A) => {
-      const anti = isAnti(A, 4);
+      const anti = runOf('C105')(A);
       if (anti !== meq(A, mneg(trans(A, 4, 4), 16))) return false;
       if (anti) { for (let i = 0; i < 4; i++) if (!z0(A[i * 4 + i])) return false; }
-      return isAnti(msub(A, trans(A, 4, 4), 16), 4) === true;
+      return runOf('C105')(Z(4, 4)) === true && runOf('C105')(id(4)) === false
+        && isAnti(msub(A, trans(A, 4, 4), 16), 4) === true;
     },
   });
   reg(106, {
@@ -240,9 +271,14 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
     run: (A) => ({ up: isUpperTri(A, 4), lo: isLowerTri(A, 4) }),
     predicate: (A) => {
+      const r = runOf('C106')(A);
       const U = triuPart(A, 4), L = trilPart(A, 4);
-      return isUpperTri(A, 4) === meq(A, U) && isLowerTri(A, 4) === meq(A, L) &&
-        isUpperTri(U, 4) === true && isLowerTri(L, 4) === true;
+      if (r.up !== meq(A, U) || r.lo !== meq(A, L)) return false;   // run 判定 vs 异构投影比对
+      if (!isUpperTri(U, 4) || !isLowerTri(L, 4)) return false;     // 正向构造：投影恒为三角阵
+      const ri = runOf('C106')(id(4));                               // 定点锚：I 上下皆三角
+      const strict = Z(4, 4); strict[4] = 1;                         // (1,0) 非零 → 下三角而非上三角
+      const rl = runOf('C106')(strict);
+      return ri.up === true && ri.lo === true && rl.up === false && rl.lo === true;
     },
   });
   reg(107, {
@@ -251,7 +287,8 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '仅对三角阵成立，一般矩阵须先投影。', invariant: '逐位 Object.is（整数域）',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [3, 3] },
     run: (A) => det3(triuPart(A, 3)),
-    predicate: (A) => { const U = triuPart(A, 3); return meq(det3(U), U[0] * U[4] * U[8]); },
+    predicate: (A) => meq(runOf('C107')(A), A[0] * A[4] * A[8])   // 内联对角线积（投影保留对角）
+      && Object.is(runOf('C107')(id(3)), 1),                     // 定点锚：det(triu(I))=1
   });
   reg(108, {
     name: 'det · 数乘齐次性', intuition: 'n 阶矩阵数乘 s 后行列式乘 sⁿ；2×2 时 det(2A) = 4·det(A)（整数域逐位精确）。',
@@ -259,7 +296,8 @@
     ref: 'Horn & Johnson 1985', commonPitfall: '指数是阶数 n 而非 1。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 2] },
     run: (A) => det2(mscale(2, A, 4)),
-    predicate: (A) => meq(det2(mscale(2, A, 4)), 4 * det2(A)),
+    predicate: (A) => meq(runOf('C108')(A), 4 * det2(A))
+      && Object.is(runOf('C108')(id(2)), 4),   // 定点锚：det(2I₂)=4
   });
 
   // ── 归约进阶（C109–C120）──────────────────────────────────────────────
@@ -270,20 +308,24 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => mscale(0.25, perColSum(A, 4, 5), 5),
     predicate: (A) => {
-      const m = mscale(0.25, perColSum(A, 4, 5), 5);
+      const m = runOf('C109')(A);
       for (let j = 0; j < 5; j++) { let acc = 0; for (let i = 0; i < 4; i++) acc += A[i * 5 + j]; if (!meq(m[j], acc * 0.25)) return false; }
-      return true;
+      return meq(runOf('C109')(ones(4, 5)), ones(1, 5));   // 定点锚：ones 列均值=1
     },
   });
   reg(110, {
     name: '列 softmax · 每列和为 1', intuition: '对每列做 softmax（复用 L8 softmaxRows 作用于转置），各列概率和趋近 1。',
     math: 'Σᵢ colSoftmax(A)ᵢⱼ = 1（每列）', pseudocode: 'return colSoftmax(A)', complexity: 'O(rc)',
-    ref: 'Bridle 1990', commonPitfall: '需容差；沿列而非行归一。', invariant: 'relClose(列和, 1, 1e-9)',
+    ref: 'Bridle 1990', commonPitfall: '需容差；沿列而非行归一；极端输入下 exp 可下溢为 0（合法，概率和仍为 1）。', invariant: 'relClose(列和, 1, 1e-9)',
     inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
     run: (A) => colSoftmax(A, 4, 5),
     predicate: (A) => {
-      const P = colSoftmax(A, 4, 5);
-      for (let j = 0; j < 5; j++) { let s = 0; for (let i = 0; i < 4; i++) s += P[i * 5 + j]; if (!rc(s, 1, 1e-9)) return false; }
+      const P = runOf('C110')(A);
+      for (let j = 0; j < 5; j++) {
+        let s = 0;
+        for (let i = 0; i < 4; i++) { if (!(P[i * 5 + j] >= 0 && P[i * 5 + j] <= 1 + 1e-12)) return false; s += P[i * 5 + j]; }
+        if (!rc(s, 1, 1e-9)) return false;
+      }
       return true;
     },
   });
@@ -292,7 +334,7 @@
     math: 'colSoftmax(A)ᵢⱼ ≥ 0', pseudocode: 'return colSoftmax(A)', complexity: 'O(rc)',
     ref: 'Bridle 1990', commonPitfall: '无。', invariant: '∀i,j: Pᵢⱼ ≥ 0',
     inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
-    run: (A) => colSoftmax(A, 4, 5), predicate: (A) => allIn(colSoftmax(A, 4, 5), (x) => x >= 0),
+    run: (A) => colSoftmax(A, 4, 5), predicate: (A) => allIn(runOf('C111')(A), (x) => x >= 0 && x <= 1 + 1e-12),
   });
   reg(112, {
     name: '行 argmax · 取值等于行最大', intuition: '每行 argmax 下标处的取值等于该行最大值（并列取首处），且下标合法。',
@@ -301,7 +343,7 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => argmaxRow(A, 4, 5),
     predicate: (A) => {
-      const idx = argmaxRow(A, 4, 5);
+      const idx = runOf('C112')(A);
       for (let i = 0; i < 4; i++) {
         const o = i * 5;
         let mx = A[o];
@@ -320,7 +362,7 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => argmaxCol(A, 4, 5),
     predicate: (A) => {
-      const idx = argmaxCol(A, 4, 5);
+      const idx = runOf('C113')(A);
       for (let j = 0; j < 5; j++) {
         let mx = A[j];
         for (let i = 1; i < 4; i++) if (A[i * 5 + j] > mx) mx = A[i * 5 + j];
@@ -338,14 +380,15 @@
     inputs: ['A'], domains: { A: 'matFinite' }, matrixDims: { A: [4, 5] },
     run: (A) => rowLSE(A, 4, 5),
     predicate: (A) => {
-      const lse = rowLSE(A, 4, 5);
+      const lse = runOf('C114')(A);
       for (let i = 0; i < 4; i++) {
         const o = i * 5;
         let mx = A[o];
         for (let j = 1; j < 5; j++) if (A[o + j] > mx) mx = A[o + j];
         if (!(lse[i] >= mx - 1e-9 && lse[i] <= mx + Math.log(5) + 1e-9)) return false;
       }
-      return true;
+      const S7 = mscale(7, ones(4, 5), 20);                 // 定点锚：全 7 行 LSE = 7+ln5
+      return rc(runOf('C114')(S7)[0], 7 + Math.log(5), 1e-12);
     },
   });
   reg(115, {
@@ -355,7 +398,7 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => colMinMax(A, 4, 5),
     predicate: (A) => {
-      const mm = colMinMax(A, 4, 5);
+      const mm = runOf('C115')(A);
       for (let j = 0; j < 5; j++) {
         let lo = A[j], hi = A[j];
         for (let i = 1; i < 4; i++) { const v = A[i * 5 + j]; if (v < lo) lo = v; if (v > hi) hi = v; }
@@ -370,7 +413,11 @@
     ref: '归约', commonPitfall: '无。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => sumAll(perColSum(A, 4, 5)),
-    predicate: (A) => meq(sumAll(perColSum(A, 4, 5)), sumAll(A)),
+    predicate: (A) => {
+      let t = 0;
+      for (let i = 0; i < 20; i++) t += A[i];               // 内联直合计（异构归约路径）
+      return Object.is(runOf('C116')(A), t);
+    },
   });
   reg(117, {
     name: '行 cumsum · 末列等于行和', intuition: '按行前缀和到最后一列即该行元素和（整数域逐位精确）。',
@@ -379,9 +426,12 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => cumsumRows(A, 4, 5),
     predicate: (A) => {
-      const cs = cumsumRows(A, 4, 5), rs = perRowSum(A, 4, 5);
-      for (let i = 0; i < 4; i++) if (!meq(cs[i * 5 + 4], rs[i])) return false;
-      return true;
+      const cs = runOf('C117')(A);
+      for (let i = 0; i < 4; i++) {
+        let s = 0;
+        for (let j = 0; j < 5; j++) { s += A[i * 5 + j]; if (!meq(cs[i * 5 + j], s)) return false; }   // 全前缀逐位内联 oracle
+      }
+      return meq(runOf('C117')(Z(4, 5)), Z(4, 5));   // 定点锚：零阵前缀和恒零
     },
   });
   reg(118, {
@@ -389,7 +439,9 @@
     math: 'Varⱼ = (Σᵢ(Aᵢⱼ−μⱼ)²)/r ≥ 0', pseudocode: 'return colVar(A)', complexity: 'O(rc)',
     ref: '统计量', commonPitfall: '无。', invariant: '∀j: Varⱼ ≥ 0',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
-    run: (A) => colVar(A, 4, 5), predicate: (A) => allIn(colVar(A, 4, 5), (x) => x >= 0),
+    run: (A) => colVar(A, 4, 5),
+    predicate: (A) => allIn(runOf('C118')(A), (x) => x >= 0)
+      && allIn(runOf('C118')(THREES), (x) => x === 0),   // 定点锚：常数列方差=0
   });
   reg(119, {
     name: '列方差 · 等于转置的行方差', intuition: 'A 的列方差等于 Aᵀ 的行方差（r=4 时两种路径累加顺序一致，逐位相等）。',
@@ -397,7 +449,8 @@
     ref: '统计量', commonPitfall: '总体方差（除以个数）而非样本方差（除以 n−1）。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => colVar(A, 4, 5),
-    predicate: (A) => meq(colVar(A, 4, 5), rowVar(trans(A, 4, 5), 5, 4)),
+    predicate: (A) => meq(runOf('C119')(A), rowVar(trans(A, 4, 5), 5, 4))   // 异构方差路径（colVar vs rowVar）
+      && meq(runOf('C119')(THREES), Z(1, 5)),                               // 定点锚：常数列方差=0
   });
   reg(120, {
     name: '列方差 · 平移不变', intuition: '每列加同一常数不改变方差（整数域下偏移在均值中精确抵消，逐位相等）。',
@@ -405,17 +458,23 @@
     ref: '统计量', commonPitfall: '常数须加到每一个元素（全矩阵同常量）。', invariant: '逐位 Object.is',
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => colVar(madd(A, THREES, 20), 4, 5),
-    predicate: (A) => meq(colVar(madd(A, THREES, 20), 4, 5), colVar(A, 4, 5)),
+    predicate: (A) => meq(runOf('C120')(A), inlineColVar(A)),   // run(A+3J) vs 内联 Var(A)
   });
 
   // ── 张量操作（C121–C128）──────────────────────────────────────────────
   reg(121, {
     name: '垂直拼接 · 形状守恒', intuition: '两块同行宽矩阵垂直拼接，行数相加、元素数 = (r₁+r₂)·c。',
     math: 'vcat(A(r₁×c), B(r₂×c)) ∈ ℝ^{(r₁+r₂)×c}', pseudocode: 'return vcat(A,B)', complexity: 'O((r₁+r₂)c)',
-    ref: 'NumPy vstack', commonPitfall: '两块列宽须相等。', invariant: 'length = (r₁+r₂)·c',
+    ref: 'NumPy vstack', commonPitfall: '两块列宽须相等。', invariant: '逐位：run(A,B)[i] === A[i]（i<6）、run(A,B)[6+i] === B[i]（钉死拼接内容，非仅长度）',
     inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 3] },
     run: (A, B) => vcat(A, B, 2, 3),
-    predicate: (A, B) => vcat(A, B, 2, 3).length === 12,
+    predicate: (A, B) => {
+      const r = runOf('C121')(A, B);
+      if (r.length !== 12) return false;
+      for (let i = 0; i < A.length; i++) if (!Object.is(r[i], A[i])) return false;
+      for (let i = 0; i < B.length; i++) if (!Object.is(r[A.length + i], B[i])) return false;
+      return true;
+    },
   });
   reg(122, {
     name: '垂直拼接 · 内容定位', intuition: '拼接结果上块逐位等于 A、下块逐位等于 B。',
@@ -423,7 +482,10 @@
     ref: 'NumPy vstack', commonPitfall: '行主序下块偏移为 r₁·c。', invariant: '逐位 Object.is',
     inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 3] },
     run: (A, B) => vcat(A, B, 2, 3),
-    predicate: (A, B) => { const o = vcat(A, B, 2, 3); return meq(o.subarray(0, 6), A) && meq(o.subarray(6, 12), B); },
+    predicate: (A, B) => {
+      const o = runOf('C122')(A, B);
+      return meq(o.subarray(0, 6), A) && meq(o.subarray(6, 12), B);
+    },
   });
   reg(123, {
     name: '水平拼接 · 形状与内容', intuition: '两块同高矩阵水平拼接，列数相加；左块为 A、右块为 B（逐位）。',
@@ -432,7 +494,7 @@
     inputs: ['A', 'B'], domains: { A: 'matInt', B: 'matInt' }, matrixDims: { A: [2, 3], B: [2, 4] },
     run: (A, B) => hcat(A, B, 2, 3, 4),
     predicate: (A, B) => {
-      const o = hcat(A, B, 2, 3, 4);
+      const o = runOf('C123')(A, B);
       if (o.length !== 14) return false;
       for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) if (!meq(o[i * 7 + j], A[i * 3 + j])) return false;
       for (let i = 0; i < 2; i++) for (let j = 0; j < 4; j++) if (!meq(o[i * 7 + 3 + j], B[i * 4 + j])) return false;
@@ -446,7 +508,7 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 5] },
     run: (A) => rowSlice(A, 4, 5, 1, 3),
     predicate: (A) => {
-      const o = rowSlice(A, 4, 5, 1, 3);
+      const o = runOf('C124')(A);
       if (o.length !== 10) return false;
       for (let i = 0; i < 2; i++) for (let j = 0; j < 5; j++) if (!meq(o[i * 5 + j], A[(1 + i) * 5 + j])) return false;
       return true;
@@ -459,10 +521,10 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 6] },
     run: (A) => trans(trans(A, 2, 6), 6, 2),
     predicate: (A) => {
-      if (!meq(trans(trans(A, 2, 6), 6, 2), A)) return false;
+      if (!meq(runOf('C125')(A), A)) return false;
       const T = trans(A, 2, 6);
       for (let i = 0; i < 6; i++) for (let j = 0; j < 2; j++) if (!meq(T[i * 2 + j], A[j * 6 + i])) return false;
-      return true;
+      return meq(runOf('C125')(ones(2, 6)), ones(2, 6));   // 定点锚：全1双转置守恒
     },
   });
   reg(126, {
@@ -472,10 +534,10 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [4, 4] },
     run: (A) => diagOf(A, 4),
     predicate: (A) => {
-      const d = diagOf(A, 4);
+      const d = runOf('C126')(A);
       if (d.length !== 4) return false;
       for (let i = 0; i < 4; i++) if (!meq(d[i], A[i * 4 + i])) return false;
-      return true;
+      return meq(runOf('C126')(id(4)), Float64Array.from([1, 1, 1, 1]));   // 定点锚：diag(I)=(1,1,1,1)
     },
   });
   reg(127, {
@@ -485,7 +547,7 @@
     inputs: ['A'], domains: { A: 'matInt' }, matrixDims: { A: [2, 3] },
     run: (A) => padTo(A, 2, 3, 4, 5),
     predicate: (A) => {
-      const o = padTo(A, 2, 3, 4, 5);
+      const o = runOf('C127')(A);
       if (o.length !== 20) return false;
       for (let i = 0; i < 4; i++) for (let j = 0; j < 5; j++) {
         const want = (i < 2 && j < 3) ? A[i * 3 + j] : 0;
@@ -502,7 +564,7 @@
     matrixDims: { A: [2, 3], B: [2, 3], C: [2, 4], D: [2, 4] },
     run: (A, B, C, D) => hcat(vcat(A, B, 2, 3), vcat(C, D, 2, 4), 4, 3, 4),
     predicate: (A, B, C, D) => {
-      const o = hcat(vcat(A, B, 2, 3), vcat(C, D, 2, 4), 4, 3, 4);
+      const o = runOf('C128')(A, B, C, D);
       if (o.length !== 28) return false;
       for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) if (!meq(o[i * 7 + j], A[i * 3 + j])) return false;
       for (let i = 0; i < 2; i++) for (let j = 0; j < 4; j++) if (!meq(o[i * 7 + 3 + j], C[i * 4 + j])) return false;
