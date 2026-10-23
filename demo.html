@@ -18361,7 +18361,12 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       V.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
       if (q8) { Ks.push(new Float64Array(cap * KV)); Vs.push(new Float64Array(cap * KV)); }
     }
-    return { K, V, Ks, Vs, n: 0, q8, cap, sink };
+    // ALiBi：各缓存槽位对应的「绝对位置」。仅在 ALiBi 开启时分配，默认路径零开销、逐位不变。
+    //   为什么必需：ALiBi 偏置依赖 |qPos − keyPos|，而槽位与绝对位置在淘汰后会解耦
+    //   （RoPE 只依赖相对距离故幸免；Attention Sink 的锚点+滚动窗口还会把序列“截断”，
+    //    此时只有显式的 kv.pos 才能还原锚点到当前 token 的真实距离）。
+    const pos = model.alibi ? new Float64Array(cap) : null;
+    return { K, V, Ks, Vs, n: 0, q8, cap, sink, pos };
   }
 
   /**
@@ -18420,9 +18425,11 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       } else {
         for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
       }
+      // ALiBi：记录该槽位的绝对位置（attentionStep 用它算 |qPos − keyPos| 惩罚）
+      if (kv.pos) kv.pos[slot] = pos;
 
       // 4) 因果 + 滑动窗口 + Attention Sink 注意力（数学下沉到 L4.attention.attnStep）
-      const ctx = attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale);
+      const ctx = attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale, pos);
       let attn = mm(ctx, P[k + 'wproj'], 1, D, D);
       for (let j = 0; j < D; j++) attn[j] += P[k + 'bproj'].d[j];
       const xMid = new Float64Array(D);
@@ -18477,7 +18484,8 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
   /** 缓存淘汰（Attention Sink / 滑动窗口）：
    *  - sink>0（StreamingLLM）：恒驻 [0,sink) 锚点，仅平移窗口区 [sink, n) 左移 1，丢弃最旧的非锚点 token；
    *  - sink=0：整体平移（丢弃最旧 token，含首 token）—— 纯滑动窗口，逐位兼容旧行为。
-   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。 */
+   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。
+   *  ALiBi 的 kv.pos（绝对位置）同步平移 —— 否则偏置会按槽位距离而非真实距离计算。 */
   function kvShift(model, kv) {
     const { nLayer: L } = model.cfg;
     const kvDim = model.KV * model.dh, KV = model.KV;
@@ -18494,6 +18502,8 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
           kv.Vs[l].copyWithin(Kst, Ksf, Ksf + Ksc);
         }
       }
+      // 位置数组的每元素是 1 个数（不是 kvDim 个）：窗口区 [sink+1, n) -> [sink, n-1)，锚点不动
+      if (kv.pos) kv.pos.copyWithin(sink, sink + 1, n);
     } else {
       for (let l = 0; l < L; l++) {
         kv.K[l].copyWithin(0, kvDim, n * kvDim);
@@ -18503,6 +18513,7 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
           kv.Vs[l].copyWithin(0, KV, n * KV);
         }
       }
+      if (kv.pos) kv.pos.copyWithin(0, 1, n); // 整体左移 1
     }
     kv.n = n - 1;
   }
@@ -19478,8 +19489,26 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
     }
   }
 
+  /* ---- ALiBi 斜率表（Press et al. 2022；BLOOM / MPT 的相对位置偏置） ----
+   * slope[h] = 2^(−8h/n)，n 为不小于头数 H 的最小 2 的幂（标准 get_slopes 的分母取幂，
+   * 使斜率分布与头数解耦）。注意力打分前叠加常数偏置 −slope[h]·|i−j|：
+   *   ① 无参数、不依赖 Q/K ⇒ 反向经现有 softmaxBwd(dP, Pm)（Pm 已含偏置）自动正确；
+   *   ② 只依赖相对距离 ⇒ 与 KV 增量路径天然一致（配合 kv.pos 记录绝对位置即可跨淘汰成立）。
+   * 下标约定【0-based】：slope[0] = 2^0 = 1（惩罚最重的头）。此约定与 L10 微指令
+   *   μD045 / μD053 的参考实现逐位一致（注意 HF transformers 的 get_slopes 是
+   *   1-based：slope[h] = 2^(−8(h+1)/n)，比本实现整体「平移一格」；本项目以
+   *   微指令登记中心的已证数学为准，故取 0-based）。 */
+  function alibiSlopes(H) {
+    let n = 1;
+    while (n < H) n *= 2;                 // n = 2^ceil(log₂ H)
+    const s = new Float64Array(H);
+    for (let h = 0; h < H; h++) s[h] = Math.pow(2, -8 * h / n);
+    return s;
+  }
+
   NS.L4.positional.ROPE_BASE = ROPE_BASE;
   NS.L4.positional.ropeApply = ropeApply;
+  NS.L4.positional.alibiSlopes = alibiSlopes;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});
 
 /* L4 神经算子 · Softmax / Top-k
@@ -19567,9 +19596,10 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
    * @param win      该层滑动窗口宽度（0 = 全因果，GPT-2 原行为）
    * @param scale    注意力缩放（=1/sqrt(dh)）
    * @param attnScale YaRN 注意力温度（=1 恒等）
+   * @param slopes   ALiBi 逐头斜率（Float64Array(H)）；关闭时传 null/undefined（逐位兼容）
    * @returns {Ps, ctx} Ps 为各头 softmax 概率（反向复用），ctx 为 T×D 上下文
    */
-  function attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, win, scale, attnScale) {
+  function attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, win, scale, attnScale, slopes) {
     const ctx = new Float64Array(T * D);
     const Ps = [];
     for (let h = 0; h < H; h++) {
@@ -19586,6 +19616,8 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
           S[i * T + j] = s * scale * attnScale;
+          // ALiBi：把「距离惩罚」直接加到 softmax 前的打分上（−slope[h]·|i−j|；此处 j ≤ i）
+          if (slopes) S[i * T + j] -= slopes[h] * (i - j);
         }
         for (let j = 0; j < jLo; j++) S[i * T + j] = -1e9;  // 窗口左侧屏蔽（窗外历史）
         for (let j = i + 1; j < T; j++) S[i * T + j] = -1e9; // 未来位置屏蔽
@@ -19673,9 +19705,10 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
    * @param kv          KV 缓存对象（含 K/V/Ks/Vs）
    * @param slot        当前写入槽位；nValid 参与注意力的有效位置数（含当前）
    * @param D/H/dh/KV/kvDim/scale  形状配置
+   * @param pos     当前 token 的绝对位置（ALiBi 需要；省略时退化为刚写入槽位 kv.pos[slot]）
    * @returns ctx  Float64Array(D)
    */
-  function attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale) {
+  function attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale, pos) {
     const attnScale = model.attentionScaling || 1; // YaRN 注意力温度（与 forward 同因子）
     const Ko = kv.K[l], Vo = kv.V[l];
     const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
@@ -19685,6 +19718,10 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
     const attnLen = win + sinkCount;
     const ctx = new Float64Array(D);
     const kSc = kv.q8 ? kv.Ks[l] : null, vSc = kv.q8 ? kv.Vs[l] : null;
+    // ALiBi：逐头斜率 + 缓存槽位的绝对位置（kv.pos）。关闭时 slopes=null ⇒ 零开销、零数值影响。
+    const slopes = model.alibiSlopes || null;
+    const posArr = kv.pos || null;
+    const qPos = pos == null ? (posArr ? posArr[slot] : slot) : pos;
     for (let h = 0; h < H; h++) {
       const kvh = (h / model.g) | 0;
       const S = new Float64Array(attnLen);
@@ -19694,13 +19731,16 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
         const ks = kSc ? kSc[j * KV + kvh] : 1;
         let s = 0;
         for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-        S[si++] = s * scale * attnScale;
+        const bias = slopes ? slopes[h] * (qPos - (posArr ? posArr[j] : j)) : 0;
+        S[si++] = s * scale * attnScale - bias; // −slope·|qPos − keyPos|（窗口内 j ≤ qPos）
       }
       for (let j = 0; j < sinkCount; j++) {
         const ks = kSc ? kSc[j * KV + kvh] : 1;
         let s = 0;
         for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-        S[si++] = s * scale * attnScale;
+        // Attention Sink 锚点：它们在缓存里的绝对位置由 kv.pos[j] 记录（恒为 0..sinkCount-1）
+        const bias = slopes ? slopes[h] * (qPos - (posArr ? posArr[j] : j)) : 0;
+        S[si++] = s * scale * attnScale - bias;
       }
       const Pm = softmaxRows(S, 1, attnLen);
       for (let p = 0; p < dh; p++) {
@@ -19987,7 +20027,8 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       if (model.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim, model.ropeFreqScale);
       const scale = 1 / Math.sqrt(dh);
       const attnScale = model.attentionScaling; // YaRN 注意力温度（=1 恒等）
-      const { Ps, ctx } = attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, model.windows[l], scale, attnScale);
+      // ALiBi：把逐头斜率交给注意力算子在其打分上加 −slope·距离（关闭时为 undefined ⇒ 逐位兼容）
+      const { Ps, ctx } = attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, model.windows[l], scale, attnScale, model.alibiSlopes);
       let attn = mm(ctx, P[k + 'wproj'], T, D, D);
       for (let i = 0; i < T; i++) {
         const o = i * D;
@@ -20152,6 +20193,7 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
   NS.L3.gpt_model = NS.L3.gpt_model || {};
   const { mulberry32, randn } = NS.L9.rng;
   const ROPE_BASE = NS.L4.positional.ROPE_BASE;
+  const alibiSlopes = NS.L4.positional.alibiSlopes;
   const { isQuantLinear } = NS.L8.matmul;
 
   class GPTModel {
@@ -20172,7 +20214,12 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
      *   稳定化开关（Gemma 2 配方，默认全关 = 逐位兼容旧模型）：
      *   qkNorm:  true 时对每个头的 Q/K 向量做 RMSNorm（RoPE 前，增益 head_dim 维跨头共享）
      *   logitCap: 最终 logits 软帽 logits = cap·tanh(logits/cap)（Gemma 2 用 30；0 = 不启用）
+     *   Attention Sink 开关：attentionSink（恒驻首 K 个 token，0=关闭，默认）/ rollingWindow
      *   kvQuant: KV 缓存量化（8 = INT8，per-(token,KV头) 对称 absmax；0 = Float64，默认）
+     *   ALiBi（第 7 套位置表示）：alibi:true 时启用「注意力打分上的线性距离惩罚」
+     *      −slope[h]·|i−j|，并**取代一切位置编码**（useRope=false 且不创建 posEmb）。
+     *      斜率按 L10 微指令 μD045/μD053 的闭式计算：slope[h] = 2^(−8h/n)，
+     *      n = 不小于 H 的最小 2 的幂（0-based，slope[0]=1 惩罚最重）。
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -20180,7 +20227,10 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       }
       this.cfg = Object.assign({ seed: 42, norm: 'ln', ffn: 'gelu', pos: 'learned' }, cfg);
       const { vocabSize: V, blockSize: T, nLayer: L, nHead: H, dModel: D } = this.cfg;
-      if (this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
+      // ALiBi（第 7 套位置表示，BLOOM/MPT 年代 Assign）：置位后取代一切位置编码。
+      //   放在最前面判定，因为下面的 RoPE 合法性检查与其后的 posEmb 分配都要让位。
+      this.alibi = !!this.cfg.alibi;
+      if (!this.alibi && this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
         throw new Error(`RoPE 要求每个 head 维度 dh=${D / H} 为偶数`);
       }
       // GQA（分组查询注意力）：KV 头数可小于 Q 头数（LLaMA-2/3 标准）。
@@ -20191,7 +20241,9 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       }
       const dh = D / H;
       this.KV = KV; this.dh = dh; this.g = H / KV; this.qkvDim = D + 2 * KV * dh;
-      this.useRope = this.cfg.pos === 'rope';
+      // ALiBi 取代位置编码：即使 cfg.pos 仍写着 'rope'，也不再旋转（BLOOM/MPT 的发表设计）
+      this.useRope = !this.alibi && this.cfg.pos === 'rope';
+      this.alibiSlopes = this.alibi ? alibiSlopes(H) : null; // 逐头斜率（关闭时 null ⇒ 零开销）
       this.useRms = this.cfg.norm === 'rmsnorm';
       this.useSwi = this.cfg.ffn === 'swiglu';
       this.fh = this.cfg.ffnHidden || 4 * D;
@@ -20282,7 +20334,8 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
         P[name] = p;
       };
       add('tokEmb', V, D);
-      if (!this.useRope) add('posEmb', T, D); // RoPE 不需要位置嵌入
+      // ALiBi 模型无位置嵌入：位置信息完全由注意力上的距离偏置提供（省 T·D 个参数）
+      if (!this.useRope && !this.alibi) add('posEmb', T, D); // RoPE / ALiBi 都不需要位置嵌入
       const rscale = 1 / Math.sqrt(2 * L); // GPT-2：按残差深度缩放输出投影初始化
       const FH = this.fh;
       for (let l = 0; l < L; l++) {
@@ -20342,6 +20395,7 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
       m.window = this.window; m.windows = this.windows.slice();
       m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant; m.attentionSink = this.attentionSink;
       m.ropeFreqScale = this.ropeFreqScale; m.attentionScaling = this.attentionScaling;
+      m.alibi = this.alibi; m.alibiSlopes = this.alibiSlopes; // ALiBi 斜率是常量表，无需量化，直接共享
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
@@ -20401,6 +20455,10 @@ footer .foot-badges { display: flex; gap: var(--sp-2); justify-content: center; 
     swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
     // Gemma 2/3 完整配方：LLaMA 基座 + GQA + 局部/全局层交错 + QK-norm + logit soft-cap 30。
     gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 }, qkNorm: true, logitCap: 30 },
+    // BLOOM / MPT 风格：ALiBi 取代一切位置编码（无 RoPE、无可学习位置嵌入）+ LayerNorm + GELU。
+    //   alibi:true 时 GPTModel 强制 useRope=false 且不创建 posEmb —— 这是 BLOOM/MPT 的发表设计：
+    //   位置信息完全由「注意力打分上的线性距离惩罚」提供，反而获得更强的长度外推能力。
+    bloom: { norm: 'ln', ffn: 'gelu', alibi: true },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {

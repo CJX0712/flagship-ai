@@ -53,6 +53,24 @@
     }
   }
 
+  /* ---- ALiBi 斜率表（Press et al. 2022；BLOOM / MPT 的相对位置偏置） ----
+   * slope[h] = 2^(−8h/n)，n 为不小于头数 H 的最小 2 的幂（标准 get_slopes 的分母取幂，
+   * 使斜率分布与头数解耦）。注意力打分前叠加常数偏置 −slope[h]·|i−j|：
+   *   ① 无参数、不依赖 Q/K ⇒ 反向经现有 softmaxBwd(dP, Pm)（Pm 已含偏置）自动正确；
+   *   ② 只依赖相对距离 ⇒ 与 KV 增量路径天然一致（配合 kv.pos 记录绝对位置即可跨淘汰成立）。
+   * 下标约定【0-based】：slope[0] = 2^0 = 1（惩罚最重的头）。此约定与 L10 微指令
+   *   μD045 / μD053 的参考实现逐位一致（注意 HF transformers 的 get_slopes 是
+   *   1-based：slope[h] = 2^(−8(h+1)/n)，比本实现整体「平移一格」；本项目以
+   *   微指令登记中心的已证数学为准，故取 0-based）。 */
+  function alibiSlopes(H) {
+    let n = 1;
+    while (n < H) n *= 2;                 // n = 2^ceil(log₂ H)
+    const s = new Float64Array(H);
+    for (let h = 0; h < H; h++) s[h] = Math.pow(2, -8 * h / n);
+    return s;
+  }
+
   NS.L4.positional.ROPE_BASE = ROPE_BASE;
   NS.L4.positional.ropeApply = ropeApply;
+  NS.L4.positional.alibiSlopes = alibiSlopes;
 })(globalThis.FlagshipAI = globalThis.FlagshipAI || {});

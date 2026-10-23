@@ -4,7 +4,7 @@
 
 **零依赖纯 JavaScript 手写 GPT 引擎 — 从字符到生成，每一行都可验证**
 
-[![Version](https://img.shields.io/badge/version-v15.9-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.10-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#自检套件12-项全绿)
 [![Layer Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#十层分解架构落地状态)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#十层分解架构落地状态)
@@ -27,7 +27,7 @@
 
 ## 📑 目录
 
-- [这是什么（v3.0 → v15.7 版本演进）](#这是什么)
+- [这是什么（v3.0 → v15.10 版本演进）](#这是什么)
 - [自检套件（12 项全绿）](#自检套件12-项全绿)
 - [性能](#性能)
   - [一键基准报告](#一键基准报告)
@@ -164,6 +164,22 @@
 | **全组合兼容** | — | 与 KV INT8、SWA、Attention Sink/StreamingLLM、INT8 权重、GQA、MoE、QK-norm、soft-cap 任意组合均经探针验证；`ropeScale` 缺省或 `factor≤1` 逐位等价于旧版 RoPE |
 
 > 核心不变量（详见 `scripts/probe-yarn.js` 5 项全绿）：`factor=1` 与缺省配置逐位等价（Δ=0）；`forward` 与 `forwardStep` 在 YaRN 下逐位一致（Δ=0）；`factor>1` 中心差分梯度检验 maxErr/Tol≤1；`mscale` 公式精确（`0.1·ln(4)/ln(2)=0.2`）；`freqScale∈[1/factor,1]` 且非递减；`pos≫blockSize`（如 3000）输出有限且同输入确定性 Δ=0。
+
+### v15.10 新增（ALiBi 线性距离偏置 · 第 7 套位置表示）
+
+第 7 套位置/注意力写法：**不加位置嵌入、不做旋转**，而是把「距离惩罚」直接打进注意力打分里。
+
+| 能力 | 复用来源 | 说明 |
+|---|---|---|
+| **ALiBi 偏置** | Press et al., 2022（ALiBi）· BLOOM / MPT | softmax 前打分加 `−slope[h]·|i−j|`；无参数、不依赖 Q/K ⇒ `softmaxBwd` 已含偏置，**注意力反向零改动** |
+| **斜率闭式** | ALiBi `get_slopes` | `slope[h] = 2^(−8h/n)`，`n` = 不小于头数的最小 2 的幂；**0-based**（`slope[0]=1` 惩罚最重），与 L10 微指令 μD045 / μD053 参考实现逐位一致 |
+| **取代位置编码** | BLOOM / MPT 的发表设计 | `alibi:true` 时强制 `useRope=false` 且**不创建 `posEmb`**，省 `blockSize·dModel` 个参数；`applyPreset(cfg,'bloom')` 一行启用（LayerNorm + GELU + ALiBi） |
+| **双端逐位一致（含淘汰后）** | — | 缓存槽位原本与绝对位置解耦，`kvShift` 后映射会丢失（RoPE 因只依赖相对距离而幸存，ALiBi 不是）⇒ 新增 `kv.pos` 记录每槽绝对位置，并与 K/V（及 INT8 scale）同步平移 |
+| **关闭零回归** | — | ALiBi 默认关闭；关闭时 `slopes=null`、`kv.pos` 不分配 ⇒ 与 legacy（未改动的老代码）前向与增量路径 **Δ=0** |
+
+> 核心不变量（`scripts/probe-alibi.js` 13 项全绿）：斜率与 μD045/μD053 `run` 逐位一致；零 qkv 下 `log(pⱼ/p₀)=slope·j`（证明偏置真的进了 softmax）；`forward ≡ forwardStep` 在短序列/滑动窗口/**500 token 淘汰后（cap=16）**/锚点+滚动窗口下均 Δ=0；**整体平移不变**（同一序列从绝对位置 1000 起跑逐位相同）——这条能抓住"拿槽位当位置"的实现；中心差分梯度检验 err/tol=4.68e-3 ≤ 1；并把引擎斜率喂给 μD045–μD056 / μD112 / μD113 / μD114 / μD117 / μD119 的 `run` 与 `predicate` 逐项通过。已做过**故障注入自检**：把 `kv.pos[slot]` 改成 `slot` 后 5c/5d 立即转红，证明这两项不是空跑。
+
+> ⚠️ 下标约定说明：HF `transformers` 的 `get_slopes` 是 **1-based**（`slope[h]=2^(−8(h+1)/n)`），本项目按任务要求以**微指令登记中心的已证数学**为准取 **0-based**。二者是同一几何级数错一格的关系，选 0-based 才能与 μD045/μD053 的 `run` 输出做逐位对拷。
 
 ### v15.9 新增（bench:full 参数对齐全现代架构对照）
 
@@ -361,6 +377,7 @@ D 域由 96 补满至 128，在 D001–D096 原子操作之上覆盖**组装 / �
 | 真实浏览器门禁 | `npm run test:demo-browser` | Playwright headless Chromium 直开 demo.html：十层栈装配 · L10 1024/1024 · 微指令浏览器 DOM/筛选/七件套 · 批量 1024×8 谓词全绿 · 产出截图 |
 | 层 lint | `npm run lint` | `src/L*` 浏览器红线 0 违例 |
 | 性质测试 | `npm run test:layers` | A/B/C/D/E/F/G/H 八域每项 ≥120 例 fast-check 任意子谓词检验 |
+| ALiBi 门禁 | `npm run test:alibi` | **13 项全绿**（斜率闭式 ≡ μD045/μD053 · 偏置矩阵五性质 · 零 qkv 复原 `log(pⱼ/p₀)=slope·j` · 几何衰减 μD112 · 关闭时与 legacy Δ=0 · 有效性非摆设 · 双端逐位一致 4 场景（含 500 token 淘汰后与锚点+滚动）· 中心差分梯度检验 ≤1 · 微指令交叉验证） |
 
 | 组件 | 复用来源 | 论文 |
 |---|---|---|
@@ -535,7 +552,7 @@ const out8 = F.generate(m8, tok, '旗舰', { maxTokens: 40, temperature: 0.9 });
 | `Tokenizer` | `new Tokenizer(text)` → `.encode(str)`, `.decode(ids)`, `.vocabSize` | 字符级，未知字符跳过 |
 | `BPETokenizer` | `new BPETokenizer(text, vocabSize?, {minPairFreq, byteLevel})` | BPE 分词；`byteLevel:true`=256 字节基元（GPT-2 标准），`false`=字符级（中文更省 token）；`.encode`/`.decode`/`.vocabSize` 接口同 `Tokenizer` |
 | `GPTModel` | `new GPTModel(cfg)` → `.forward(tokens)`, `.backward(cache, dlogits)`, `.params`, `.grads`, `.paramCount()`, `.evaluate(tokens)` | cfg: `vocabSize/blockSize/nLayer/nHead/dModel/seed` + 架构开关 `norm('ln'\|'rmsnorm')` / `ffn('gelu'\|'swiglu')` / `pos('learned'\|'rope')` / `ffnHidden` / `nKvHead`（KV 头数，默认=`nHead` 即 MHA；`<nHead` 启用 GQA） + MoE 开关 `nExp`（专家数，默认 1=稠密）/ `topK`（激活专家数，默认 1）/ `auxWeight`（负载均衡权重，MoE 默认 0.01） + 稀疏注意力开关 `window`（标量=所有层同窗；数组=逐层窗口，长度须=nLayer；`{alt:N}`=偶数层全局/奇数层窗口 N；默认 0=全因果） + 稳定化开关 `qkNorm`（Q/K 逐头 RMSNorm，RoPE 前，默认 false）/ `logitCap`（logit 软帽 `cap·tanh(x/cap)`，默认 0=不启用）/ `kvQuant`（KV 缓存 INT8 量化，8=启用；0=关闭，默认）/ `attentionSink`（Attention Sink 锚点数，K>0=恒驻首 K 个 token 支持无限上下文流式推理；0=关闭，默认）/ `rollingWindow`（滚动窗口大小，sink>0 时与 SWA `window` 同为滚动边界，默认 256）/ `ropeScale`（YaRN 长度外推：`{type:'yarn'|'ntk', factor>1, originalMaxLength}`；`type:'yarn'`=NTK-by-parts RoPE 频率插值 + 注意力温度 mscale，`'ntk'`=全局基频缩放；`factor≤1` 或省略=恒等） |
-| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64},qkNorm:true,logitCap:30}`（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
+| `applyPreset` / `ARCH_PRESETS` | `applyPreset(cfg, 'gpt2'\|'llama'\|'llama-gqa'\|'mixtral'\|'swa'\|'gemma'\|'bloom')` | 一键套用预设：`gpt2={ln,gelu,learned}`、`llama={rmsnorm,swiglu,rope}`、`llama-gqa={rmsnorm,swiglu,rope,nKvHead:2}`、`mixtral={rmsnorm,swiglu,rope,nKvHead:2,nExp:4,topK:2,auxWeight:0.01}`、`swa={rmsnorm,swiglu,rope,nKvHead:2,window:64}`、`gemma={rmsnorm,swiglu,rope,nKvHead:2,window:{alt:64},qkNorm:true,logitCap:30}`、`bloom={ln,gelu,alibi:true}`（ALiBi 取代位置编码，无 posEmb / 无 RoPE）（preset 会覆盖同名 cfg 项，需改回请在其后再赋值） |
 | `model.quantize()` | `model.quantize()` → 量化副本（含 `.q`/`.scale`） | INT8 weight-only PTQ：线性权重转 Int8 常驻（稠密 wqkv/wproj/w1/w2、MoE 路由 wg 与专家 e*.w1/w2、嵌入），推理时内联解量化；原模型不变；`saveModel` 自动编码为 `{q,s}` |
 | `train` | `train(model, tokens, opts)` → `{history, finalLoss, state}` | opts: `steps/lr/batch/warmup/seed/wd/gradClip`；`state+stepOffset+totalSteps` 支持断点续训 |
 | `generate` | `generate(model, tok, prompt, opts)` → `{text, ids}` | opts: `maxNew`(别名 `maxTokens`) / `temperature` / `topK` / `topP` / `seed` / `useCache` |
@@ -567,6 +584,8 @@ flagship-ai/
 │   ├── L1-app/              # 应用层：demo-app（已接入 __loadOrder）
 │   └── L0-boot/             # 引导装配：assemble（34 键映射 + K15 逐名门禁 + 注册中心自举，已接入）
 ├── tests/                   # node:test + fast-check 性质测试（L3–L10 各层）
+├── scripts/probe-alibi.js   # v15.10 ALiBi 专项：斜率闭式 / 偏置矩阵 / 几何衰减 / 关闭 Δ=0 / 双端逐位（含淘汰后）/ 梯度检验 / 微指令交叉验证
+├── scripts/probe-demo.js    # 浏览器装配门禁（9 项，含前向双端逐位一致）
 ├── scripts/build-demo.js    # 把十层栈+套件+应用内联进 demo.html（mini-require 双端同码）
 ├── scripts/isa.js           # 微指令覆盖率 CLI（逐域 impl/capacity 断言）
 ├── scripts/probe-v3.js      # v3 对照实验：BPE / 多架构梯度检验 / RoPE 不变性

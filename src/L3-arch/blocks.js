@@ -63,7 +63,8 @@
       if (model.useRope) ropeApply(qkv, T, D, H, dh, 0, 1, KV, qkvDim, model.ropeFreqScale);
       const scale = 1 / Math.sqrt(dh);
       const attnScale = model.attentionScaling; // YaRN 注意力温度（=1 恒等）
-      const { Ps, ctx } = attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, model.windows[l], scale, attnScale);
+      // ALiBi：把逐头斜率交给注意力算子在其打分上加 −slope·距离（关闭时为 undefined ⇒ 逐位兼容）
+      const { Ps, ctx } = attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, model.windows[l], scale, attnScale, model.alibiSlopes);
       let attn = mm(ctx, P[k + 'wproj'], T, D, D);
       for (let i = 0; i < T; i++) {
         const o = i * D;

@@ -22,9 +22,10 @@
    * @param win      该层滑动窗口宽度（0 = 全因果，GPT-2 原行为）
    * @param scale    注意力缩放（=1/sqrt(dh)）
    * @param attnScale YaRN 注意力温度（=1 恒等）
+   * @param slopes   ALiBi 逐头斜率（Float64Array(H)）；关闭时传 null/undefined（逐位兼容）
    * @returns {Ps, ctx} Ps 为各头 softmax 概率（反向复用），ctx 为 T×D 上下文
    */
-  function attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, win, scale, attnScale) {
+  function attnFwd(qkv, T, D, H, dh, qkvDim, KV, g, win, scale, attnScale, slopes) {
     const ctx = new Float64Array(T * D);
     const Ps = [];
     for (let h = 0; h < H; h++) {
@@ -41,6 +42,8 @@
           let s = 0;
           for (let p = 0; p < dh; p++) s += qkv[qi + p] * qkv[kj + p];
           S[i * T + j] = s * scale * attnScale;
+          // ALiBi：把「距离惩罚」直接加到 softmax 前的打分上（−slope[h]·|i−j|；此处 j ≤ i）
+          if (slopes) S[i * T + j] -= slopes[h] * (i - j);
         }
         for (let j = 0; j < jLo; j++) S[i * T + j] = -1e9;  // 窗口左侧屏蔽（窗外历史）
         for (let j = i + 1; j < T; j++) S[i * T + j] = -1e9; // 未来位置屏蔽
@@ -128,9 +131,10 @@
    * @param kv          KV 缓存对象（含 K/V/Ks/Vs）
    * @param slot        当前写入槽位；nValid 参与注意力的有效位置数（含当前）
    * @param D/H/dh/KV/kvDim/scale  形状配置
+   * @param pos     当前 token 的绝对位置（ALiBi 需要；省略时退化为刚写入槽位 kv.pos[slot]）
    * @returns ctx  Float64Array(D)
    */
-  function attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale) {
+  function attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale, pos) {
     const attnScale = model.attentionScaling || 1; // YaRN 注意力温度（与 forward 同因子）
     const Ko = kv.K[l], Vo = kv.V[l];
     const win = model.windows[l] > 0 ? Math.min(model.windows[l], nValid) : nValid;
@@ -140,6 +144,10 @@
     const attnLen = win + sinkCount;
     const ctx = new Float64Array(D);
     const kSc = kv.q8 ? kv.Ks[l] : null, vSc = kv.q8 ? kv.Vs[l] : null;
+    // ALiBi：逐头斜率 + 缓存槽位的绝对位置（kv.pos）。关闭时 slopes=null ⇒ 零开销、零数值影响。
+    const slopes = model.alibiSlopes || null;
+    const posArr = kv.pos || null;
+    const qPos = pos == null ? (posArr ? posArr[slot] : slot) : pos;
     for (let h = 0; h < H; h++) {
       const kvh = (h / model.g) | 0;
       const S = new Float64Array(attnLen);
@@ -149,13 +157,16 @@
         const ks = kSc ? kSc[j * KV + kvh] : 1;
         let s = 0;
         for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-        S[si++] = s * scale * attnScale;
+        const bias = slopes ? slopes[h] * (qPos - (posArr ? posArr[j] : j)) : 0;
+        S[si++] = s * scale * attnScale - bias; // −slope·|qPos − keyPos|（窗口内 j ≤ qPos）
       }
       for (let j = 0; j < sinkCount; j++) {
         const ks = kSc ? kSc[j * KV + kvh] : 1;
         let s = 0;
         for (let p = 0; p < dh; p++) s += qkv[h * dh + p] * (Ko[j * kvDim + kvh * dh + p] * ks);
-        S[si++] = s * scale * attnScale;
+        // Attention Sink 锚点：它们在缓存里的绝对位置由 kv.pos[j] 记录（恒为 0..sinkCount-1）
+        const bias = slopes ? slopes[h] * (qPos - (posArr ? posArr[j] : j)) : 0;
+        S[si++] = s * scale * attnScale - bias;
       }
       const Pm = softmaxRows(S, 1, attnLen);
       for (let p = 0; p < dh; p++) {

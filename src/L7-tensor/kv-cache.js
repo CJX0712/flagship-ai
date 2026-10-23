@@ -53,7 +53,12 @@
       V.push(q8 ? new Int8Array(cap * kvDim) : new Float64Array(cap * kvDim));
       if (q8) { Ks.push(new Float64Array(cap * KV)); Vs.push(new Float64Array(cap * KV)); }
     }
-    return { K, V, Ks, Vs, n: 0, q8, cap, sink };
+    // ALiBi：各缓存槽位对应的「绝对位置」。仅在 ALiBi 开启时分配，默认路径零开销、逐位不变。
+    //   为什么必需：ALiBi 偏置依赖 |qPos − keyPos|，而槽位与绝对位置在淘汰后会解耦
+    //   （RoPE 只依赖相对距离故幸免；Attention Sink 的锚点+滚动窗口还会把序列“截断”，
+    //    此时只有显式的 kv.pos 才能还原锚点到当前 token 的真实距离）。
+    const pos = model.alibi ? new Float64Array(cap) : null;
+    return { K, V, Ks, Vs, n: 0, q8, cap, sink, pos };
   }
 
   /**
@@ -112,9 +117,11 @@
       } else {
         for (let j = 0; j < kvDim; j++) { Ko[o + j] = qkv[D + j]; Vo[o + j] = qkv[D + KV * dh + j]; }
       }
+      // ALiBi：记录该槽位的绝对位置（attentionStep 用它算 |qPos − keyPos| 惩罚）
+      if (kv.pos) kv.pos[slot] = pos;
 
       // 4) 因果 + 滑动窗口 + Attention Sink 注意力（数学下沉到 L4.attention.attnStep）
-      const ctx = attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale);
+      const ctx = attnStep(model, l, qkv, kv, slot, nValid, D, H, dh, KV, kvDim, scale, pos);
       let attn = mm(ctx, P[k + 'wproj'], 1, D, D);
       for (let j = 0; j < D; j++) attn[j] += P[k + 'bproj'].d[j];
       const xMid = new Float64Array(D);
@@ -169,7 +176,8 @@
   /** 缓存淘汰（Attention Sink / 滑动窗口）：
    *  - sink>0（StreamingLLM）：恒驻 [0,sink) 锚点，仅平移窗口区 [sink, n) 左移 1，丢弃最旧的非锚点 token；
    *  - sink=0：整体平移（丢弃最旧 token，含首 token）—— 纯滑动窗口，逐位兼容旧行为。
-   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。 */
+   *  K/V 与（kvQuant=8 时）scale 同步平移，解量化不错位。
+   *  ALiBi 的 kv.pos（绝对位置）同步平移 —— 否则偏置会按槽位距离而非真实距离计算。 */
   function kvShift(model, kv) {
     const { nLayer: L } = model.cfg;
     const kvDim = model.KV * model.dh, KV = model.KV;
@@ -186,6 +194,8 @@
           kv.Vs[l].copyWithin(Kst, Ksf, Ksf + Ksc);
         }
       }
+      // 位置数组的每元素是 1 个数（不是 kvDim 个）：窗口区 [sink+1, n) -> [sink, n-1)，锚点不动
+      if (kv.pos) kv.pos.copyWithin(sink, sink + 1, n);
     } else {
       for (let l = 0; l < L; l++) {
         kv.K[l].copyWithin(0, kvDim, n * kvDim);
@@ -195,6 +205,7 @@
           kv.Vs[l].copyWithin(0, KV, n * KV);
         }
       }
+      if (kv.pos) kv.pos.copyWithin(0, 1, n); // 整体左移 1
     }
     kv.n = n - 1;
   }

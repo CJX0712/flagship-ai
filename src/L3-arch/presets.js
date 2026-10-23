@@ -18,6 +18,10 @@
     swa: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: 64 },
     // Gemma 2/3 完整配方：LLaMA 基座 + GQA + 局部/全局层交错 + QK-norm + logit soft-cap 30。
     gemma: { norm: 'rmsnorm', ffn: 'swiglu', pos: 'rope', nKvHead: 2, window: { alt: 64 }, qkNorm: true, logitCap: 30 },
+    // BLOOM / MPT 风格：ALiBi 取代一切位置编码（无 RoPE、无可学习位置嵌入）+ LayerNorm + GELU。
+    //   alibi:true 时 GPTModel 强制 useRope=false 且不创建 posEmb —— 这是 BLOOM/MPT 的发表设计：
+    //   位置信息完全由「注意力打分上的线性距离惩罚」提供，反而获得更强的长度外推能力。
+    bloom: { norm: 'ln', ffn: 'gelu', alibi: true },
   };
   /** 把预设叠到配置上：applyPreset(cfg, 'llama') */
   function applyPreset(cfg, preset) {

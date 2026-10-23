@@ -4,7 +4,7 @@
 
 **A zero-dependency, single-file GPT engine in pure JavaScript — from characters to generation, every line verifiable**
 
-[![Version](https://img.shields.io/badge/version-v15.9-blue)](#)
+[![Version](https://img.shields.io/badge/version-v15.10-blue)](#)
 [![Self-check](https://img.shields.io/badge/selfcheck-12%2F12-brightgreen)](#verification)
 [![Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#verification)
 [![ISA](https://img.shields.io/badge/ISA-1024%2F1024-blue)](#capabilities)
@@ -37,7 +37,8 @@ A **zero-dependency, single-file** GPT language model, implemented end to end �
 |---|---|---|
 | **Tokenizers** | Char-level + BPE (`byteLevel` on/off), lossless round-trip | GPT-2 byte-level BPE |
 | **Backbone** | Decoder-only Transformer, hand-written forward + backward, AdamW (warmup, wd, grad-clip, resume) | GPT-2 |
-| **Norm / FFN / Pos** | `ln`\|`rmsnorm` · `gelu`\|`swiglu` · `learned`\|`rope` — one-line presets | LLaMA modern recipe |
+| **Norm / FFN / Pos** | `ln`\|`rmsnorm` · `gelu`\|`swiglu` · `learned`\|`rope` · **ALiBi** (`alibi:true`, replaces positional encoding entirely) — one-line presets | LLaMA modern recipe, ALiBi / BLOOM / MPT |
+| **ALiBi (v15.10)** | Linear distance bias `−slope[h]·\|i−j\|` added to attention logits, `slope[h]=2^(−8h/n)` (0-based, `n` = next power of two); parameter-free ⇒ backwards needs no change. `kv.pos` tracks absolute positions across `kvShift` eviction so streaming stays bit-exact | Press et al., 2022 |
 | **Attention** | MHA / **GQA** (`nKvHead`) · **sliding-window** & **interleaved** sparse (`window`) | LLaMA-2/3, Mistral, Gemma 2/3 |
 | **Stabilizers** | Per-head **QK-norm**, **logit soft-cap** (`cap·tanh(x/cap)`) | Gemma 2 |
 | **MoE** | N experts + **top-k** routing + **load-balancing aux loss** | Mixtral / DeepSeek |
@@ -49,7 +50,7 @@ A **zero-dependency, single-file** GPT language model, implemented end to end �
 | **Micro-ISA (L10)** | **1024-slot registry, 8 domains A–H × 128, all 1024 implemented** — each op ships intuition / math / pseudocode / complexity / reference / pitfall / invariant + `run` + `predicate` | — |
 | **Dual-end** | Node and browser share one codebase; forward is **bit-identical** across both | — |
 
-Full version-by-version changelog (v3.0 → v15.9) lives in the [Chinese README](README.md).
+Full version-by-version changelog (v3.0 → v15.10) lives in the [Chinese README](README.md).
 
 ## Verification
 

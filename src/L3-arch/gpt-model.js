@@ -12,6 +12,7 @@
   NS.L3.gpt_model = NS.L3.gpt_model || {};
   const { mulberry32, randn } = NS.L9.rng;
   const ROPE_BASE = NS.L4.positional.ROPE_BASE;
+  const alibiSlopes = NS.L4.positional.alibiSlopes;
   const { isQuantLinear } = NS.L8.matmul;
 
   class GPTModel {
@@ -32,7 +33,12 @@
      *   稳定化开关（Gemma 2 配方，默认全关 = 逐位兼容旧模型）：
      *   qkNorm:  true 时对每个头的 Q/K 向量做 RMSNorm（RoPE 前，增益 head_dim 维跨头共享）
      *   logitCap: 最终 logits 软帽 logits = cap·tanh(logits/cap)（Gemma 2 用 30；0 = 不启用）
+     *   Attention Sink 开关：attentionSink（恒驻首 K 个 token，0=关闭，默认）/ rollingWindow
      *   kvQuant: KV 缓存量化（8 = INT8，per-(token,KV头) 对称 absmax；0 = Float64，默认）
+     *   ALiBi（第 7 套位置表示）：alibi:true 时启用「注意力打分上的线性距离惩罚」
+     *      −slope[h]·|i−j|，并**取代一切位置编码**（useRope=false 且不创建 posEmb）。
+     *      斜率按 L10 微指令 μD045/μD053 的闭式计算：slope[h] = 2^(−8h/n)，
+     *      n = 不小于 H 的最小 2 的幂（0-based，slope[0]=1 惩罚最重）。
      */
     constructor(cfg) {
       if (cfg.dModel % cfg.nHead !== 0) {
@@ -40,7 +46,10 @@
       }
       this.cfg = Object.assign({ seed: 42, norm: 'ln', ffn: 'gelu', pos: 'learned' }, cfg);
       const { vocabSize: V, blockSize: T, nLayer: L, nHead: H, dModel: D } = this.cfg;
-      if (this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
+      // ALiBi（第 7 套位置表示，BLOOM/MPT 年代 Assign）：置位后取代一切位置编码。
+      //   放在最前面判定，因为下面的 RoPE 合法性检查与其后的 posEmb 分配都要让位。
+      this.alibi = !!this.cfg.alibi;
+      if (!this.alibi && this.cfg.pos === 'rope' && (D / H) % 2 !== 0) {
         throw new Error(`RoPE 要求每个 head 维度 dh=${D / H} 为偶数`);
       }
       // GQA（分组查询注意力）：KV 头数可小于 Q 头数（LLaMA-2/3 标准）。
@@ -51,7 +60,9 @@
       }
       const dh = D / H;
       this.KV = KV; this.dh = dh; this.g = H / KV; this.qkvDim = D + 2 * KV * dh;
-      this.useRope = this.cfg.pos === 'rope';
+      // ALiBi 取代位置编码：即使 cfg.pos 仍写着 'rope'，也不再旋转（BLOOM/MPT 的发表设计）
+      this.useRope = !this.alibi && this.cfg.pos === 'rope';
+      this.alibiSlopes = this.alibi ? alibiSlopes(H) : null; // 逐头斜率（关闭时 null ⇒ 零开销）
       this.useRms = this.cfg.norm === 'rmsnorm';
       this.useSwi = this.cfg.ffn === 'swiglu';
       this.fh = this.cfg.ffnHidden || 4 * D;
@@ -142,7 +153,8 @@
         P[name] = p;
       };
       add('tokEmb', V, D);
-      if (!this.useRope) add('posEmb', T, D); // RoPE 不需要位置嵌入
+      // ALiBi 模型无位置嵌入：位置信息完全由注意力上的距离偏置提供（省 T·D 个参数）
+      if (!this.useRope && !this.alibi) add('posEmb', T, D); // RoPE / ALiBi 都不需要位置嵌入
       const rscale = 1 / Math.sqrt(2 * L); // GPT-2：按残差深度缩放输出投影初始化
       const FH = this.fh;
       for (let l = 0; l < L; l++) {
@@ -202,6 +214,7 @@
       m.window = this.window; m.windows = this.windows.slice();
       m.qkNorm = this.qkNorm; m.logitCap = this.logitCap; m.kvQuant = this.kvQuant; m.attentionSink = this.attentionSink;
       m.ropeFreqScale = this.ropeFreqScale; m.attentionScaling = this.attentionScaling;
+      m.alibi = this.alibi; m.alibiSlopes = this.alibiSlopes; // ALiBi 斜率是常量表，无需量化，直接共享
       m.params = {};
       for (const key in this.params) {
         const p = this.params[key];
