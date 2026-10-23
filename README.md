@@ -169,7 +169,7 @@
 
 **发现的系统性缺陷**：门禁只调 `op.predicate(...args)`，**从不调 `op.run`**（`tests/lib/op-harness.js:43`、`scripts/probe-microisa.js:106`）。A–E 五域 640 项谓词中，存在大量「把 run 的定义式内联复算、或直调 run 内部的底层 helper」的自比断言 —— run 若被改坏，门禁完全失明（假绿）。**E 域最严重：128/128 项谓词全部直接调 `NS.L7.shape.*` 或本地 helper，从不调本 op 的 run**，即整域彻底假绿。
 
-**修复范围**（A-scalar-000~003、B-vector-000~003、C-matrix-000~003、D-attention-000~003、E-shape-000~003 共 20 文件 640 项，+6046 / −3752 行）：
+**修复范围**（A-scalar-000~003、B-vector-000~003、C-matrix-000~003、D-attention-000~003、E-shape-000~003 共 20 文件 640 项，L10 源码 **+3023 / −1876 行**；demo.html 因内联同一批 L10 文件而等量变化，全提交 24 文件 **+6089 / −3757 行**）：
 
 | 域 | 原缺陷 | 修复手法 |
 |---|---|---|
